@@ -4,6 +4,9 @@ import { useMemo, useState, type DragEvent } from "react";
 import styles from "./QcReportLab.module.css";
 
 const FRAME_MS = 10;
+const QC_STREAMING_WAV_THRESHOLD_BYTES = 64 * 1024 * 1024;
+const QC_WAV_STREAM_CHUNK_BYTES = 4 * 1024 * 1024;
+const QC_WAV_HEADER_SCAN_BYTES = 8 * 1024 * 1024;
 
 type QcReport = {
   fileName: string;
@@ -18,8 +21,13 @@ type QcReport = {
   pauseNoiseFloorDb: number;
   noiseContrastDb: number;
   speechRatioPct: number;
+  speechDutyCyclePct: number;
+  medianSpeechRunMs: number;
   dynamicRangeDb: number;
   instabilityScore: number;
+  onsetOvershootScore: number;
+  midLineSagScore: number;
+  endFadeRiskScore: number;
   compressionScore: number;
   clickScore: number;
   echoScore: number;
@@ -34,11 +42,26 @@ type QcComparison = {
   after: QcReport;
   deltaRisk: number;
   deltaInstability: number;
+  deltaOnsetOvershoot: number;
+  deltaMidLineSag: number;
+  deltaEndFadeRisk: number;
   deltaCompression: number;
   deltaNoiseFloor: number;
   deltaNoiseContrast: number;
   deltaClick: number;
   deltaEcho: number;
+};
+
+type ParsedWavInfo = {
+  channels: number;
+  sampleRate: number;
+  bitsPerSample: number;
+  audioFormat: number;
+  blockAlign: number;
+  dataOffset: number;
+  dataBytes: number;
+  totalFrames: number;
+  durationSec: number;
 };
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
@@ -52,6 +75,13 @@ const percentile = (values: number[], percent: number) => {
   if (lower === upper) return sorted[lower];
   const weight = rank - lower;
   return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+};
+
+const median = (values: number[]) => {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 };
 
 const mean = (values: number[]) => {
@@ -124,6 +154,9 @@ const buildComparisons = (reports: QcReport[]) => {
       after,
       deltaRisk: after.overallRisk - before.overallRisk,
       deltaInstability: after.instabilityScore - before.instabilityScore,
+      deltaOnsetOvershoot: after.onsetOvershootScore - before.onsetOvershootScore,
+      deltaMidLineSag: after.midLineSagScore - before.midLineSagScore,
+      deltaEndFadeRisk: after.endFadeRiskScore - before.endFadeRiskScore,
       deltaCompression: after.compressionScore - before.compressionScore,
       deltaNoiseFloor: after.pauseNoiseFloorDb - before.pauseNoiseFloorDb,
       deltaNoiseContrast: after.noiseContrastDb - before.noiseContrastDb,
@@ -137,6 +170,134 @@ const buildComparisons = (reports: QcReport[]) => {
 
 const formatSignedPercent = (value: number) => `${value >= 0 ? "+" : ""}${Math.round(value * 100)}%`;
 const formatSignedDb = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(1)} dB`;
+
+const readFourCC = (view: DataView, offset: number) =>
+  String.fromCharCode(
+    view.getUint8(offset),
+    view.getUint8(offset + 1),
+    view.getUint8(offset + 2),
+    view.getUint8(offset + 3)
+  );
+
+const parseWavHeader = async (file: File): Promise<ParsedWavInfo> => {
+  const headerScanBytes = Math.min(file.size, QC_WAV_HEADER_SCAN_BYTES);
+  const headerBuffer = await file.slice(0, headerScanBytes).arrayBuffer();
+  const view = new DataView(headerBuffer);
+
+  if (view.byteLength < 12) {
+    throw new Error("WAV header is too small.");
+  }
+  const riff = readFourCC(view, 0);
+  const wave = readFourCC(view, 8);
+  if (riff !== "RIFF" || wave !== "WAVE") {
+    throw new Error("Unsupported WAV container (expected RIFF/WAVE).");
+  }
+
+  let offset = 12;
+  let channels: number | null = null;
+  let sampleRate: number | null = null;
+  let bitsPerSample: number | null = null;
+  let audioFormat: number | null = null;
+  let blockAlign: number | null = null;
+  let dataOffset: number | null = null;
+  let dataBytes: number | null = null;
+
+  while (offset + 8 <= view.byteLength) {
+    const chunkId = readFourCC(view, offset);
+    const chunkSize = view.getUint32(offset + 4, true);
+    const chunkDataOffset = offset + 8;
+    const nextOffset = chunkDataOffset + chunkSize + (chunkSize % 2);
+
+    if (chunkId === "fmt " && chunkDataOffset + Math.min(chunkSize, 40) <= view.byteLength) {
+      const rawFormat = view.getUint16(chunkDataOffset, true);
+      const parsedChannels = view.getUint16(chunkDataOffset + 2, true);
+      const parsedSampleRate = view.getUint32(chunkDataOffset + 4, true);
+      const parsedBlockAlign = view.getUint16(chunkDataOffset + 12, true);
+      const parsedBitsPerSample = view.getUint16(chunkDataOffset + 14, true);
+
+      let normalizedFormat = rawFormat;
+      if (rawFormat === 0xfffe && chunkSize >= 40 && chunkDataOffset + 40 <= view.byteLength) {
+        normalizedFormat = view.getUint16(chunkDataOffset + 24, true);
+      }
+
+      channels = parsedChannels;
+      sampleRate = parsedSampleRate;
+      blockAlign = parsedBlockAlign;
+      bitsPerSample = parsedBitsPerSample;
+      audioFormat = normalizedFormat;
+    } else if (chunkId === "data") {
+      dataOffset = chunkDataOffset;
+      dataBytes = Math.min(chunkSize, Math.max(0, file.size - chunkDataOffset));
+      break;
+    }
+
+    if (nextOffset <= offset) break;
+    offset = nextOffset;
+  }
+
+  if (channels === null || sampleRate === null || bitsPerSample === null || audioFormat === null || blockAlign === null) {
+    throw new Error("WAV fmt chunk not found or incomplete.");
+  }
+  if (dataOffset === null || dataBytes === null) {
+    throw new Error("WAV data chunk not found in header scan.");
+  }
+  if (channels <= 0 || sampleRate <= 0 || blockAlign <= 0) {
+    throw new Error("Invalid WAV format values.");
+  }
+
+  const bytesPerSample = blockAlign / channels;
+  if (!Number.isInteger(bytesPerSample) || bytesPerSample <= 0) {
+    throw new Error("Unsupported WAV block alignment.");
+  }
+
+  const supported =
+    (audioFormat === 1 && [8, 16, 24, 32].includes(bitsPerSample)) ||
+    (audioFormat === 3 && [32, 64].includes(bitsPerSample));
+  if (!supported) {
+    throw new Error(`Unsupported WAV sample format (format ${audioFormat}, ${bitsPerSample}-bit).`);
+  }
+
+  const totalFrames = Math.floor(dataBytes / blockAlign);
+  const durationSec = totalFrames / sampleRate;
+  return {
+    channels,
+    sampleRate,
+    bitsPerSample,
+    audioFormat,
+    blockAlign,
+    dataOffset,
+    dataBytes,
+    totalFrames,
+    durationSec,
+  };
+};
+
+const createWavSampleReader = (view: DataView, audioFormat: number, bitsPerSample: number) => {
+  if (audioFormat === 3 && bitsPerSample === 32) {
+    return (byteOffset: number) => view.getFloat32(byteOffset, true);
+  }
+  if (audioFormat === 3 && bitsPerSample === 64) {
+    return (byteOffset: number) => view.getFloat64(byteOffset, true);
+  }
+  if (audioFormat === 1 && bitsPerSample === 8) {
+    return (byteOffset: number) => (view.getUint8(byteOffset) - 128) / 128;
+  }
+  if (audioFormat === 1 && bitsPerSample === 16) {
+    return (byteOffset: number) => view.getInt16(byteOffset, true) / 32768;
+  }
+  if (audioFormat === 1 && bitsPerSample === 24) {
+    return (byteOffset: number) => {
+      let value =
+        view.getUint8(byteOffset) | (view.getUint8(byteOffset + 1) << 8) | (view.getUint8(byteOffset + 2) << 16);
+      if (value & 0x800000) value |= ~0xffffff;
+      return value / 8388608;
+    };
+  }
+  if (audioFormat === 1 && bitsPerSample === 32) {
+    return (byteOffset: number) => view.getInt32(byteOffset, true) / 2147483648;
+  }
+  throw new Error(`Unsupported WAV reader (format ${audioFormat}, ${bitsPerSample}-bit).`);
+};
 
 const decodeToMono = async (file: File, audioContext: AudioContext) => {
   const buffer = await file.arrayBuffer();
@@ -184,6 +345,21 @@ const buildFlagsAndRecommendations = (report: QcReport) => {
     recommendations.push("Use instability-safe leveling (slower gain riding, less compression mix).");
   }
 
+  if (report.onsetOvershootScore >= 0.38) {
+    flags.push("First-word/onset spike risk detected.");
+    recommendations.push("Use onset spike taming before auto-leveling on short lines and line starts.");
+  }
+
+  if (report.midLineSagScore >= 0.36) {
+    flags.push("Mid-line level sag detected.");
+    recommendations.push("Use faster leveling response for line continuity and verify dyna window sizing.");
+  }
+
+  if (report.endFadeRiskScore >= 0.35) {
+    flags.push("Sentence-end audibility loss risk detected.");
+    recommendations.push("Protect endings: reduce tail gating/threshold behavior on clean unstable takes.");
+  }
+
   if (report.compressionScore >= 0.52) {
     flags.push("Compressed or radio-like tone risk.");
     recommendations.push("Relax compressor ratio/mix and preserve more transient dynamics.");
@@ -212,17 +388,20 @@ const buildFlagsAndRecommendations = (report: QcReport) => {
   return { flags, recommendations };
 };
 
-const analyzeSamples = (
+const analyzeFrameFeatures = (
   fileName: string,
   fileSize: number,
-  samples: Float32Array,
+  frameRms: number[],
+  framePeak: number[],
+  frameDb: number[],
+  frameSharpness: number[],
   sampleRate: number,
   durationSec: number,
   peakDb: number,
-  clipPct: number
+  clipPct: number,
+  sampleSpikeCount: number
 ): QcReport => {
-  const frameSize = Math.max(1, Math.round((sampleRate * FRAME_MS) / 1000));
-  const frameCount = Math.floor(samples.length / frameSize);
+  const frameCount = frameDb.length;
   if (frameCount < 30) {
     return {
       fileName,
@@ -237,8 +416,13 @@ const analyzeSamples = (
       pauseNoiseFloorDb: -120,
       noiseContrastDb: 0,
       speechRatioPct: 0,
+      speechDutyCyclePct: 0,
+      medianSpeechRunMs: 0,
       dynamicRangeDb: 0,
       instabilityScore: 0,
+      onsetOvershootScore: 0,
+      midLineSagScore: 0,
+      endFadeRiskScore: 0,
       compressionScore: 0,
       clickScore: 0,
       echoScore: 0,
@@ -246,33 +430,6 @@ const analyzeSamples = (
       recommendations: [],
       error: "Audio is too short for reliable QC analysis.",
     };
-  }
-
-  const frameRms = new Array<number>(frameCount);
-  const frameDb = new Array<number>(frameCount);
-  const framePeak = new Array<number>(frameCount);
-  const frameSharpness = new Array<number>(frameCount);
-
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    const start = frame * frameSize;
-    let sumSquares = 0;
-    let peak = 0;
-    let sharpEnergy = 0;
-    for (let i = 0; i < frameSize; i += 1) {
-      const value = samples[start + i] ?? 0;
-      const abs = Math.abs(value);
-      if (abs > peak) peak = abs;
-      sumSquares += value * value;
-      const prev = i > 0 ? samples[start + i - 1] ?? 0 : value;
-      const next = i + 1 < frameSize ? samples[start + i + 1] ?? 0 : value;
-      const spike = value - (prev + next) * 0.5;
-      sharpEnergy += spike * spike;
-    }
-    const rms = Math.sqrt(sumSquares / frameSize);
-    frameRms[frame] = rms;
-    framePeak[frame] = peak;
-    frameDb[frame] = Math.max(-120, toDb(rms + 1e-12));
-    frameSharpness[frame] = toDb(Math.sqrt(sharpEnergy / frameSize) + 1e-12);
   }
 
   const baseNoiseFloorDb = percentile(frameDb, 25) ?? -72;
@@ -284,18 +441,6 @@ const analyzeSamples = (
   const speechCrest: number[] = [];
   let nonSpeechFrames = 0;
   let clickFrames = 0;
-  let sampleSpikeCount = 0;
-  const refractorySamples = Math.max(1, Math.round(sampleRate * 0.004));
-  let lastSpikeIndex = -refractorySamples;
-
-  for (let i = 1; i < samples.length; i += 1) {
-    const diff = Math.abs((samples[i] ?? 0) - (samples[i - 1] ?? 0));
-    if (diff < 0.09) continue;
-    if (Math.abs(samples[i] ?? 0) < 0.015) continue;
-    if (i - lastSpikeIndex < refractorySamples) continue;
-    sampleSpikeCount += 1;
-    lastSpikeIndex = i;
-  }
 
   for (let frame = 0; frame < frameCount; frame += 1) {
     const crestDb = toDb((framePeak[frame] + 1e-9) / (frameRms[frame] + 1e-9));
@@ -322,6 +467,7 @@ const analyzeSamples = (
   );
   const noiseFloorDb = pauseNoiseFloorDb;
   const speechRatioPct = (speechDb.length / Math.max(frameCount, 1)) * 100;
+  const speechDutyCyclePct = speechRatioPct;
   const p90Speech = percentile(speechDb, 90) ?? -24;
   const p10Speech = percentile(speechDb, 10) ?? p90Speech;
   const p50Speech = percentile(speechDb, 50) ?? p90Speech;
@@ -349,6 +495,73 @@ const analyzeSamples = (
       1
     );
   }
+
+  const speechRuns: Array<{ start: number; end: number }> = [];
+  let runStart = 0;
+  let runIsSpeech = speechMask[0] ?? false;
+  for (let i = 1; i <= frameCount; i += 1) {
+    const currentIsSpeech = i < frameCount ? speechMask[i] : !runIsSpeech;
+    if (i < frameCount && currentIsSpeech === runIsSpeech) continue;
+    if (runIsSpeech && i > runStart) {
+      speechRuns.push({ start: runStart, end: i });
+    }
+    runStart = i;
+    runIsSpeech = currentIsSpeech;
+  }
+  const speechRunMs = speechRuns.map((run) => (run.end - run.start) * FRAME_MS);
+  const medianSpeechRunMs = median(speechRunMs) ?? 0;
+
+  const meanSlice = (values: number[], start: number, end: number) => {
+    const safeStart = Math.max(0, start);
+    const safeEnd = Math.min(values.length, end);
+    if (safeEnd <= safeStart) return null;
+    let sum = 0;
+    for (let i = safeStart; i < safeEnd; i += 1) sum += values[i];
+    return sum / (safeEnd - safeStart);
+  };
+
+  const onsetEventScores: number[] = [];
+  const midSagEventScores: number[] = [];
+  const endFadeEventScores: number[] = [];
+  const speechFloorGuardDb = speechThresholdDb - 8;
+  for (let runIndex = 0; runIndex < speechRuns.length; runIndex += 1) {
+    const run = speechRuns[runIndex];
+    const runFrames = run.end - run.start;
+    const prevEnd = runIndex > 0 ? speechRuns[runIndex - 1].end : 0;
+    const nextStart = runIndex + 1 < speechRuns.length ? speechRuns[runIndex + 1].start : frameCount;
+    const preSilenceFrames = Math.max(0, run.start - prevEnd);
+    const postSilenceFrames = Math.max(0, nextStart - run.end);
+
+    if (preSilenceFrames >= 20 && runFrames >= 70) {
+      const onsetDb = meanSlice(frameDb, run.start + 12, Math.min(run.end, run.start + 22));
+      const bodyDb = meanSlice(frameDb, run.start + 25, Math.min(run.end, run.start + 70));
+      if (onsetDb !== null && bodyDb !== null) {
+        onsetEventScores.push(clamp((onsetDb - bodyDb - 2.5) / 4.5, 0, 1));
+      }
+    }
+
+    if (runFrames >= 90) {
+      const third = Math.floor(runFrames / 3);
+      const startDb = meanSlice(frameDb, run.start, run.start + third);
+      const midDb = meanSlice(frameDb, run.start + third, run.start + third * 2);
+      const endDb = meanSlice(frameDb, run.start + third * 2, run.end);
+      if (startDb !== null && midDb !== null && endDb !== null) {
+        const edgeMean = (startDb + endDb) / 2;
+        midSagEventScores.push(clamp((edgeMean - midDb - 1.8) / 4.2, 0, 1));
+      }
+    }
+
+    if (runFrames >= 70 && postSilenceFrames >= 10) {
+      const preTailDb = meanSlice(frameDb, Math.max(run.start, run.end - 50), Math.max(run.start, run.end - 22));
+      const tailDb = meanSlice(frameDb, Math.max(run.start, run.end - 22), run.end);
+      if (preTailDb !== null && tailDb !== null && tailDb > speechFloorGuardDb) {
+        endFadeEventScores.push(clamp((preTailDb - tailDb - 3.2) / 4.8, 0, 1));
+      }
+    }
+  }
+  const onsetOvershootScore = clamp(percentile(onsetEventScores, 75) ?? 0, 0, 1);
+  const midLineSagScore = clamp(percentile(midSagEventScores, 75) ?? 0, 0, 1);
+  const endFadeRiskScore = clamp(percentile(endFadeEventScores, 75) ?? 0, 0, 1);
 
   const centered = frameRms.map((value) => value - mean(frameRms));
   let bestCorr = 0;
@@ -409,7 +622,10 @@ const analyzeSamples = (
     clamp((pauseNoiseFloorDb + 62) / 18, 0, 1) * 0.45 + clamp((24 - noiseContrastDb) / 16, 0, 1) * 0.55;
   const clipScore = clamp(clipPct / 0.03, 0, 1);
   const overallRisk = clamp(
-    instabilityScore * 0.24 +
+    instabilityScore * 0.18 +
+      onsetOvershootScore * 0.1 +
+      midLineSagScore * 0.1 +
+      endFadeRiskScore * 0.1 +
       compressionScore * 0.24 +
       noiseLiftRisk * 0.22 +
       clickScore * 0.14 +
@@ -435,8 +651,13 @@ const analyzeSamples = (
     pauseNoiseFloorDb,
     noiseContrastDb,
     speechRatioPct,
+    speechDutyCyclePct,
+    medianSpeechRunMs,
     dynamicRangeDb,
     instabilityScore,
+    onsetOvershootScore,
+    midLineSagScore,
+    endFadeRiskScore,
     compressionScore,
     clickScore,
     echoScore,
@@ -450,6 +671,190 @@ const analyzeSamples = (
     flags,
     recommendations,
   };
+};
+
+const analyzeSamples = (
+  fileName: string,
+  fileSize: number,
+  samples: Float32Array,
+  sampleRate: number,
+  durationSec: number,
+  peakDb: number,
+  clipPct: number
+): QcReport => {
+  const frameSize = Math.max(1, Math.round((sampleRate * FRAME_MS) / 1000));
+  const frameCount = Math.floor(samples.length / frameSize);
+  const frameRms = new Array<number>(frameCount);
+  const frameDb = new Array<number>(frameCount);
+  const framePeak = new Array<number>(frameCount);
+  const frameSharpness = new Array<number>(frameCount);
+
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    const start = frame * frameSize;
+    let sumSquares = 0;
+    let peak = 0;
+    let sharpEnergy = 0;
+    for (let i = 0; i < frameSize; i += 1) {
+      const value = samples[start + i] ?? 0;
+      const abs = Math.abs(value);
+      if (abs > peak) peak = abs;
+      sumSquares += value * value;
+      const prev = i > 0 ? samples[start + i - 1] ?? 0 : value;
+      const next = i + 1 < frameSize ? samples[start + i + 1] ?? 0 : value;
+      const spike = value - (prev + next) * 0.5;
+      sharpEnergy += spike * spike;
+    }
+    const rms = Math.sqrt(sumSquares / frameSize);
+    frameRms[frame] = rms;
+    framePeak[frame] = peak;
+    frameDb[frame] = Math.max(-120, toDb(rms + 1e-12));
+    frameSharpness[frame] = toDb(Math.sqrt(sharpEnergy / frameSize) + 1e-12);
+  }
+
+  let sampleSpikeCount = 0;
+  const refractorySamples = Math.max(1, Math.round(sampleRate * 0.004));
+  let lastSpikeIndex = -refractorySamples;
+  for (let i = 1; i < samples.length; i += 1) {
+    const current = samples[i] ?? 0;
+    const previous = samples[i - 1] ?? 0;
+    const diff = Math.abs(current - previous);
+    if (diff < 0.09) continue;
+    if (Math.abs(current) < 0.015) continue;
+    if (i - lastSpikeIndex < refractorySamples) continue;
+    sampleSpikeCount += 1;
+    lastSpikeIndex = i;
+  }
+
+  return analyzeFrameFeatures(
+    fileName,
+    fileSize,
+    frameRms,
+    framePeak,
+    frameDb,
+    frameSharpness,
+    sampleRate,
+    durationSec,
+    peakDb,
+    clipPct,
+    sampleSpikeCount
+  );
+};
+
+const analyzePcmWavStreaming = async (file: File): Promise<QcReport> => {
+  const wav = await parseWavHeader(file);
+  const frameSize = Math.max(1, Math.round((wav.sampleRate * FRAME_MS) / 1000));
+  const frameCount = Math.floor(wav.totalFrames / frameSize);
+
+  const frameRms = new Array<number>(Math.max(0, frameCount));
+  const frameDb = new Array<number>(Math.max(0, frameCount));
+  const framePeak = new Array<number>(Math.max(0, frameCount));
+  const frameSharpness = new Array<number>(Math.max(0, frameCount));
+
+  let globalPeak = 0;
+  let clipCount = 0;
+  let monoSampleCount = 0;
+  let sampleSpikeCount = 0;
+  const refractorySamples = Math.max(1, Math.round(wav.sampleRate * 0.004));
+  let lastSpikeIndex = -refractorySamples;
+  let prevMonoSample = 0;
+  let hasPrevMonoSample = false;
+
+  let frameWriteIndex = 0;
+  let frameFill = 0;
+  const frameBuffer = new Float32Array(frameSize);
+
+  const bytesPerFrame = wav.blockAlign;
+  const bytesPerChannelSample = wav.blockAlign / wav.channels;
+
+  for (let dataRead = 0; dataRead < wav.dataBytes; ) {
+    const remaining = wav.dataBytes - dataRead;
+    let chunkBytes = Math.min(QC_WAV_STREAM_CHUNK_BYTES, remaining);
+    chunkBytes -= chunkBytes % bytesPerFrame;
+    if (chunkBytes <= 0) {
+      chunkBytes = Math.min(bytesPerFrame, remaining);
+      chunkBytes -= chunkBytes % bytesPerFrame;
+      if (chunkBytes <= 0) break;
+    }
+
+    const buffer = await file.slice(wav.dataOffset + dataRead, wav.dataOffset + dataRead + chunkBytes).arrayBuffer();
+    const view = new DataView(buffer);
+    const readSample = createWavSampleReader(view, wav.audioFormat, wav.bitsPerSample);
+    const interleavedFrames = Math.floor(view.byteLength / bytesPerFrame);
+
+    for (let frame = 0; frame < interleavedFrames; frame += 1) {
+      const baseByteOffset = frame * bytesPerFrame;
+      let mono = 0;
+      for (let channel = 0; channel < wav.channels; channel += 1) {
+        const sampleOffset = baseByteOffset + channel * bytesPerChannelSample;
+        mono += readSample(sampleOffset) / wav.channels;
+      }
+
+      const abs = Math.abs(mono);
+      if (abs > globalPeak) globalPeak = abs;
+      if (abs >= 0.995) clipCount += 1;
+
+      if (hasPrevMonoSample) {
+        const diff = Math.abs(mono - prevMonoSample);
+        if (diff >= 0.09 && abs >= 0.015 && monoSampleCount - lastSpikeIndex >= refractorySamples) {
+          sampleSpikeCount += 1;
+          lastSpikeIndex = monoSampleCount;
+        }
+      }
+      prevMonoSample = mono;
+      hasPrevMonoSample = true;
+
+      if (frameWriteIndex < frameCount) {
+        frameBuffer[frameFill] = mono;
+        frameFill += 1;
+        if (frameFill === frameSize) {
+          let sumSquares = 0;
+          let peak = 0;
+          let sharpEnergy = 0;
+          for (let i = 0; i < frameSize; i += 1) {
+            const value = frameBuffer[i];
+            const frameAbs = Math.abs(value);
+            if (frameAbs > peak) peak = frameAbs;
+            sumSquares += value * value;
+            const prev = i > 0 ? frameBuffer[i - 1] : value;
+            const next = i + 1 < frameSize ? frameBuffer[i + 1] : value;
+            const spike = value - (prev + next) * 0.5;
+            sharpEnergy += spike * spike;
+          }
+          const rms = Math.sqrt(sumSquares / frameSize);
+          frameRms[frameWriteIndex] = rms;
+          framePeak[frameWriteIndex] = peak;
+          frameDb[frameWriteIndex] = Math.max(-120, toDb(rms + 1e-12));
+          frameSharpness[frameWriteIndex] = toDb(Math.sqrt(sharpEnergy / frameSize) + 1e-12);
+          frameWriteIndex += 1;
+          frameFill = 0;
+        }
+      }
+
+      monoSampleCount += 1;
+    }
+
+    dataRead += interleavedFrames * bytesPerFrame;
+    if (interleavedFrames === 0) break;
+  }
+
+  const analyzedFrames = Math.min(frameWriteIndex, frameCount);
+  const durationSec = wav.durationSec;
+  const peakDb = toDb(globalPeak + 1e-12);
+  const clipPct = (clipCount / Math.max(monoSampleCount, 1)) * 100;
+
+  return analyzeFrameFeatures(
+    file.name,
+    file.size,
+    frameRms.slice(0, analyzedFrames),
+    framePeak.slice(0, analyzedFrames),
+    frameDb.slice(0, analyzedFrames),
+    frameSharpness.slice(0, analyzedFrames),
+    wav.sampleRate,
+    durationSec,
+    peakDb,
+    clipPct,
+    sampleSpikeCount
+  );
 };
 
 export default function QcReportLab() {
@@ -492,7 +897,7 @@ export default function QcReportLab() {
     setReports([]);
     setStatus("Preparing analysis...");
 
-    const audioContext = new AudioContext();
+    let audioContext: AudioContext | null = null;
     const nextReports: QcReport[] = [];
 
     try {
@@ -500,16 +905,24 @@ export default function QcReportLab() {
         const file = files[index];
         setStatus(`Analyzing ${file.name} (${index + 1}/${files.length})`);
         try {
-          const decoded = await decodeToMono(file, audioContext);
-          const report = analyzeSamples(
-            file.name,
-            file.size,
-            decoded.samples,
-            decoded.sampleRate,
-            decoded.durationSec,
-            decoded.peakDb,
-            decoded.clipPct
-          );
+          let report: QcReport;
+          const useStreamingWav = file.size >= QC_STREAMING_WAV_THRESHOLD_BYTES;
+          if (useStreamingWav) {
+            setStatus(`Analyzing ${file.name} (${index + 1}/${files.length}) • streaming WAV mode`);
+            report = await analyzePcmWavStreaming(file);
+          } else {
+            if (!audioContext) audioContext = new AudioContext();
+            const decoded = await decodeToMono(file, audioContext);
+            report = analyzeSamples(
+              file.name,
+              file.size,
+              decoded.samples,
+              decoded.sampleRate,
+              decoded.durationSec,
+              decoded.peakDb,
+              decoded.clipPct
+            );
+          }
           nextReports.push(report);
         } catch (error) {
           nextReports.push({
@@ -525,8 +938,13 @@ export default function QcReportLab() {
             pauseNoiseFloorDb: -120,
             noiseContrastDb: 0,
             speechRatioPct: 0,
+            speechDutyCyclePct: 0,
+            medianSpeechRunMs: 0,
             dynamicRangeDb: 0,
             instabilityScore: 0,
+            onsetOvershootScore: 0,
+            midLineSagScore: 0,
+            endFadeRiskScore: 0,
             compressionScore: 0,
             clickScore: 0,
             echoScore: 0,
@@ -541,7 +959,9 @@ export default function QcReportLab() {
       const hasWarning = nextReports.some((report) => report.status === "warning");
       setStatus(hasError ? "Done with errors" : hasWarning ? "Done with warnings" : "Done");
     } finally {
-      await audioContext.close();
+      if (audioContext) {
+        await audioContext.close();
+      }
       setLoading(false);
     }
   };
@@ -631,6 +1051,7 @@ export default function QcReportLab() {
           </div>
           <div className={styles.badges}>
             <span className={styles.badge}>Instability</span>
+            <span className={styles.badge}>Onset / Sag / End Fade</span>
             <span className={styles.badge}>Noise lift risk</span>
             <span className={styles.badge}>Clicks + Echo</span>
             <span className={styles.badge}>Compression risk</span>
@@ -674,6 +1095,18 @@ export default function QcReportLab() {
                     <div className={styles.metric}>
                       <span>Instability delta</span>
                       <strong>{formatSignedPercent(comparison.deltaInstability)}</strong>
+                    </div>
+                    <div className={styles.metric}>
+                      <span>Onset spike delta</span>
+                      <strong>{formatSignedPercent(comparison.deltaOnsetOvershoot)}</strong>
+                    </div>
+                    <div className={styles.metric}>
+                      <span>Mid-line sag delta</span>
+                      <strong>{formatSignedPercent(comparison.deltaMidLineSag)}</strong>
+                    </div>
+                    <div className={styles.metric}>
+                      <span>End-fade delta</span>
+                      <strong>{formatSignedPercent(comparison.deltaEndFadeRisk)}</strong>
                     </div>
                     <div className={styles.metric}>
                       <span>Compression delta</span>
@@ -745,6 +1178,18 @@ export default function QcReportLab() {
                         <strong>{Math.round(report.instabilityScore * 100)}%</strong>
                       </div>
                       <div className={styles.metric}>
+                        <span>Onset spike risk</span>
+                        <strong>{Math.round(report.onsetOvershootScore * 100)}%</strong>
+                      </div>
+                      <div className={styles.metric}>
+                        <span>Mid-line sag risk</span>
+                        <strong>{Math.round(report.midLineSagScore * 100)}%</strong>
+                      </div>
+                      <div className={styles.metric}>
+                        <span>End-fade risk</span>
+                        <strong>{Math.round(report.endFadeRiskScore * 100)}%</strong>
+                      </div>
+                      <div className={styles.metric}>
                         <span>Compression risk</span>
                         <strong>{Math.round(report.compressionScore * 100)}%</strong>
                       </div>
@@ -763,6 +1208,12 @@ export default function QcReportLab() {
                       <div className={styles.metric}>
                         <span>Speech range</span>
                         <strong>{report.dynamicRangeDb.toFixed(1)} dB</strong>
+                      </div>
+                      <div className={styles.metric}>
+                        <span>Speech duty / median run</span>
+                        <strong>
+                          {report.speechDutyCyclePct.toFixed(1)}% / {(report.medianSpeechRunMs / 1000).toFixed(1)}s
+                        </strong>
                       </div>
                       <div className={styles.metric}>
                         <span>Peak / clip</span>

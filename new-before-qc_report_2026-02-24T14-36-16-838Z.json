@@ -1,0 +1,44 @@
+{
+  "generatedAt": "2026-02-24T14:36:16.837Z",
+  "status": "Done with warnings",
+  "reports": [
+    {
+      "fileName": "Lara 1-10.wav",
+      "fileSize": 206355284,
+      "status": "warning",
+      "overallRisk": 0.561128995222921,
+      "durationSec": 2149.5333125,
+      "sampleRate": 48000,
+      "peakDb": 8.686661818707667e-12,
+      "clipPct": 0.00027040753293745476,
+      "noiseFloorDb": -70.27761693767805,
+      "pauseNoiseFloorDb": -70.27761693767805,
+      "noiseContrastDb": 26.910506975429882,
+      "speechRatioPct": 16.198424771926888,
+      "speechDutyCyclePct": 16.198424771926888,
+      "medianSpeechRunMs": 10,
+      "dynamicRangeDb": 33.852348635192435,
+      "instabilityScore": 0.7132958974673846,
+      "onsetOvershootScore": 0.4937585907926388,
+      "midLineSagScore": 0,
+      "endFadeRiskScore": 1,
+      "compressionScore": 0.1959795176952528,
+      "clickScore": 1,
+      "echoScore": 0.7966975299847286,
+      "flags": [
+        "Large voice-level jumps detected.",
+        "First-word/onset spike risk detected.",
+        "Sentence-end audibility loss risk detected.",
+        "Click/transient artifacts detected.",
+        "Echo/reverb tail risk detected."
+      ],
+      "recommendations": [
+        "Use instability-safe leveling (slower gain riding, less compression mix).",
+        "Use onset spike taming before auto-leveling on short lines and line starts.",
+        "Protect endings: reduce tail gating/threshold behavior on clean unstable takes.",
+        "Run click-taming cleanup and recheck consonant spikes.",
+        "Keep room cleanup on and verify tail control + notch behavior."
+      ]
+    }
+  ]
+}

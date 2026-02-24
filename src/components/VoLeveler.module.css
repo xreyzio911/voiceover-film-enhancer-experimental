@@ -203,6 +203,189 @@
   cursor: help;
 }
 
+.queueHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.queueSummaryBadges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.queueCountBadge {
+  font-size: 0.74rem;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.queueCountNeutral {
+  color: var(--muted);
+}
+
+.queueCountActive {
+  border-color: rgba(110, 214, 198, 0.35);
+  background: rgba(110, 214, 198, 0.12);
+}
+
+.queueCountDone {
+  border-color: rgba(110, 214, 198, 0.3);
+  background: rgba(110, 214, 198, 0.08);
+}
+
+.queueCountError {
+  border-color: rgba(255, 120, 120, 0.35);
+  background: rgba(255, 120, 120, 0.08);
+}
+
+.queueActiveBar {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.035);
+  padding: 10px 12px;
+}
+
+.queueActivePercent {
+  min-width: 56px;
+  text-align: right;
+  font-family: var(--font-mono), ui-monospace, monospace;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.queueList {
+  margin-top: 10px;
+  max-height: 280px;
+  overflow: auto;
+  display: grid;
+  gap: 8px;
+  padding-right: 4px;
+}
+
+.queueItem {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.025);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.queueItemActive {
+  border-color: rgba(110, 214, 198, 0.35);
+  background: rgba(110, 214, 198, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(110, 214, 198, 0.06);
+}
+
+.queueRowTop {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.queueTitleWrap {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.queueIndex {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  color: var(--muted);
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.queueFileName {
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.2;
+  word-break: break-word;
+}
+
+.queueStageText {
+  margin-top: 3px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.25;
+  word-break: break-word;
+}
+
+.queueStatusBadge {
+  flex-shrink: 0;
+  font-size: 0.72rem;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.queueStatusPending {
+  color: var(--muted);
+}
+
+.queueStatusWorking {
+  border-color: rgba(110, 214, 198, 0.35);
+  background: rgba(110, 214, 198, 0.12);
+}
+
+.queueStatusDone {
+  border-color: rgba(110, 214, 198, 0.28);
+  background: rgba(110, 214, 198, 0.08);
+}
+
+.queueStatusError {
+  border-color: rgba(255, 120, 120, 0.4);
+  background: rgba(255, 120, 120, 0.1);
+}
+
+.queueProgressTrack {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.queueProgressFill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  transition: width 0.18s ease;
+}
+
+.queueProgressFill.queueStatusWorking {
+  background: linear-gradient(90deg, rgba(110, 214, 198, 0.65), rgba(110, 214, 198, 0.95));
+}
+
+.queueProgressFill.queueStatusDone {
+  background: linear-gradient(90deg, rgba(110, 214, 198, 0.45), rgba(110, 214, 198, 0.7));
+}
+
+.queueProgressFill.queueStatusError {
+  background: linear-gradient(90deg, rgba(255, 120, 120, 0.45), rgba(255, 120, 120, 0.7));
+}
+
 .log {
   background: #0b0d12;
   border-radius: 12px;

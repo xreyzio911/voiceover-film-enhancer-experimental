@@ -62,6 +62,13 @@ const ENVELOPE_FRAME_MS = 10;
 const ENVELOPE_FLOOR_DB = -120;
 const MIX_SEGMENT_SECONDS = 75;
 const MIX_SEGMENT_MIN_DURATION_SECONDS = 105;
+const LONG_SPARSE_DURATION_SECONDS = 480;
+const LONG_SPARSE_ANALYSIS_WINDOW_SECONDS = 24;
+const LONG_SPARSE_ANALYSIS_WINDOW_TARGET_COUNT = 8;
+const SPEECH_ALIGNED_SEGMENT_TARGET_SECONDS = 30;
+const SPEECH_ALIGNED_SEGMENT_MAX_SECONDS = 42;
+const SPEECH_ALIGNED_SEGMENT_PAD_IN_MS = 160;
+const SPEECH_ALIGNED_SEGMENT_PAD_OUT_MS = 320;
 const BATCH_MEMORY_GUARD_FILE_THRESHOLD = 8;
 const BATCH_MEMORY_GUARD_INTERVAL = 3;
 const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled";
@@ -169,6 +176,24 @@ type OutputEntry = {
   variant: "clean" | "blend";
 };
 
+type SilenceSpan = {
+  startSec: number;
+  endSec: number;
+};
+
+type SpeechSpan = {
+  startSec: number;
+  endSec: number;
+};
+
+type RenderSegment = {
+  startSec: number;
+  endSec: number;
+  process: boolean;
+  trimInMs: number;
+  trimOutMs: number;
+};
+
 type FileAnalysis = {
   inputI: number | null;
   inputLRA: number | null;
@@ -188,6 +213,15 @@ type FileAnalysis = {
   drynessScore: number | null;
   instabilityScore: number | null;
   clickScore: number | null;
+  speechDutyCyclePct: number | null;
+  speechSegmentCount: number | null;
+  medianSpeechRunMs: number | null;
+  longSilenceCount: number | null;
+  onsetOvershootScore: number | null;
+  midLineSagScore: number | null;
+  endFadeRiskScore: number | null;
+  analysisWindowCount: number | null;
+  longSparseModeEligible: boolean | null;
 };
 
 type BatchReference = {
@@ -224,6 +258,15 @@ type AdaptiveProfile = {
   instabilityScore: number;
   clickScore: number;
   clickTameStrength: number;
+  lineContinuityRisk: number;
+  preserveEndings: boolean;
+  onsetTameStrength: number;
+  sagRecoveryStrength: number;
+  disableDynaThresholdForStability: boolean;
+  strictEndingProtection: boolean;
+  useSpeechAlignedSegmentation: boolean;
+  segmentTargetSec: number;
+  segmentMaxSec: number;
   blendIndoorGain: number;
   blendOutdoorGain: number;
   blendIndoorDelayMs: number;
@@ -242,6 +285,19 @@ type FailedOptimization = {
   base: string;
   fileName: string;
   reason: string;
+};
+
+type QueueItemStatus = "pending" | "working" | "done" | "error";
+
+type QueueItem = {
+  base: string;
+  fileName: string;
+  index: number;
+  status: QueueItemStatus;
+  stageLabel: string;
+  progress: number;
+  detail: string | null;
+  updatedAtMs: number;
 };
 
 const createEmptyAnalysis = (): FileAnalysis => ({
@@ -263,11 +319,23 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   drynessScore: null,
   instabilityScore: null,
   clickScore: null,
+  speechDutyCyclePct: null,
+  speechSegmentCount: null,
+  medianSpeechRunMs: null,
+  longSilenceCount: null,
+  onsetOvershootScore: null,
+  midLineSagScore: null,
+  endFadeRiskScore: null,
+  analysisWindowCount: null,
+  longSparseModeEligible: null,
 });
 
 export default function VoLeveler() {
   const ffmpegRef = useRef<FFmpeg | null>(null);
   const logBufferRef = useRef<string[]>([]);
+  const activeQueueBaseRef = useRef<string | null>(null);
+  const activeQueueStageRef = useRef<string>("Queued");
+  const activeQueueProgressRef = useRef<number>(-1);
 
   const [files, setFiles] = useState<File[]>([]);
   const [outputs, setOutputs] = useState<OutputEntry[]>([]);
@@ -279,6 +347,7 @@ export default function VoLeveler() {
   const [dragActive, setDragActive] = useState(false);
   const [failedOptimizations, setFailedOptimizations] = useState<FailedOptimization[]>([]);
   const [showFailureWarning, setShowFailureWarning] = useState(false);
+  const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
 
   const [loudnessTarget, setLoudnessTarget] = useState<keyof typeof LOUDNESS_PRESETS>(
     "ATSC A/85 (-24 LKFS, -2 dBTP)"
@@ -318,6 +387,89 @@ export default function VoLeveler() {
 
   const appendLog = (message: string) => {
     setLogs((prev) => [...prev.slice(-300), message]);
+  };
+
+  const initializeQueueItems = (jobs: JobEntry[]) => {
+    const now = Date.now();
+    setQueueItems(
+      jobs.map((job, index) => ({
+        base: job.base,
+        fileName: job.file.name,
+        index,
+        status: "pending",
+        stageLabel: "Queued",
+        progress: 0,
+        detail: null,
+        updatedAtMs: now,
+      }))
+    );
+    activeQueueBaseRef.current = null;
+    activeQueueStageRef.current = "Queued";
+    activeQueueProgressRef.current = -1;
+  };
+
+  const updateQueueItem = (
+    base: string,
+    patch: Partial<Pick<QueueItem, "status" | "stageLabel" | "progress" | "detail">>
+  ) => {
+    const now = Date.now();
+    setQueueItems((prev) =>
+      prev.map((item) => (item.base === base ? { ...item, ...patch, updatedAtMs: now } : item))
+    );
+  };
+
+  const setActiveQueueStage = (base: string, stageLabel: string, detail?: string | null) => {
+    activeQueueBaseRef.current = base;
+    activeQueueStageRef.current = stageLabel;
+    activeQueueProgressRef.current = -1;
+    updateQueueItem(base, {
+      status: "working",
+      stageLabel,
+      progress: 0,
+      detail: detail ?? null,
+    });
+  };
+
+  const markQueuePending = (base: string, stageLabel: string, detail?: string | null) => {
+    if (activeQueueBaseRef.current === base) {
+      activeQueueBaseRef.current = null;
+      activeQueueStageRef.current = "Queued";
+      activeQueueProgressRef.current = -1;
+    }
+    updateQueueItem(base, {
+      status: "pending",
+      stageLabel,
+      progress: 0,
+      detail: detail ?? null,
+    });
+  };
+
+  const markQueueDone = (base: string, detail?: string | null) => {
+    if (activeQueueBaseRef.current === base) {
+      activeQueueBaseRef.current = null;
+      activeQueueStageRef.current = "Complete";
+      activeQueueProgressRef.current = -1;
+    }
+    updateQueueItem(base, {
+      status: "done",
+      stageLabel: "Complete",
+      progress: 1,
+      detail: detail ?? null,
+    });
+  };
+
+  const markQueueError = (base: string, detail?: string | null) => {
+    if (activeQueueBaseRef.current === base) {
+      activeQueueBaseRef.current = null;
+      activeQueueStageRef.current = "Error";
+      activeQueueProgressRef.current = -1;
+    }
+    updateQueueItem(base, {
+      status: "error",
+      stageLabel: "Error",
+      progress: 1,
+      detail: detail ?? null,
+    });
   };
 
   const toBlobURLSafe = async (url: string, mime: string) => {
@@ -374,6 +526,18 @@ export default function VoLeveler() {
     ffmpeg.on("progress", ({ progress }) => {
       if (progress > 0) {
         setStatus(`Processing ${(progress * 100).toFixed(0)}%`);
+        const activeBase = activeQueueBaseRef.current;
+        if (activeBase) {
+          const clampedProgress = clamp(progress, 0, 1);
+          if (Math.abs(clampedProgress - activeQueueProgressRef.current) >= 0.03 || clampedProgress >= 0.995) {
+            activeQueueProgressRef.current = clampedProgress;
+            updateQueueItem(activeBase, {
+              status: "working",
+              stageLabel: activeQueueStageRef.current,
+              progress: clampedProgress,
+            });
+          }
+        }
       }
     });
 
@@ -458,31 +622,6 @@ const summarizeFailureReason = (error: unknown) => {
     }
   };
 
-  const runRmsAnalysis = async (ffmpeg: FFmpeg, inputName: string, bandFilter: string) => {
-    resetLogBuffer();
-    await execOrThrow(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-i",
-        inputName,
-        "-t",
-        `${ANALYSIS_SAMPLE_SECONDS}`,
-        "-af",
-        `${bandFilter},astats=metadata=0:reset=0:measure_perchannel=0`,
-        "-f",
-        "null",
-        "-",
-      ],
-      "RMS analysis"
-    );
-    const logText = resetLogBuffer();
-    return parseRmsFromAstats(logText);
-  };
-
   const readVirtualFileBytes = async (ffmpeg: FFmpeg, name: string) => {
     const data = await ffmpeg.readFile(name);
     return typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
@@ -514,6 +653,13 @@ const summarizeFailureReason = (error: unknown) => {
         drynessScore: null,
         instabilityScore: null,
         clickScore: null,
+        speechDutyCyclePct: null,
+        speechSegmentCount: null,
+        medianSpeechRunMs: null,
+        longSilenceCount: null,
+        onsetOvershootScore: null,
+        midLineSagScore: null,
+        endFadeRiskScore: null,
       };
     }
 
@@ -686,6 +832,88 @@ const summarizeFailureReason = (error: unknown) => {
     const clickDensity = clickFrames / Math.max(nonSpeechFrames, 1);
     const clickScore = clamp(clickDensity * 3.2, 0, 1);
 
+    const speechRuns: Array<{ start: number; end: number }> = [];
+    const silenceRuns: Array<{ start: number; end: number }> = [];
+    let runStart = 0;
+    let runIsSpeech = speechMask[0] ?? false;
+    for (let i = 1; i <= frameCount; i += 1) {
+      const currentIsSpeech = i < frameCount ? speechMask[i] : !runIsSpeech;
+      if (i < frameCount && currentIsSpeech === runIsSpeech) continue;
+      const runEnd = i;
+      if (runEnd > runStart) {
+        if (runIsSpeech) {
+          speechRuns.push({ start: runStart, end: runEnd });
+        } else {
+          silenceRuns.push({ start: runStart, end: runEnd });
+        }
+      }
+      runStart = i;
+      runIsSpeech = currentIsSpeech;
+    }
+
+    const speechFramesTotal = speechRuns.reduce((sum, run) => sum + (run.end - run.start), 0);
+    const speechDutyCyclePct = (speechFramesTotal / Math.max(frameCount, 1)) * 100;
+    const speechRunMs = speechRuns.map((run) => (run.end - run.start) * ENVELOPE_FRAME_MS);
+    const silenceRunMs = silenceRuns.map((run) => (run.end - run.start) * ENVELOPE_FRAME_MS);
+    const medianSpeechRunMs = median(speechRunMs) ?? 0;
+    const longSilenceCount = silenceRunMs.filter((ms) => ms >= 1500).length;
+
+    const onsetEventScores: number[] = [];
+    const midSagEventScores: number[] = [];
+    const endFadeEventScores: number[] = [];
+    const minimumSpeechTailDb = speechThresholdDb - 8;
+
+    for (let runIndex = 0; runIndex < speechRuns.length; runIndex += 1) {
+      const run = speechRuns[runIndex];
+      const runFrames = run.end - run.start;
+      const prevSilenceFrames =
+        runIndex > 0 ? Math.max(0, speechRuns[runIndex].start - speechRuns[runIndex - 1].end) : run.start;
+      const nextBoundary = runIndex + 1 < speechRuns.length ? speechRuns[runIndex + 1].start : frameCount;
+      const followingSilenceFrames = Math.max(0, nextBoundary - run.end);
+
+      if (prevSilenceFrames >= 20 && runFrames >= 70) {
+        const onsetStart = run.start + 12;
+        const onsetEnd = Math.min(run.end, run.start + 22);
+        const bodyStart = Math.min(run.end, run.start + 25);
+        const bodyEnd = Math.min(run.end, run.start + 70);
+        const onsetDb = meanSlice(frameDb, onsetStart, onsetEnd);
+        const bodyDb = meanSlice(frameDb, bodyStart, bodyEnd);
+        if (onsetDb !== null && bodyDb !== null) {
+          const overshootDb = onsetDb - bodyDb;
+          onsetEventScores.push(clamp((overshootDb - 2.5) / 4.5, 0, 1));
+        }
+      }
+
+      if (runFrames >= 90) {
+        const oneThird = Math.floor(runFrames / 3);
+        const startDb = meanSlice(frameDb, run.start, run.start + oneThird);
+        const midDb = meanSlice(frameDb, run.start + oneThird, run.start + oneThird * 2);
+        const endDb = meanSlice(frameDb, run.start + oneThird * 2, run.end);
+        if (startDb !== null && midDb !== null && endDb !== null) {
+          const edgeMean = (startDb + endDb) / 2;
+          const sagDb = edgeMean - midDb;
+          midSagEventScores.push(clamp((sagDb - 1.8) / 4.2, 0, 1));
+        }
+      }
+
+      if (runFrames >= 70 && followingSilenceFrames >= 10) {
+        const preTailStart = Math.max(run.start, run.end - 50);
+        const preTailEnd = Math.max(run.start, run.end - 22);
+        const tailStart = Math.max(run.start, run.end - 22);
+        const tailEnd = run.end;
+        const preTailDb = meanSlice(frameDb, preTailStart, preTailEnd);
+        const tailDb = meanSlice(frameDb, tailStart, tailEnd);
+        if (preTailDb !== null && tailDb !== null && tailDb > minimumSpeechTailDb) {
+          const terminalDropDb = preTailDb - tailDb;
+          endFadeEventScores.push(clamp((terminalDropDb - 3.2) / 4.8, 0, 1));
+        }
+      }
+    }
+
+    const onsetOvershootScore = clamp(percentile(onsetEventScores, 75) ?? 0, 0, 1);
+    const midLineSagScore = clamp(percentile(midSagEventScores, 75) ?? 0, 0, 1);
+    const endFadeRiskScore = clamp(percentile(endFadeEventScores, 75) ?? 0, 0, 1);
+
     return {
       noiseFloorDb,
       nearSpeechNoiseFloorDb,
@@ -698,11 +926,377 @@ const summarizeFailureReason = (error: unknown) => {
       drynessScore,
       instabilityScore,
       clickScore,
+      speechDutyCyclePct,
+      speechSegmentCount: speechRuns.length,
+      medianSpeechRunMs,
+      longSilenceCount,
+      onsetOvershootScore,
+      midLineSagScore,
+      endFadeRiskScore,
     };
   };
 
-  const runEnvelopeAnalysis = async (ffmpeg: FFmpeg, inputName: string) => {
-    const analysisName = `${sanitizeBase(inputName)}_envelope_analysis.f32`;
+  const parseSilencedetectSpans = (text: string, durationSeconds: number | null): SilenceSpan[] => {
+    const lines = text.split(/\r?\n/);
+    const spans: SilenceSpan[] = [];
+    let currentStart: number | null = null;
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      const startMatch = line.match(/silence_start:\s*([0-9]+(?:\.[0-9]+)?)/i);
+      if (startMatch) {
+        const parsed = Number(startMatch[1]);
+        if (Number.isFinite(parsed)) currentStart = parsed;
+      }
+      const endMatch = line.match(/silence_end:\s*([0-9]+(?:\.[0-9]+)?)/i);
+      if (endMatch) {
+        const end = Number(endMatch[1]);
+        if (!Number.isFinite(end)) continue;
+        const start = currentStart ?? Math.max(0, end - 0.32);
+        spans.push({ startSec: start, endSec: end });
+        currentStart = null;
+      }
+    }
+
+    if (currentStart !== null && durationSeconds !== null) {
+      spans.push({ startSec: currentStart, endSec: durationSeconds });
+    }
+
+    const clamped = spans
+      .map((span) => ({
+        startSec: clamp(span.startSec, 0, durationSeconds ?? Math.max(span.endSec, span.startSec)),
+        endSec: clamp(span.endSec, 0, durationSeconds ?? Math.max(span.endSec, span.startSec)),
+      }))
+      .filter((span) => span.endSec - span.startSec >= 0.01)
+      .sort((a, b) => a.startSec - b.startSec);
+
+    const merged: SilenceSpan[] = [];
+    for (const span of clamped) {
+      const last = merged.at(-1);
+      if (!last || span.startSec > last.endSec + 0.02) {
+        merged.push({ ...span });
+      } else {
+        last.endSec = Math.max(last.endSec, span.endSec);
+      }
+    }
+    return merged;
+  };
+
+  const deriveSpeechSpans = (silenceSpans: SilenceSpan[], durationSeconds: number): SpeechSpan[] => {
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return [];
+    const speechSpans: SpeechSpan[] = [];
+    let cursor = 0;
+    for (const silence of silenceSpans) {
+      const start = clamp(silence.startSec, 0, durationSeconds);
+      const end = clamp(silence.endSec, 0, durationSeconds);
+      if (start > cursor + 0.01) {
+        speechSpans.push({ startSec: cursor, endSec: start });
+      }
+      cursor = Math.max(cursor, end);
+    }
+    if (cursor < durationSeconds - 0.01) {
+      speechSpans.push({ startSec: cursor, endSec: durationSeconds });
+    }
+    return speechSpans.filter((span) => span.endSec - span.startSec >= 0.06);
+  };
+
+  const overlapSeconds = (aStart: number, aEnd: number, bStart: number, bEnd: number) =>
+    Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
+
+  const speechOccupancyPctInWindow = (speechSpans: SpeechSpan[], startSec: number, durationSec: number) => {
+    const endSec = startSec + durationSec;
+    let speech = 0;
+    for (const span of speechSpans) {
+      if (span.endSec <= startSec) continue;
+      if (span.startSec >= endSec) break;
+      speech += overlapSeconds(startSec, endSec, span.startSec, span.endSec);
+    }
+    return (speech / Math.max(durationSec, 1e-6)) * 100;
+  };
+
+  const computeSpeechMapStats = (speechSpans: SpeechSpan[], silenceSpans: SilenceSpan[], durationSeconds: number) => {
+    const speechDurationsMs = speechSpans.map((span) => (span.endSec - span.startSec) * 1000);
+    const silenceDurationsMs = silenceSpans.map((span) => (span.endSec - span.startSec) * 1000);
+    const totalSpeechSeconds = speechSpans.reduce((sum, span) => sum + (span.endSec - span.startSec), 0);
+    const speechDutyCyclePct = (totalSpeechSeconds / Math.max(durationSeconds, 1e-6)) * 100;
+    const medianSpeechRunMs = median(speechDurationsMs) ?? 0;
+    const longSilenceCount = silenceDurationsMs.filter((ms) => ms >= 1500).length;
+    return {
+      speechDutyCyclePct,
+      speechSegmentCount: speechSpans.length,
+      medianSpeechRunMs,
+      longSilenceCount,
+      longSparseModeEligible:
+        durationSeconds >= LONG_SPARSE_DURATION_SECONDS &&
+        speechDutyCyclePct <= 38 &&
+        (longSilenceCount >= 12 || medianSpeechRunMs <= 2600),
+    };
+  };
+
+  const selectDistributedAnalysisWindows = (speechSpans: SpeechSpan[], durationSeconds: number) => {
+    const windowSec = LONG_SPARSE_ANALYSIS_WINDOW_SECONDS;
+    const targetCount = LONG_SPARSE_ANALYSIS_WINDOW_TARGET_COUNT;
+    const maxStart = Math.max(0, durationSeconds - windowSec);
+
+    type Candidate = { startSec: number; occupancyPct: number; centerSec: number; spanLenSec: number };
+    const candidates: Candidate[] = [];
+
+    for (const span of speechSpans) {
+      const spanLenSec = span.endSec - span.startSec;
+      if (spanLenSec <= 0.05) continue;
+      const stepSec = spanLenSec > windowSec ? Math.max(10, windowSec * 0.75) : spanLenSec;
+      const centerStart = span.startSec + spanLenSec / 2;
+      for (let t = span.startSec; t <= span.endSec; t += stepSec) {
+        const centerSec = clamp(t, span.startSec, span.endSec);
+        const startSec = clamp(centerSec - windowSec / 2, 0, maxStart);
+        const occupancyPct = speechOccupancyPctInWindow(speechSpans, startSec, windowSec);
+        candidates.push({ startSec, occupancyPct, centerSec, spanLenSec });
+      }
+      const centeredStart = clamp(centerStart - windowSec / 2, 0, maxStart);
+      candidates.push({
+        startSec: centeredStart,
+        occupancyPct: speechOccupancyPctInWindow(speechSpans, centeredStart, windowSec),
+        centerSec: centerStart,
+        spanLenSec,
+      });
+    }
+
+    if (candidates.length === 0) {
+      const starts: number[] = [];
+      const count = Math.min(targetCount, Math.max(1, Math.ceil(durationSeconds / windowSec)));
+      for (let i = 0; i < count; i += 1) {
+        const ratio = count === 1 ? 0 : i / (count - 1);
+        starts.push(clamp(ratio * maxStart, 0, maxStart));
+      }
+      return starts.map((startSec) => ({ startSec, durationSec: Math.min(windowSec, durationSeconds - startSec), occupancyPct: 0 }));
+    }
+
+    const buckets = new Map<number, Candidate[]>();
+    for (const candidate of candidates) {
+      const bucketIndex = clamp(Math.floor((candidate.centerSec / Math.max(durationSeconds, 1e-6)) * targetCount), 0, targetCount - 1);
+      const bucket = buckets.get(bucketIndex) ?? [];
+      bucket.push(candidate);
+      buckets.set(bucketIndex, bucket);
+    }
+
+    const selected: Candidate[] = [];
+    for (let bucketIndex = 0; bucketIndex < targetCount; bucketIndex += 1) {
+      const bucket = buckets.get(bucketIndex);
+      if (!bucket || bucket.length === 0) continue;
+      bucket.sort((a, b) => b.occupancyPct - a.occupancyPct || a.startSec - b.startSec);
+      selected.push(bucket[0]);
+    }
+
+    const selectedKeys = new Set(selected.map((item) => item.startSec.toFixed(2)));
+    const remaining = [...candidates]
+      .filter((candidate) => !selectedKeys.has(candidate.startSec.toFixed(2)))
+      .sort((a, b) => b.occupancyPct - a.occupancyPct || a.startSec - b.startSec);
+
+    for (const candidate of remaining) {
+      if (selected.length >= targetCount) break;
+      const tooClose = selected.some((picked) => Math.abs(picked.startSec - candidate.startSec) < windowSec * 0.35);
+      if (tooClose) continue;
+      selected.push(candidate);
+    }
+
+    const thresholdCandidates = selected.filter((candidate) => candidate.occupancyPct >= 12);
+    const finalList = thresholdCandidates.length > 0 ? thresholdCandidates : selected;
+    finalList.sort((a, b) => a.startSec - b.startSec);
+
+    return finalList.slice(0, targetCount).map((candidate) => ({
+      startSec: candidate.startSec,
+      durationSec: Math.min(windowSec, Math.max(1, durationSeconds - candidate.startSec)),
+      occupancyPct: candidate.occupancyPct,
+    }));
+  };
+
+  const selectSpeechAnchoredAnalysisWindow = (
+    speechSpans: SpeechSpan[],
+    durationSeconds: number,
+    windowSec: number
+  ): { startSec: number; durationSec: number; occupancyPct: number } | null => {
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0 || speechSpans.length === 0) {
+      return null;
+    }
+
+    const safeWindowSec = clamp(windowSec, 1, Math.max(1, durationSeconds));
+    const maxStart = Math.max(0, durationSeconds - safeWindowSec);
+
+    const candidateStarts = new Set<number>();
+    const addCandidate = (startSec: number) => {
+      const clampedStart = clamp(startSec, 0, maxStart);
+      candidateStarts.add(Number(clampedStart.toFixed(3)));
+    };
+
+    for (const span of speechSpans) {
+      const spanLen = Math.max(0, span.endSec - span.startSec);
+      if (spanLen < 0.05) continue;
+      addCandidate(span.startSec - safeWindowSec * 0.12);
+      addCandidate(((span.startSec + span.endSec) / 2) - safeWindowSec / 2);
+      addCandidate(span.endSec - safeWindowSec * 0.88);
+      if (spanLen > safeWindowSec) {
+        const stepSec = Math.max(12, safeWindowSec * 0.45);
+        for (let t = span.startSec; t <= span.endSec; t += stepSec) {
+          addCandidate(t - safeWindowSec / 2);
+        }
+      }
+    }
+
+    if (candidateStarts.size === 0) {
+      return null;
+    }
+
+    const candidates = [...candidateStarts].map((startSec) => ({
+      startSec,
+      durationSec: Math.min(safeWindowSec, Math.max(1, durationSeconds - startSec)),
+      occupancyPct: speechOccupancyPctInWindow(speechSpans, startSec, safeWindowSec),
+      timelineBias: durationSeconds > 0 ? startSec / durationSeconds : 0,
+    }));
+
+    const strongCandidate = candidates
+      .filter((candidate) => candidate.occupancyPct >= 8)
+      .sort((a, b) => b.occupancyPct - a.occupancyPct || a.timelineBias - b.timelineBias)[0];
+    if (strongCandidate) {
+      return {
+        startSec: strongCandidate.startSec,
+        durationSec: strongCandidate.durationSec,
+        occupancyPct: strongCandidate.occupancyPct,
+      };
+    }
+
+    const earliestSpeechStart = speechSpans[0]?.startSec ?? 0;
+    const fallbackStart = clamp(earliestSpeechStart - safeWindowSec * 0.1, 0, maxStart);
+    return {
+      startSec: fallbackStart,
+      durationSec: Math.min(safeWindowSec, Math.max(1, durationSeconds - fallbackStart)),
+      occupancyPct: speechOccupancyPctInWindow(speechSpans, fallbackStart, safeWindowSec),
+    };
+  };
+
+  const weightedPercentile = (entries: Array<{ value: number; weight: number }>, percent: number) => {
+    const usable = entries
+      .filter((entry) => Number.isFinite(entry.value) && Number.isFinite(entry.weight) && entry.weight > 0)
+      .sort((a, b) => a.value - b.value);
+    if (usable.length === 0) return null;
+    const totalWeight = usable.reduce((sum, entry) => sum + entry.weight, 0);
+    if (totalWeight <= 0) return usable[Math.floor(usable.length / 2)]?.value ?? null;
+    const target = (clamp(percent, 0, 100) / 100) * totalWeight;
+    let cumulative = 0;
+    for (const entry of usable) {
+      cumulative += entry.weight;
+      if (cumulative >= target) return entry.value;
+    }
+    return usable.at(-1)?.value ?? null;
+  };
+
+  const weightedMetric = (
+    analyses: Array<{ analysis: FileAnalysis; weight: number }>,
+    getter: (analysis: FileAnalysis) => number | null,
+    percent: number
+  ) => {
+    const entries: Array<{ value: number; weight: number }> = [];
+    for (const item of analyses) {
+      const value = getter(item.analysis);
+      if (value === null || !Number.isFinite(value)) continue;
+      entries.push({ value, weight: item.weight });
+    }
+    return weightedPercentile(entries, percent);
+  };
+
+  const runSilenceMapAnalysis = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    silenceDb: number,
+    durationSeconds: number | null
+  ) => {
+    resetLogBuffer();
+    await execOrThrow(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-i",
+        inputName,
+        "-af",
+        `highpass=f=70,lowpass=f=6000,silencedetect=n=${silenceDb.toFixed(1)}dB:d=0.32`,
+        "-f",
+        "null",
+        "-",
+      ],
+      "Silence map analysis"
+    );
+    const logText = resetLogBuffer();
+    const silences = parseSilencedetectSpans(logText, durationSeconds);
+    const speech = durationSeconds !== null ? deriveSpeechSpans(silences, durationSeconds) : [];
+    return { silenceSpans: silences, speechSpans: speech };
+  };
+
+  const analyzeFileWindow = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    startSeconds: number,
+    durationSeconds: number
+  ): Promise<FileAnalysis> => {
+    const analysis = createEmptyAnalysis();
+    const windowStart = Math.max(0, startSeconds);
+    const windowDur = Math.max(1, durationSeconds);
+    const trimArgs = ["-ss", windowStart.toFixed(3), "-t", windowDur.toFixed(3)];
+
+    resetLogBuffer();
+    await execOrThrow(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-threads",
+        "1",
+        ...trimArgs,
+        "-i",
+        inputName,
+        "-af",
+        "loudnorm=I=-24:TP=-2:LRA=7:print_format=json",
+        "-f",
+        "null",
+        "-",
+      ],
+      "Smart match loudness analysis"
+    );
+    const loudData = parseLoudnormJson(resetLogBuffer());
+    analysis.inputI = parseMaybeNumber(loudData?.input_i);
+    analysis.inputLRA = parseMaybeNumber(loudData?.input_lra);
+    analysis.inputTP = parseMaybeNumber(loudData?.input_tp);
+    analysis.inputThresh = parseMaybeNumber(loudData?.input_thresh);
+
+    const runRmsAnalysisWindow = async (bandFilter: string) => {
+      resetLogBuffer();
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          ...trimArgs,
+          "-i",
+          inputName,
+          "-af",
+          `${bandFilter},astats=metadata=0:reset=0:measure_perchannel=0`,
+          "-f",
+          "null",
+          "-",
+        ],
+        "RMS analysis"
+      );
+      return parseRmsFromAstats(resetLogBuffer());
+    };
+
+    analysis.lowRms = await runRmsAnalysisWindow("highpass=f=50,lowpass=f=220");
+    analysis.midRms = await runRmsAnalysisWindow("highpass=f=300,lowpass=f=2400");
+    analysis.highRms = await runRmsAnalysisWindow("highpass=f=2800,lowpass=f=9000");
+
+    const analysisName = `${sanitizeBase(inputName)}_${Math.round(windowStart * 1000)}_${Math.round(windowDur * 1000)}_env.f32`;
     try {
       resetLogBuffer();
       await execOrThrow(
@@ -713,10 +1307,9 @@ const summarizeFailureReason = (error: unknown) => {
           "-threads",
           "1",
           "-y",
+          ...trimArgs,
           "-i",
           inputName,
-          "-t",
-          `${ANALYSIS_SAMPLE_SECONDS}`,
           "-ac",
           "1",
           "-ar",
@@ -729,51 +1322,8 @@ const summarizeFailureReason = (error: unknown) => {
         ],
         "Envelope analysis render"
       );
-
       const bytes = await readVirtualFileBytes(ffmpeg, analysisName);
-      const samples = toFloatSamples(bytes);
-      return computeEnvelopeMetrics(samples);
-    } finally {
-      await safeDeleteFile(ffmpeg, analysisName);
-    }
-  };
-
-  const analyzeFile = async (ffmpeg: FFmpeg, inputName: string): Promise<FileAnalysis> => {
-    const analysis = createEmptyAnalysis();
-
-    resetLogBuffer();
-    await execOrThrow(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-i",
-        inputName,
-        "-t",
-        `${ANALYSIS_SAMPLE_SECONDS}`,
-        "-af",
-        "loudnorm=I=-24:TP=-2:LRA=7:print_format=json",
-        "-f",
-        "null",
-        "-",
-      ],
-      "Smart match loudness analysis"
-    );
-
-    const loudData = parseLoudnormJson(resetLogBuffer());
-    analysis.inputI = parseMaybeNumber(loudData?.input_i);
-    analysis.inputLRA = parseMaybeNumber(loudData?.input_lra);
-    analysis.inputTP = parseMaybeNumber(loudData?.input_tp);
-    analysis.inputThresh = parseMaybeNumber(loudData?.input_thresh);
-
-    analysis.lowRms = await runRmsAnalysis(ffmpeg, inputName, "highpass=f=50,lowpass=f=220");
-    analysis.midRms = await runRmsAnalysis(ffmpeg, inputName, "highpass=f=300,lowpass=f=2400");
-    analysis.highRms = await runRmsAnalysis(ffmpeg, inputName, "highpass=f=2800,lowpass=f=9000");
-
-    try {
-      const envelope = await runEnvelopeAnalysis(ffmpeg, inputName);
+      const envelope = computeEnvelopeMetrics(toFloatSamples(bytes));
       analysis.noiseFloorDb = envelope.noiseFloorDb;
       analysis.nearSpeechNoiseFloorDb = envelope.nearSpeechNoiseFloorDb;
       analysis.speechThresholdDb = envelope.speechThresholdDb;
@@ -785,15 +1335,202 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.drynessScore = envelope.drynessScore;
       analysis.instabilityScore = envelope.instabilityScore;
       analysis.clickScore = envelope.clickScore;
+      analysis.speechDutyCyclePct = envelope.speechDutyCyclePct;
+      analysis.speechSegmentCount = envelope.speechSegmentCount;
+      analysis.medianSpeechRunMs = envelope.medianSpeechRunMs;
+      analysis.longSilenceCount = envelope.longSilenceCount;
+      analysis.onsetOvershootScore = envelope.onsetOvershootScore;
+      analysis.midLineSagScore = envelope.midLineSagScore;
+      analysis.endFadeRiskScore = envelope.endFadeRiskScore;
+    } finally {
+      await safeDeleteFile(ffmpeg, analysisName);
+    }
+
+    analysis.analysisWindowCount = 1;
+    return analysis;
+  };
+
+  const aggregateWindowAnalyses = (
+    baseAnalysis: FileAnalysis,
+    windowAnalyses: Array<{ analysis: FileAnalysis; weight: number }>,
+    speechMapStats?: {
+      speechDutyCyclePct: number;
+      speechSegmentCount: number;
+      medianSpeechRunMs: number;
+      longSilenceCount: number;
+      longSparseModeEligible: boolean;
+    }
+  ): FileAnalysis => {
+    if (windowAnalyses.length === 0) return baseAnalysis;
+
+    const aggregated = createEmptyAnalysis();
+    aggregated.inputI = weightedMetric(windowAnalyses, (a) => a.inputI, 50);
+    aggregated.inputLRA = weightedMetric(windowAnalyses, (a) => a.inputLRA, 50);
+    aggregated.inputTP = weightedMetric(windowAnalyses, (a) => a.inputTP, 50);
+    aggregated.inputThresh = weightedMetric(windowAnalyses, (a) => a.inputThresh, 50);
+    aggregated.lowRms = weightedMetric(windowAnalyses, (a) => a.lowRms, 50);
+    aggregated.midRms = weightedMetric(windowAnalyses, (a) => a.midRms, 50);
+    aggregated.highRms = weightedMetric(windowAnalyses, (a) => a.highRms, 50);
+    aggregated.noiseFloorDb = weightedMetric(windowAnalyses, (a) => a.noiseFloorDb, 70);
+    aggregated.nearSpeechNoiseFloorDb = weightedMetric(windowAnalyses, (a) => a.nearSpeechNoiseFloorDb, 70);
+    aggregated.speechThresholdDb = weightedMetric(windowAnalyses, (a) => a.speechThresholdDb, 60);
+    aggregated.reverbScore = weightedMetric(windowAnalyses, (a) => a.reverbScore, 70);
+    aggregated.echoScore = weightedMetric(windowAnalyses, (a) => a.echoScore, 70);
+    aggregated.roomScore = weightedMetric(windowAnalyses, (a) => a.roomScore, 70);
+    aggregated.echoDelayMs = weightedMetric(windowAnalyses, (a) => a.echoDelayMs, 50);
+    aggregated.analysisConfidence = weightedMetric(windowAnalyses, (a) => a.analysisConfidence, 50);
+    aggregated.drynessScore = weightedMetric(windowAnalyses, (a) => a.drynessScore, 50);
+    aggregated.instabilityScore = weightedMetric(windowAnalyses, (a) => a.instabilityScore, 75);
+    aggregated.clickScore = weightedMetric(windowAnalyses, (a) => a.clickScore, 70);
+    aggregated.onsetOvershootScore = weightedMetric(windowAnalyses, (a) => a.onsetOvershootScore, 75);
+    aggregated.midLineSagScore = weightedMetric(windowAnalyses, (a) => a.midLineSagScore, 75);
+    aggregated.endFadeRiskScore = weightedMetric(windowAnalyses, (a) => a.endFadeRiskScore, 75);
+    aggregated.speechDutyCyclePct =
+      speechMapStats?.speechDutyCyclePct ?? weightedMetric(windowAnalyses, (a) => a.speechDutyCyclePct, 50);
+    aggregated.speechSegmentCount =
+      speechMapStats?.speechSegmentCount ?? weightedMetric(windowAnalyses, (a) => a.speechSegmentCount, 50);
+    aggregated.medianSpeechRunMs =
+      speechMapStats?.medianSpeechRunMs ?? weightedMetric(windowAnalyses, (a) => a.medianSpeechRunMs, 50);
+    aggregated.longSilenceCount =
+      speechMapStats?.longSilenceCount ?? weightedMetric(windowAnalyses, (a) => a.longSilenceCount, 50);
+    aggregated.analysisWindowCount = windowAnalyses.length;
+    aggregated.longSparseModeEligible = speechMapStats?.longSparseModeEligible ?? false;
+
+    for (const key of Object.keys(baseAnalysis) as Array<keyof FileAnalysis>) {
+      if (aggregated[key] !== null) continue;
+      (aggregated as Record<string, number | boolean | null>)[key] =
+        (baseAnalysis as Record<string, number | boolean | null>)[key];
+    }
+
+    return aggregated;
+  };
+
+  const analyzeFile = async (ffmpeg: FFmpeg, inputName: string): Promise<FileAnalysis> => {
+    let durationSeconds: number | null = null;
+    try {
+      durationSeconds = await probeInputDurationSeconds(ffmpeg, inputName);
+    } catch {
+      durationSeconds = null;
+    }
+
+    const baseWindowDuration =
+      durationSeconds !== null ? Math.min(ANALYSIS_SAMPLE_SECONDS, Math.max(10, durationSeconds)) : ANALYSIS_SAMPLE_SECONDS;
+    let baseWindowStart = 0;
+    let coarseSpeechMap:
+      | { silenceDb: number; silenceSpans: SilenceSpan[]; speechSpans: SpeechSpan[] }
+      | null = null;
+
+    if (durationSeconds !== null && durationSeconds > baseWindowDuration + 1) {
+      const coarseSilenceDb = -46;
+      try {
+        const coarseMap = await runSilenceMapAnalysis(ffmpeg, inputName, coarseSilenceDb, durationSeconds);
+        coarseSpeechMap = {
+          silenceDb: coarseSilenceDb,
+          silenceSpans: coarseMap.silenceSpans,
+          speechSpans: coarseMap.speechSpans,
+        };
+        const bootstrapWindow = selectSpeechAnchoredAnalysisWindow(
+          coarseMap.speechSpans,
+          durationSeconds,
+          baseWindowDuration
+        );
+        if (bootstrapWindow && bootstrapWindow.occupancyPct > 0.1) {
+          baseWindowStart = bootstrapWindow.startSec;
+          if (baseWindowStart > 0.5) {
+            appendLog(
+              `[Analysis] ${sanitizeBase(inputName)}: speech-anchored bootstrap @ ${baseWindowStart.toFixed(
+                1
+              )}s (${bootstrapWindow.occupancyPct.toFixed(1)}% speech in ${bootstrapWindow.durationSec.toFixed(0)}s window).`
+            );
+          }
+        } else {
+          appendLog(
+            `[Analysis] ${sanitizeBase(
+              inputName
+            )}: no reliable speech found in coarse map, using start-window bootstrap.`
+          );
+        }
+      } catch (error) {
+        appendLog(
+          `[Analysis] Bootstrap speech-map fallback (${sanitizeBase(inputName)}): ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+      }
+    }
+
+    const baseAnalysis = await analyzeFileWindow(ffmpeg, inputName, baseWindowStart, baseWindowDuration);
+    baseAnalysis.analysisWindowCount = 1;
+
+    if (durationSeconds === null || durationSeconds < LONG_SPARSE_DURATION_SECONDS) {
+      baseAnalysis.longSparseModeEligible = false;
+      return baseAnalysis;
+    }
+
+    const silenceDb = clamp(
+      Math.max(baseAnalysis.nearSpeechNoiseFloorDb ?? -90, baseAnalysis.noiseFloorDb ?? -70) + 16,
+      -46,
+      -30
+    );
+
+    try {
+      const useCoarseSpeechMap = coarseSpeechMap !== null && Math.abs(coarseSpeechMap.silenceDb - silenceDb) <= 1;
+      let silenceMapResult: { silenceSpans: SilenceSpan[]; speechSpans: SpeechSpan[] };
+      if (useCoarseSpeechMap && coarseSpeechMap) {
+        silenceMapResult = {
+          silenceSpans: coarseSpeechMap.silenceSpans,
+          speechSpans: coarseSpeechMap.speechSpans,
+        };
+      } else {
+        silenceMapResult = await runSilenceMapAnalysis(ffmpeg, inputName, silenceDb, durationSeconds);
+      }
+      const { silenceSpans, speechSpans } = silenceMapResult;
+      const speechStats = computeSpeechMapStats(speechSpans, silenceSpans, durationSeconds);
+      baseAnalysis.speechDutyCyclePct = speechStats.speechDutyCyclePct;
+      baseAnalysis.speechSegmentCount = speechStats.speechSegmentCount;
+      baseAnalysis.medianSpeechRunMs = speechStats.medianSpeechRunMs;
+      baseAnalysis.longSilenceCount = speechStats.longSilenceCount;
+      baseAnalysis.longSparseModeEligible = speechStats.longSparseModeEligible;
+
+      if (!speechStats.longSparseModeEligible) {
+        return baseAnalysis;
+      }
+
+      const windows = selectDistributedAnalysisWindows(speechSpans, durationSeconds);
+      appendLog(
+        `[Analysis] ${sanitizeBase(inputName)}: long-sparse mode on (speech-duty ${speechStats.speechDutyCyclePct.toFixed(
+          1
+        )}%, median-run ${(speechStats.medianSpeechRunMs / 1000).toFixed(1)}s, windows ${windows.length}).`
+      );
+
+      const windowAnalyses: Array<{ analysis: FileAnalysis; weight: number }> = [];
+      for (const window of windows) {
+        try {
+          const windowAnalysis = await analyzeFileWindow(ffmpeg, inputName, window.startSec, window.durationSec);
+          const speechCoverage = clamp((window.occupancyPct ?? windowAnalysis.speechDutyCyclePct ?? 0) / 100, 0, 1);
+          const confidence = clamp(windowAnalysis.analysisConfidence ?? 0.25, 0, 1);
+          const roomPenalty = clamp(1 - (windowAnalysis.roomScore ?? 0), 0, 1);
+          const weight = clamp(speechCoverage * 0.55 + confidence * 0.35 + roomPenalty * 0.1, 0.05, 1);
+          windowAnalyses.push({ analysis: windowAnalysis, weight });
+        } catch (error) {
+          appendLog(
+            `[Analysis] Window fallback (${sanitizeBase(inputName)} @ ${window.startSec.toFixed(1)}s): ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
+
+      if (windowAnalyses.length > 0) {
+        return aggregateWindowAnalyses(baseAnalysis, windowAnalyses, speechStats);
+      }
     } catch (error) {
       appendLog(
-        `[Analysis] Envelope fallback (${inputName}): ${
-          error instanceof Error ? error.message : String(error)
-        }`
+        `[Analysis] Sparse-map fallback (${inputName}): ${error instanceof Error ? error.message : String(error)}`
       );
     }
 
-    return analysis;
+    return baseAnalysis;
   };
 
   const buildBatchReference = (analyses: FileAnalysis[]) => {
@@ -922,12 +1659,33 @@ const summarizeFailureReason = (error: unknown) => {
     const useDenoise = false;
     const instabilityScore = clamp(analysis.instabilityScore ?? 0, 0, 1);
     const clickScore = clamp(analysis.clickScore ?? 0, 0, 1);
-    const preserveSentenceEndings = noiseRisk === "low" && instabilityScore >= 0.62 && echoScore < 0.92;
+    const onsetOvershootScore = clamp(analysis.onsetOvershootScore ?? 0, 0, 1);
+    const midLineSagScore = clamp(analysis.midLineSagScore ?? 0, 0, 1);
+    const endFadeRiskScore = clamp(analysis.endFadeRiskScore ?? 0, 0, 1);
+    const lineContinuityRisk = clamp(
+      instabilityScore * 0.45 + onsetOvershootScore * 0.25 + midLineSagScore * 0.2 + endFadeRiskScore * 0.1,
+      0,
+      1
+    );
+    const preserveEndings =
+      (noiseRisk === "low" && (endFadeRiskScore >= 0.45 || instabilityScore >= 0.62)) ||
+      (midLineSagScore >= 0.52 && echoScore < 0.9);
+    const strictEndingProtection =
+      preserveEndings &&
+      noiseRisk === "low" &&
+      (endFadeRiskScore >= 0.78 || lineContinuityRisk >= 0.58 || !!analysis.longSparseModeEligible);
+    const onsetTameStrength = clamp(onsetOvershootScore * (noiseRisk === "low" ? 1 : 0.7), 0, 1);
+    const sagRecoveryStrength = clamp(midLineSagScore * (noiseRisk === "high" ? 0.5 : 1), 0, 1);
+    const disableDynaThresholdForStability = noiseRisk === "low" && (preserveEndings || midLineSagScore >= 0.45);
+    const useSpeechAlignedSegmentation =
+      !!analysis.longSparseModeEligible &&
+      (instabilityScore >= 0.58 || onsetOvershootScore >= 0.45 || midLineSagScore >= 0.45);
+
     const forceTailGateForEcho =
-      roomCleanupEnabled && roomRisk === "high" && echoScore >= 0.62 && !preserveSentenceEndings;
+      roomCleanupEnabled && roomRisk === "high" && echoScore >= 0.62 && !preserveEndings;
     const useTailGate =
       roomCleanupEnabled &&
-      !preserveSentenceEndings &&
+      !preserveEndings &&
       (forceTailGateForEcho ||
         (analysisConfidence >= 0.52 && (roomRisk === "high" || (roomRisk === "medium" && echoScore >= 0.5))));
     const denoiseStrength = 0;
@@ -999,6 +1757,15 @@ const summarizeFailureReason = (error: unknown) => {
       instabilityScore,
       clickScore,
       clickTameStrength,
+      lineContinuityRisk,
+      preserveEndings,
+      onsetTameStrength,
+      sagRecoveryStrength,
+      disableDynaThresholdForStability,
+      strictEndingProtection,
+      useSpeechAlignedSegmentation,
+      segmentTargetSec: SPEECH_ALIGNED_SEGMENT_TARGET_SECONDS,
+      segmentMaxSec: SPEECH_ALIGNED_SEGMENT_MAX_SECONDS,
       blendIndoorGain,
       blendOutdoorGain,
       blendIndoorDelayMs,
@@ -1030,6 +1797,19 @@ const summarizeFailureReason = (error: unknown) => {
     )}dB:attack=${attack}:release=${release}:level=disabled`;
   };
 
+  const buildOnsetTamerFilter = (strength: number) => {
+    const thresholdDb = clamp(-19 - strength * 4, -23, -19);
+    const ratio = clamp(1.08 + strength * 0.5, 1.08, 1.45);
+    const attack = Math.round(clamp(2 + strength * 3, 2, 5));
+    const release = Math.round(clamp(32 + strength * 40, 32, 72));
+    const mix = clamp(0.18 + strength * 0.22, 0.18, 0.4);
+    return `acompressor=threshold=${thresholdDb.toFixed(
+      1
+    )}dB:ratio=${ratio.toFixed(2)}:attack=${attack}:release=${release}:mix=${mix.toFixed(
+      2
+    )}:detection=peak`;
+  };
+
   const buildAdaptiveNoiseReductionFilter = (noiseRisk: NoiseRisk, noiseFloorDb: number | null) => {
     if (noiseRisk === "low") return null;
 
@@ -1053,6 +1833,10 @@ const summarizeFailureReason = (error: unknown) => {
     disableAdaptiveNoiseReduction?: boolean;
     minimalStabilityChain?: boolean;
     disableLimiter?: boolean;
+    segmentBoundaryPadInMs?: number;
+    segmentBoundaryPadOutMs?: number;
+    trimSegmentPadMs?: number;
+    segmentMode?: "fixed" | "speech-aligned";
   };
 
   const resolveAdaptiveNoiseReductionFilter = (
@@ -1075,7 +1859,13 @@ const summarizeFailureReason = (error: unknown) => {
     const useAdaptiveNoiseReduction = adaptiveNoiseReductionFilter !== null;
     const instabilityScore = profile?.instabilityScore ?? 0;
     const clickTameStrength = profile?.clickTameStrength ?? 0;
+    const onsetTameStrength = profile?.onsetTameStrength ?? 0;
+    const sagRecoveryStrength = profile?.sagRecoveryStrength ?? 0;
+    const disableDynaThresholdForStability = profile?.disableDynaThresholdForStability ?? false;
+    const lineContinuityRisk = profile?.lineContinuityRisk ?? 0;
+    const strictEndingProtection = profile?.strictEndingProtection ?? false;
     const useClickTamer = !minimalStabilityChain && clickTameStrength >= 0.46;
+    const useOnsetTamer = !minimalStabilityChain && onsetTameStrength >= 0.35;
 
     if (eqCleanup) {
       const highpassHz = profile?.highpassHz ?? 80;
@@ -1089,6 +1879,9 @@ const summarizeFailureReason = (error: unknown) => {
     }
     if (!eqCleanup && useAdaptiveNoiseReduction && adaptiveNoiseReductionFilter) {
       filters.push(adaptiveNoiseReductionFilter);
+    }
+    if (useOnsetTamer) {
+      filters.push(buildOnsetTamerFilter(onsetTameStrength));
     }
     if (useClickTamer) {
       filters.push(buildClickTamerFilter(clickTameStrength));
@@ -1150,12 +1943,36 @@ const summarizeFailureReason = (error: unknown) => {
               dynaThresholdAmp = Math.max(dynaThresholdAmp, fromDb(speechGateDb));
             }
           }
+
+          if (sagRecoveryStrength > 0.12) {
+            dynaF = Math.round(
+              clamp(
+                dynaF - sagRecoveryStrength * (profile.noiseRisk === "high" ? 24 : profile.noiseRisk === "medium" ? 44 : 64),
+                181,
+                281
+              )
+            );
+            dynaG = Math.min(9.5, dynaG + sagRecoveryStrength * (profile.noiseRisk === "high" ? 0.6 : 1.3));
+            dynaM = Math.min(10.5, dynaM + sagRecoveryStrength * (profile.noiseRisk === "high" ? 0.5 : 1.1));
+          }
+
+          if (strictEndingProtection && profile.noiseRisk === "low") {
+            // Protect sentence endings and close-gap continuity on sparse dialogue takes.
+            dynaF = Math.round(clamp(dynaF - (profile.useSpeechAlignedSegmentation ? 42 : 26), 181, 241));
+            dynaG = clamp(dynaG + 0.7, 3, 8.5);
+            dynaM = clamp(dynaM + 0.5, 3, 9.5);
+            dynaThresholdAmp = 0;
+          }
         }
       } else {
         // Stability-safe fallback keeps mandatory leveler but removes adaptive modifiers.
         dynaF = dyn.f;
         dynaG = dyn.g;
         dynaM = dyn.m;
+      }
+
+      if (!minimalStabilityChain && disableDynaThresholdForStability && profile?.noiseRisk === "low") {
+        dynaThresholdAmp = 0;
       }
 
       const dynaGInt = toOddInt(dynaG, 3, 301);
@@ -1175,7 +1992,7 @@ const summarizeFailureReason = (error: unknown) => {
       floorGuard &&
       (profile?.noiseRisk === "high" || (noiseGuard && profile?.noiseRisk === "medium"));
     const useFloorGuard = !useRoomGate && floorGuard && (breath === null || preferFloorGuard);
-    const useBreathCompand = !useRoomGate && breath !== null && !useFloorGuard;
+    const useBreathCompand = !strictEndingProtection && !useRoomGate && breath !== null && !useFloorGuard;
 
     if (!minimalStabilityChain && useRoomGate && roomGateFilter) {
       filters.push(roomGateFilter);
@@ -1270,6 +2087,12 @@ const summarizeFailureReason = (error: unknown) => {
       instabilityScore * (profile?.noiseRisk === "high" ? 0.9 : profile?.noiseRisk === "medium" ? 0.75 : 0.65);
     thresholdAdjust += instabilityCompressorRelax * 0.9;
     ratioAdjust -= instabilityCompressorRelax * 0.35;
+    thresholdAdjust += lineContinuityRisk * 0.35;
+    ratioAdjust -= lineContinuityRisk * 0.14;
+    if (strictEndingProtection) {
+      thresholdAdjust += 0.45;
+      ratioAdjust -= 0.18;
+    }
 
     // Smarter consistency: tighten when needed, but protect emotional peaks.
     const thresholdTighten = consistency * (0.55 + levelingNeed * 0.75);
@@ -1291,7 +2114,8 @@ const summarizeFailureReason = (error: unknown) => {
           emotionProtection * 8 +
           roomRelax * 4 +
           echoPressure * 2 +
-          instabilityCompressorRelax * 3,
+          instabilityCompressorRelax * 3 +
+          lineContinuityRisk * 2,
         14,
         36
       )
@@ -1303,9 +2127,11 @@ const summarizeFailureReason = (error: unknown) => {
           emotionProtection * 75 +
           roomRelax * 40 +
           echoPressure * 30 +
-          instabilityCompressorRelax * 55,
+          instabilityCompressorRelax * 55 +
+          lineContinuityRisk * 85 +
+          (strictEndingProtection ? 125 : profile?.preserveEndings ? 55 : 0),
         95,
-        320
+        420
       )
     );
     const compMix = clamp(
@@ -1314,7 +2140,9 @@ const summarizeFailureReason = (error: unknown) => {
         emotionProtection * 0.24 -
         roomRelax * 0.08 -
         echoPressure * 0.04 -
-        instabilityCompressorRelax * 0.12,
+        instabilityCompressorRelax * 0.12 -
+        lineContinuityRisk * 0.08 -
+        (strictEndingProtection ? 0.06 : 0),
       0.58,
       0.95
     );
@@ -1606,6 +2434,201 @@ const summarizeFailureReason = (error: unknown) => {
     }
   };
 
+  const buildSpeechAlignedRenderSegments = (
+    speechSpans: SpeechSpan[],
+    silenceSpans: SilenceSpan[],
+    durationSeconds: number,
+    profile: AdaptiveProfile | null
+  ): RenderSegment[] => {
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return [];
+    const targetSec = profile?.segmentTargetSec ?? SPEECH_ALIGNED_SEGMENT_TARGET_SECONDS;
+    const maxSec = profile?.segmentMaxSec ?? SPEECH_ALIGNED_SEGMENT_MAX_SECONDS;
+    const segments: RenderSegment[] = [];
+
+    const isWithinLongSilence = (timeSec: number) =>
+      silenceSpans.some((span) => span.endSec - span.startSec >= 0.5 && timeSec >= span.startSec && timeSec <= span.endSec);
+
+    const speechOccupancy = (startSec: number, endSec: number) => {
+      let sum = 0;
+      for (const span of speechSpans) {
+        if (span.endSec <= startSec) continue;
+        if (span.startSec >= endSec) break;
+        sum += overlapSeconds(startSec, endSec, span.startSec, span.endSec);
+      }
+      return sum / Math.max(endSec - startSec, 1e-6);
+    };
+
+    let cursor = 0;
+    while (cursor < durationSeconds - 0.02) {
+      const minCut = Math.min(durationSeconds, cursor + targetSec * 0.55);
+      const idealCut = Math.min(durationSeconds, cursor + targetSec);
+      const hardCut = Math.min(durationSeconds, cursor + maxSec);
+
+      let cutSec = hardCut;
+      let bestScore = Number.POSITIVE_INFINITY;
+      for (const silence of silenceSpans) {
+        const silenceLen = silence.endSec - silence.startSec;
+        if (silenceLen < 0.4) continue;
+        const center = (silence.startSec + silence.endSec) / 2;
+        if (center < minCut || center > hardCut) continue;
+        const score = Math.abs(center - idealCut);
+        if (score < bestScore) {
+          bestScore = score;
+          cutSec = center;
+        }
+      }
+
+      if (cutSec <= cursor + 0.25) {
+        cutSec = Math.min(durationSeconds, cursor + targetSec);
+      }
+
+      const startSec = cursor;
+      const endSec = Math.max(cursor + 0.1, cutSec);
+      const occupancy = speechOccupancy(startSec, endSec);
+      const process = occupancy >= 0.01;
+      const trimInMs = 0;
+      const trimOutMs = 0;
+      segments.push({ startSec, endSec, process, trimInMs, trimOutMs });
+      cursor = endSec;
+    }
+
+    for (let i = 0; i < segments.length; i += 1) {
+      const segment = segments[i];
+      if (!segment.process) continue;
+      const startOnLongSilence = isWithinLongSilence(segment.startSec);
+      const endOnLongSilence = isWithinLongSilence(segment.endSec);
+      const strictEndingProtection = profile?.strictEndingProtection ?? false;
+      const padInMs = strictEndingProtection
+        ? SPEECH_ALIGNED_SEGMENT_PAD_IN_MS + 80
+        : SPEECH_ALIGNED_SEGMENT_PAD_IN_MS;
+      const padOutMs = strictEndingProtection
+        ? SPEECH_ALIGNED_SEGMENT_PAD_OUT_MS + 260
+        : SPEECH_ALIGNED_SEGMENT_PAD_OUT_MS;
+      segment.trimInMs = startOnLongSilence ? 0 : padInMs;
+      // Even when cut lands in detected silence, keep a small tail context for conservative
+      // look-ahead filters in case the detector marked a low-level word ending as silence.
+      segment.trimOutMs = endOnLongSilence ? (strictEndingProtection ? 160 : 0) : padOutMs;
+    }
+
+    return segments;
+  };
+
+  const buildSilenceSegmentFilter = (profile: AdaptiveProfile | null) => {
+    const filters: string[] = [];
+    if (eqCleanup) {
+      filters.push(`highpass=f=${profile?.highpassHz ?? 80}`);
+    }
+    if (floorGuard && profile?.noiseRisk === "high") {
+      filters.push(profile.floorGuardFilter);
+    }
+    if (filters.length === 0) return null;
+    return filters.join(",");
+  };
+
+  const runMixReadySpeechAlignedSegmented = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    outputName: string,
+    profile: AdaptiveProfile | null,
+    durationSeconds: number,
+    silenceSpans: SilenceSpan[],
+    speechSpans: SpeechSpan[],
+    options?: MixRenderOptions
+  ) => {
+    const segments = buildSpeechAlignedRenderSegments(speechSpans, silenceSpans, durationSeconds, profile);
+    if (segments.length < 2) {
+      throw new Error("Speech-aligned segmentation skipped (insufficient segments).");
+    }
+
+    const processedFilter = buildMixFilter(profile, { ...options, segmentMode: "speech-aligned" });
+    const silenceFilter = buildSilenceSegmentFilter(profile);
+    const tempBase = sanitizeBase(outputName);
+    const concatListName = `${tempBase}_speech_segments.txt`;
+    const segmentNames: string[] = [];
+
+    try {
+      for (let index = 0; index < segments.length; index += 1) {
+        const segment = segments[index];
+        const readStart = Math.max(0, segment.startSec - segment.trimInMs / 1000);
+        const readEnd = Math.min(durationSeconds, segment.endSec + segment.trimOutMs / 1000);
+        const readSpan = Math.max(0.05, readEnd - readStart);
+        const trimStartSec = Math.max(0, (segment.startSec - readStart) + ((options?.trimSegmentPadMs ?? 0) / 1000));
+        const trimEndSec = Math.max(
+          trimStartSec + 0.02,
+          (segment.endSec - readStart) - ((options?.trimSegmentPadMs ?? 0) / 1000)
+        );
+        const segmentName = `${tempBase}_speech_seg_${index + 1}.wav`;
+        segmentNames.push(segmentName);
+
+        const baseFilter = segment.process ? processedFilter : silenceFilter;
+        const trimFilter = `atrim=start=${trimStartSec.toFixed(3)}:end=${trimEndSec.toFixed(3)},asetpts=N/SR/TB`;
+        const filterChain = baseFilter ? `${baseFilter},${trimFilter}` : trimFilter;
+
+        resetLogBuffer();
+        await execOrThrow(
+          ffmpeg,
+          [
+            "-hide_banner",
+            "-nostdin",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-y",
+            "-ss",
+            readStart.toFixed(3),
+            "-t",
+            readSpan.toFixed(3),
+            "-i",
+            inputName,
+            "-af",
+            filterChain,
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_f32le",
+            segmentName,
+          ],
+          `Speech-aligned segment render ${index + 1}/${segments.length}`
+        );
+      }
+
+      const concatList = `${segmentNames.map((name) => `file '${name}'`).join("\n")}\n`;
+      await ffmpeg.writeFile(concatListName, new TextEncoder().encode(concatList));
+
+      resetLogBuffer();
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-y",
+          "-f",
+          "concat",
+          "-safe",
+          "0",
+          "-i",
+          concatListName,
+          "-c",
+          "copy",
+          outputName,
+        ],
+        "Speech-aligned segment concat render"
+      );
+
+      return segments.length;
+    } finally {
+      await safeDeleteFile(ffmpeg, concatListName);
+      for (const name of segmentNames) {
+        await safeDeleteFile(ffmpeg, name);
+      }
+    }
+  };
+
   const runBlendMixReady = async (
     ffmpeg: FFmpeg,
     inputName: string,
@@ -1791,6 +2814,7 @@ const summarizeFailureReason = (error: unknown) => {
       let ffmpeg = await ensureFfmpeg();
       const outputEntries: OutputEntry[] = [];
       const jobs = buildJobs(files);
+      initializeQueueItems(jobs);
       const analysisByBase = new Map<string, FileAnalysis>();
       let batchReference: BatchReference | null = null;
       const smartMatchEnabled = smartMatchConfig.tone > 0 || smartMatchConfig.dynamics > 0;
@@ -1802,11 +2826,13 @@ const summarizeFailureReason = (error: unknown) => {
         for (let i = 0; i < jobs.length; i += 1) {
           const job = jobs[i];
           setStatus(`Analyze: ${job.base} (${i + 1}/${jobs.length})`);
+          setActiveQueueStage(job.base, "Analyze", `Pass ${i + 1} of ${jobs.length}`);
           try {
             await writeJobInput(ffmpeg, job);
             const analysis = await analyzeFile(ffmpeg, job.inputName);
             analysisByBase.set(job.base, analysis);
             analyses.push(analysis);
+            markQueuePending(job.base, "Ready for render", "Analysis complete");
           } catch (error) {
             appendLog(
               `Analysis fallback (${job.base}): ${error instanceof Error ? error.message : String(error)}`
@@ -1814,6 +2840,7 @@ const summarizeFailureReason = (error: unknown) => {
             const fallback = createEmptyAnalysis();
             analysisByBase.set(job.base, fallback);
             analyses.push(fallback);
+            markQueuePending(job.base, "Ready for render", "Analysis fallback used");
             if (shouldResetFfmpegForError(error)) {
               ffmpeg = await refreshFfmpeg(`analysis failure on ${job.base}`);
             }
@@ -1851,6 +2878,9 @@ const summarizeFailureReason = (error: unknown) => {
           const profile = buildAdaptiveProfile(analysisByBase.get(job.base), batchReference);
           const roomScore = profile ? (analysisByBase.get(job.base)?.roomScore ?? 0) : null;
           const adaptiveNoiseReductionFilter = profile ? resolveAdaptiveNoiseReductionFilter(profile) : null;
+          const primaryMixFilterPreview = profile ? buildMixFilter(profile) : "";
+          const dynaPreviewMatch = primaryMixFilterPreview.match(/dynaudnorm=([^,]+)/i);
+          const dynaPreview = dynaPreviewMatch ? dynaPreviewMatch[1] : "off";
           const adaptiveNoiseReductionLabel =
             adaptiveNoiseReductionFilter === null
               ? "off"
@@ -1868,9 +2898,21 @@ const summarizeFailureReason = (error: unknown) => {
                 1
               )} dB; adaptive-NR ${adaptiveNoiseReductionLabel}), instability ${(
                 profile.instabilityScore * 100
-              ).toFixed(0)}%, clicks ${(profile.clickScore * 100).toFixed(0)}%, conf ${(
+              ).toFixed(0)}%, onset/sag/end ${((analysisByBase.get(job.base)?.onsetOvershootScore ?? 0) * 100).toFixed(
+                0
+              )}/${((analysisByBase.get(job.base)?.midLineSagScore ?? 0) * 100).toFixed(0)}/${(
+                (analysisByBase.get(job.base)?.endFadeRiskScore ?? 0) * 100
+              ).toFixed(0)}%, speech-duty ${(analysisByBase.get(job.base)?.speechDutyCyclePct ?? 0).toFixed(
+                1
+              )}%, median-run ${(((analysisByBase.get(job.base)?.medianSpeechRunMs ?? 0) as number) / 1000).toFixed(
+                1
+              )}s, sparse-mode ${profile.useSpeechAlignedSegmentation ? "on" : "off"}, clicks ${(
+                profile.clickScore * 100
+              ).toFixed(0)}%, conf ${(
                 analysisByBase.get(job.base)?.analysisConfidence ?? 0
-              ).toFixed(2)}, tail-gate ${profile.useTailGate ? "on" : "off"}, echo ${
+              ).toFixed(2)}, tail-gate ${profile.useTailGate ? "on" : "off"}${
+                profile.preserveEndings ? " (endings protect)" : ""
+              }${profile.strictEndingProtection ? " [strict]" : ""}, dyna ${dynaPreview}, echo ${
                 analysisByBase.get(job.base)?.echoDelayMs ?? 0
               } ms, blend ${
                 (profile.blendIndoorGain * 100).toFixed(1)
@@ -1882,6 +2924,7 @@ const summarizeFailureReason = (error: unknown) => {
           const hasAdaptiveNoiseReduction = noiseGuard && !!profile && profile.noiseRisk !== "low";
 
           setStatus(`Mix-ready: ${job.base} (${i + 1}/${jobs.length})`);
+          setActiveQueueStage(job.base, "Mix-ready", `File ${i + 1} of ${jobs.length}`);
           const fallbackStrategies: Array<{ label: string; options?: MixRenderOptions }> = [
             { label: "primary chain" },
           ];
@@ -1916,6 +2959,11 @@ const summarizeFailureReason = (error: unknown) => {
           let fallbackApplied: string | null = null;
           let lastMixError: unknown = null;
           let inputDurationSeconds: number | null | undefined = undefined;
+          let speechAlignedSegmentCountUsed: number | null = null;
+          let cachedSpeechAlignedPlan:
+            | { durationSeconds: number; silenceSpans: SilenceSpan[]; speechSpans: SpeechSpan[] }
+            | null
+            | undefined = undefined;
 
           const ensureInputDuration = async () => {
             if (inputDurationSeconds !== undefined) return inputDurationSeconds;
@@ -1927,9 +2975,76 @@ const summarizeFailureReason = (error: unknown) => {
             return inputDurationSeconds;
           };
 
+          const ensureSpeechAlignedPlan = async () => {
+            if (cachedSpeechAlignedPlan !== undefined) return cachedSpeechAlignedPlan;
+            if (!profile?.useSpeechAlignedSegmentation) {
+              cachedSpeechAlignedPlan = null;
+              return cachedSpeechAlignedPlan;
+            }
+            const durationSeconds = await ensureInputDuration();
+            if (durationSeconds === null || durationSeconds < MIX_SEGMENT_MIN_DURATION_SECONDS) {
+              cachedSpeechAlignedPlan = null;
+              return cachedSpeechAlignedPlan;
+            }
+            const silenceDb = clamp((profile.noiseFloorDb ?? -70) + 16, -46, -30);
+            try {
+              const silenceMap = await runSilenceMapAnalysis(ffmpeg, job.inputName, silenceDb, durationSeconds);
+              cachedSpeechAlignedPlan = {
+                durationSeconds,
+                silenceSpans: silenceMap.silenceSpans,
+                speechSpans: silenceMap.speechSpans,
+              };
+            } catch (error) {
+              appendLog(
+                `[SegmentPlan] ${job.base}: speech-aligned plan fallback (${error instanceof Error ? error.message : String(
+                  error
+                )})`
+              );
+              cachedSpeechAlignedPlan = null;
+            }
+            return cachedSpeechAlignedPlan;
+          };
+
           for (let strategyIndex = 0; strategyIndex < fallbackStrategies.length; strategyIndex += 1) {
             const strategy = fallbackStrategies[strategyIndex];
             try {
+              if (strategyIndex === 0 && profile?.useSpeechAlignedSegmentation) {
+                const plan = await ensureSpeechAlignedPlan();
+                if (plan && plan.speechSpans.length > 0) {
+                  try {
+                    setStatus(`Speech-aligned mix: ${job.base} (${i + 1}/${jobs.length})`);
+                    setActiveQueueStage(job.base, "Speech-aligned mix", `File ${i + 1} of ${jobs.length}`);
+                    speechAlignedSegmentCountUsed = await runMixReadySpeechAlignedSegmented(
+                      ffmpeg,
+                      job.inputName,
+                      job.mixName,
+                      profile,
+                      plan.durationSeconds,
+                      plan.silenceSpans,
+                      plan.speechSpans,
+                      strategy.options
+                    );
+                    mixRendered = true;
+                    fallbackApplied = "primary chain (speech-aligned segmented)";
+                    appendLog(
+                      `[Segmented] ${job.base}: speech-aligned render used ${speechAlignedSegmentCountUsed} segments.`
+                    );
+                    break;
+                  } catch (segError) {
+                    lastMixError = segError;
+                    appendLog(
+                      `[Segmented] ${job.base}: speech-aligned primary failed (${describeError(
+                        segError
+                      )}), trying single-pass primary chain.`
+                    );
+                    if (shouldResetFfmpegForError(segError)) {
+                      ffmpeg = await refreshFfmpeg(`speech-aligned mix fallback on ${job.base}`);
+                      await writeJobInput(ffmpeg, job);
+                    }
+                  }
+                }
+              }
+
               await runMixReady(ffmpeg, job.inputName, job.mixName, profile, strategy.options);
               mixRendered = true;
               fallbackApplied = strategyIndex === 0 ? null : strategy.label;
@@ -2035,6 +3150,7 @@ const summarizeFailureReason = (error: unknown) => {
             } else {
               try {
                 setStatus(`Blend: ${job.base} (${i + 1}/${jobs.length})`);
+                setActiveQueueStage(job.base, "Blend", `File ${i + 1} of ${jobs.length}`);
                 await runBlendMixReady(ffmpeg, job.mixName, job.blendMixName, profile);
                 const blendMixOutput = await writeOutput(ffmpeg, job.blendMixName, "mixready", "blend");
                 blendRendered = true;
@@ -2052,6 +3168,7 @@ const summarizeFailureReason = (error: unknown) => {
           if (loudnessConfig) {
             cleanLoudName = `${job.base}_${loudnessConfig.suffix}.wav`;
             setStatus(`Loudness clean: ${job.base} (${i + 1}/${jobs.length})`);
+            setActiveQueueStage(job.base, "Loudness (clean)", `File ${i + 1} of ${jobs.length}`);
             await runLoudnorm(ffmpeg, job.mixName, cleanLoudName, loudnessConfig);
             const loudOutput = await writeOutput(ffmpeg, cleanLoudName, "loudness", "clean");
             outputEntries.push(loudOutput);
@@ -2059,11 +3176,14 @@ const summarizeFailureReason = (error: unknown) => {
             if (sceneBlend && blendRendered) {
               blendLoudName = `${job.base}_blend_${loudnessConfig.suffix}.wav`;
               setStatus(`Loudness blend: ${job.base} (${i + 1}/${jobs.length})`);
+              setActiveQueueStage(job.base, "Loudness (blend)", `File ${i + 1} of ${jobs.length}`);
               await runLoudnorm(ffmpeg, job.blendMixName, blendLoudName, loudnessConfig);
               const blendLoudOutput = await writeOutput(ffmpeg, blendLoudName, "loudness", "blend");
               outputEntries.push(blendLoudOutput);
             }
           }
+
+          markQueueDone(job.base, "Outputs ready");
         } catch (error) {
           hadErrors = true;
           const reason = summarizeFailureReason(error);
@@ -2073,6 +3193,7 @@ const summarizeFailureReason = (error: unknown) => {
             reason,
           });
           appendLog(`Error (${job.base}): ${reason}`);
+          markQueueError(job.base, reason);
           if (shouldResetFfmpegForError(error)) {
             ffmpeg = await refreshFfmpeg(`processing failure on ${job.base}`);
           }
@@ -2180,6 +3301,21 @@ const summarizeFailureReason = (error: unknown) => {
       setZipProgress(0);
     }
   };
+
+  const activeQueueItem = useMemo(
+    () => queueItems.find((item) => item.status === "working") ?? null,
+    [queueItems]
+  );
+  const queueCounts = useMemo(
+    () => ({
+      total: queueItems.length,
+      done: queueItems.filter((item) => item.status === "done").length,
+      error: queueItems.filter((item) => item.status === "error").length,
+      working: queueItems.filter((item) => item.status === "working").length,
+      pending: queueItems.filter((item) => item.status === "pending").length,
+    }),
+    [queueItems]
+  );
 
   return (
     <div className={styles.layout}>
@@ -2406,6 +3542,10 @@ const summarizeFailureReason = (error: unknown) => {
                 setLogs([]);
                 setFailedOptimizations([]);
                 setShowFailureWarning(false);
+                setQueueItems([]);
+                activeQueueBaseRef.current = null;
+                activeQueueStageRef.current = "Queued";
+                activeQueueProgressRef.current = -1;
                 setStatus("Idle");
               }}
               disabled={loading}
@@ -2418,6 +3558,107 @@ const summarizeFailureReason = (error: unknown) => {
           <div className={styles.footerNote}>
             Processing order is tuned to avoid processor clashes.
           </div>
+        </div>
+      </div>
+
+      <div className={styles.card}>
+        <div className={styles.queueHeader}>
+          <h3>Batch Queue</h3>
+          {queueCounts.total > 0 && (
+            <div className={styles.queueSummaryBadges}>
+              <span className={`${styles.queueCountBadge} ${styles.queueCountNeutral}`}>
+                {queueCounts.total} total
+              </span>
+              <span className={`${styles.queueCountBadge} ${styles.queueCountActive}`}>
+                {queueCounts.working} active
+              </span>
+              <span className={`${styles.queueCountBadge} ${styles.queueCountDone}`}>
+                {queueCounts.done} done
+              </span>
+              <span className={`${styles.queueCountBadge} ${styles.queueCountError}`}>
+                {queueCounts.error} failed
+              </span>
+              <span className={`${styles.queueCountBadge} ${styles.queueCountNeutral}`}>
+                {queueCounts.pending} waiting
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className={styles.sectionTop}>
+          {queueItems.length === 0 ? (
+            <div className={styles.dropHint}>No batch queue yet. Add files and run processing.</div>
+          ) : (
+            <>
+              <div className={styles.queueActiveBar}>
+                <div>
+                  <strong>{activeQueueItem ? activeQueueItem.fileName : "No active file"}</strong>
+                  <div className={styles.label}>
+                    {activeQueueItem
+                      ? `${activeQueueItem.stageLabel}${activeQueueItem.detail ? ` • ${activeQueueItem.detail}` : ""}`
+                      : loading
+                        ? "Waiting for next command..."
+                        : "Idle"}
+                  </div>
+                </div>
+                <div className={styles.queueActivePercent}>
+                  {activeQueueItem ? `${Math.round(activeQueueItem.progress * 100)}%` : "—"}
+                </div>
+              </div>
+              <div className={styles.queueList}>
+                {queueItems.map((item) => {
+                  const statusClass =
+                    item.status === "done"
+                      ? styles.queueStatusDone
+                      : item.status === "error"
+                        ? styles.queueStatusError
+                        : item.status === "working"
+                          ? styles.queueStatusWorking
+                          : styles.queueStatusPending;
+                  const progressPercent =
+                    item.status === "done" || item.status === "error"
+                      ? 100
+                      : Math.round(clamp(item.progress, 0, 1) * 100);
+                  return (
+                    <div
+                      key={item.base}
+                      className={`${styles.queueItem} ${
+                        item.status === "working" ? styles.queueItemActive : ""
+                      }`}
+                    >
+                      <div className={styles.queueRowTop}>
+                        <div className={styles.queueTitleWrap}>
+                          <span className={styles.queueIndex}>{item.index + 1}</span>
+                          <div>
+                            <div className={styles.queueFileName}>{item.fileName}</div>
+                            <div className={styles.queueStageText}>
+                              {item.stageLabel}
+                              {item.detail ? ` • ${item.detail}` : ""}
+                            </div>
+                          </div>
+                        </div>
+                        <span className={`${styles.queueStatusBadge} ${statusClass}`}>
+                          {item.status === "working"
+                            ? "Processing"
+                            : item.status === "done"
+                              ? "Done"
+                              : item.status === "error"
+                                ? "Failed"
+                                : "Queued"}
+                        </span>
+                      </div>
+                      <div className={styles.queueProgressTrack} aria-hidden="true">
+                        <div
+                          className={`${styles.queueProgressFill} ${statusClass}`}
+                          style={{ width: `${progressPercent}%` }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
       </div>
 
