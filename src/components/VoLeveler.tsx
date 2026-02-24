@@ -18,6 +18,11 @@ const BREATH_COMPAND = {
   Medium: "compand=attacks=0.2:decays=0.8:points=-90/-90|-60/-70|-40/-40|-20/-20|0/0",
 } as const;
 
+const BREATH_COMPAND_SAFE = {
+  Light: "compand=attacks=0.25:decays=1.0:points=-90/-90|-74/-75|-64/-65|-54/-54|-40/-40|-20/-20|0/0",
+  Medium: "compand=attacks=0.25:decays=1.0:points=-90/-90|-76/-78|-66/-68|-56/-56|-40/-40|-20/-20|0/0",
+} as const;
+
 const FLOOR_GUARD =
   "compand=attacks=0.05:decays=0.2:points=-90/-95|-70/-74|-60/-60|-50/-50|-20/-20|0/0";
 const FLOOR_GUARD_STRONG =
@@ -1982,7 +1987,15 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push(`dynaudnorm=f=${dynaF}:g=${dynaGInt}:m=${dynaMValue}${dynaThreshold}`);
     }
 
-    const breath = BREATH_COMPAND[breathControl];
+    const continuityBreathProtect =
+      !minimalStabilityChain &&
+      (strictEndingProtection || (profile?.preserveEndings ?? false) || lineContinuityRisk >= 0.52);
+    const breath =
+      breathControl === "Off"
+        ? null
+        : continuityBreathProtect
+          ? BREATH_COMPAND_SAFE[breathControl === "Medium" ? "Medium" : "Light"]
+          : BREATH_COMPAND[breathControl];
     const roomGateFilter =
       roomCleanupEnabled && (profile?.useTailGate ?? false)
         ? buildTailGateFilter(profile?.tailGateStrength ?? 0.12)
@@ -1992,7 +2005,7 @@ const summarizeFailureReason = (error: unknown) => {
       floorGuard &&
       (profile?.noiseRisk === "high" || (noiseGuard && profile?.noiseRisk === "medium"));
     const useFloorGuard = !useRoomGate && floorGuard && (breath === null || preferFloorGuard);
-    const useBreathCompand = !strictEndingProtection && !useRoomGate && breath !== null && !useFloorGuard;
+    const useBreathCompand = !useRoomGate && breath !== null && !useFloorGuard;
 
     if (!minimalStabilityChain && useRoomGate && roomGateFilter) {
       filters.push(roomGateFilter);
@@ -2089,10 +2102,15 @@ const summarizeFailureReason = (error: unknown) => {
     ratioAdjust -= instabilityCompressorRelax * 0.35;
     thresholdAdjust += lineContinuityRisk * 0.35;
     ratioAdjust -= lineContinuityRisk * 0.14;
+    thresholdAdjust += onsetTameStrength * 0.25;
+    ratioAdjust -= onsetTameStrength * 0.12;
     if (strictEndingProtection) {
       thresholdAdjust += 0.45;
       ratioAdjust -= 0.18;
     }
+
+    const continuityAttackBias = lineContinuityRisk * 0.45 + sagRecoveryStrength * 1.1 - onsetTameStrength * 3.2;
+    const continuityReleaseBias = lineContinuityRisk * 22 + sagRecoveryStrength * 24 - onsetTameStrength * 42;
 
     // Smarter consistency: tighten when needed, but protect emotional peaks.
     const thresholdTighten = consistency * (0.55 + levelingNeed * 0.75);
@@ -2115,7 +2133,7 @@ const summarizeFailureReason = (error: unknown) => {
           roomRelax * 4 +
           echoPressure * 2 +
           instabilityCompressorRelax * 3 +
-          lineContinuityRisk * 2,
+          continuityAttackBias,
         14,
         36
       )
@@ -2128,8 +2146,12 @@ const summarizeFailureReason = (error: unknown) => {
           roomRelax * 40 +
           echoPressure * 30 +
           instabilityCompressorRelax * 55 +
-          lineContinuityRisk * 85 +
-          (strictEndingProtection ? 125 : profile?.preserveEndings ? 55 : 0),
+          continuityReleaseBias +
+          (strictEndingProtection
+            ? 95 - onsetTameStrength * 30
+            : profile?.preserveEndings
+              ? 45 - onsetTameStrength * 12
+              : 0),
         95,
         420
       )
@@ -2142,6 +2164,7 @@ const summarizeFailureReason = (error: unknown) => {
         echoPressure * 0.04 -
         instabilityCompressorRelax * 0.12 -
         lineContinuityRisk * 0.08 -
+        onsetTameStrength * 0.05 -
         (strictEndingProtection ? 0.06 : 0),
       0.58,
       0.95
