@@ -1,36 +1,28 @@
 "use client";
 
 import { useMemo, useState, type DragEvent } from "react";
+import {
+  AUDIO_QC_FRAME_MS,
+  analyzeFloatSamples,
+  analyzeFrameAudio,
+  buildFlagsAndRecommendations,
+  toDb,
+  type AudioQcMetrics,
+} from "../lib/audioQc";
 import styles from "./QcReportLab.module.css";
 
-const FRAME_MS = 10;
 const QC_STREAMING_WAV_THRESHOLD_BYTES = 64 * 1024 * 1024;
 const QC_WAV_STREAM_CHUNK_BYTES = 4 * 1024 * 1024;
 const QC_WAV_HEADER_SCAN_BYTES = 8 * 1024 * 1024;
 
-type QcReport = {
+type QcReport = Omit<AudioQcMetrics, "peakDb" | "clipPct"> & {
   fileName: string;
   fileSize: number;
   status: "ok" | "warning" | "error";
-  overallRisk: number;
   durationSec: number;
   sampleRate: number;
   peakDb: number;
   clipPct: number;
-  noiseFloorDb: number;
-  pauseNoiseFloorDb: number;
-  noiseContrastDb: number;
-  speechRatioPct: number;
-  speechDutyCyclePct: number;
-  medianSpeechRunMs: number;
-  dynamicRangeDb: number;
-  instabilityScore: number;
-  onsetOvershootScore: number;
-  midLineSagScore: number;
-  endFadeRiskScore: number;
-  compressionScore: number;
-  clickScore: number;
-  echoScore: number;
   flags: string[];
   recommendations: string[];
   error?: string;
@@ -47,6 +39,8 @@ type QcComparison = {
   deltaEndFadeRisk: number;
   deltaCompression: number;
   deltaNoiseFloor: number;
+  deltaPauseNoiseRisk: number;
+  deltaLineSwing: number;
   deltaNoiseContrast: number;
   deltaClick: number;
   deltaEcho: number;
@@ -62,36 +56,6 @@ type ParsedWavInfo = {
   dataBytes: number;
   totalFrames: number;
   durationSec: number;
-};
-
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
-
-const percentile = (values: number[], percent: number) => {
-  if (values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const rank = (clamp(percent, 0, 100) / 100) * (sorted.length - 1);
-  const lower = Math.floor(rank);
-  const upper = Math.ceil(rank);
-  if (lower === upper) return sorted[lower];
-  const weight = rank - lower;
-  return sorted[lower] * (1 - weight) + sorted[upper] * weight;
-};
-
-const median = (values: number[]) => {
-  if (values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-};
-
-const mean = (values: number[]) => {
-  if (values.length === 0) return 0;
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-};
-
-const toDb = (value: number) => {
-  if (value <= 0) return -120;
-  return 20 * Math.log10(value);
 };
 
 const formatBytes = (bytes: number) => {
@@ -159,6 +123,8 @@ const buildComparisons = (reports: QcReport[]) => {
       deltaEndFadeRisk: after.endFadeRiskScore - before.endFadeRiskScore,
       deltaCompression: after.compressionScore - before.compressionScore,
       deltaNoiseFloor: after.pauseNoiseFloorDb - before.pauseNoiseFloorDb,
+      deltaPauseNoiseRisk: after.pauseNoiseRisk - before.pauseNoiseRisk,
+      deltaLineSwing: after.lineSwingScore - before.lineSwingScore,
       deltaNoiseContrast: after.noiseContrastDb - before.noiseContrastDb,
       deltaClick: after.clickScore - before.clickScore,
       deltaEcho: after.echoScore - before.echoScore,
@@ -330,63 +296,80 @@ const decodeToMono = async (file: File, audioContext: AudioContext) => {
   };
 };
 
-const buildFlagsAndRecommendations = (report: QcReport) => {
-  const flags: string[] = [];
-  const recommendations: string[] = [];
-
-  const noiseLiftRisk = clamp((report.pauseNoiseFloorDb + 62) / 18, 0, 1) * 0.45 + clamp((24 - report.noiseContrastDb) / 16, 0, 1) * 0.55;
-  if (noiseLiftRisk >= 0.45) {
-    flags.push("Noise uplift risk in pauses.");
-    recommendations.push("Use stricter noise-lift guard and verify pause regions after leveling.");
-  }
-
-  if (report.instabilityScore >= 0.5) {
-    flags.push("Large voice-level jumps detected.");
-    recommendations.push("Use instability-safe leveling (slower gain riding, less compression mix).");
-  }
-
-  if (report.onsetOvershootScore >= 0.38) {
-    flags.push("First-word/onset spike risk detected.");
-    recommendations.push("Use onset spike taming before auto-leveling on short lines and line starts.");
-  }
-
-  if (report.midLineSagScore >= 0.36) {
-    flags.push("Mid-line level sag detected.");
-    recommendations.push("Use faster leveling response for line continuity and verify dyna window sizing.");
-  }
-
-  if (report.endFadeRiskScore >= 0.35) {
-    flags.push("Sentence-end audibility loss risk detected.");
-    recommendations.push("Protect endings: reduce tail gating/threshold behavior on clean unstable takes.");
-  }
-
-  if (report.compressionScore >= 0.52) {
-    flags.push("Compressed or radio-like tone risk.");
-    recommendations.push("Relax compressor ratio/mix and preserve more transient dynamics.");
-  }
-
-  if (report.clickScore >= 0.2) {
-    flags.push("Click/transient artifacts detected.");
-    recommendations.push("Run click-taming cleanup and recheck consonant spikes.");
-  }
-
-  if (report.echoScore >= 0.38) {
-    flags.push("Echo/reverb tail risk detected.");
-    recommendations.push("Keep room cleanup on and verify tail control + notch behavior.");
-  }
-
-  if (report.clipPct >= 0.02) {
-    flags.push("Potential clipped peaks in source.");
-    recommendations.push("Ask for cleaner source if clipped peaks are audible.");
-  }
-
-  if (flags.length === 0) {
-    flags.push("No major QC risk detected.");
-    recommendations.push("Source looks stable for standard optimization.");
-  }
-
-  return { flags, recommendations };
+const toQcReport = (
+  fileName: string,
+  fileSize: number,
+  sampleRate: number,
+  durationSec: number,
+  metrics: AudioQcMetrics
+): QcReport => {
+  const { flags, recommendations } = buildFlagsAndRecommendations(metrics);
+  return {
+    fileName,
+    fileSize,
+    status:
+      metrics.overallRisk >= 0.56 ||
+      metrics.instabilityScore >= 0.74 ||
+      metrics.pauseNoiseRisk >= 0.72 ||
+      metrics.clickScore >= 0.66
+        ? "warning"
+        : "ok",
+    durationSec,
+    sampleRate,
+    ...metrics,
+    peakDb: metrics.peakDb ?? -120,
+    clipPct: metrics.clipPct ?? 0,
+    flags,
+    recommendations,
+  };
 };
+
+const createErrorReport = (
+  fileName: string,
+  fileSize: number,
+  error: string,
+  sampleRate = 0,
+  durationSec = 0
+): QcReport => ({
+  fileName,
+  fileSize,
+  status: "error",
+  overallRisk: 1,
+  durationSec,
+  sampleRate,
+  peakDb: -120,
+  clipPct: 0,
+  noiseFloorDb: -120,
+  pauseNoiseFloorDb: -120,
+  nearSpeechNoiseFloorDb: null,
+  speechThresholdDb: -120,
+  noiseContrastDb: 0,
+  speechRatioPct: 0,
+  speechDutyCyclePct: 0,
+  speechSegmentCount: 0,
+  medianSpeechRunMs: 0,
+  longSilenceCount: 0,
+  dynamicRangeDb: 0,
+  instabilityScore: 0,
+  onsetOvershootScore: 0,
+  midLineSagScore: 0,
+  endFadeRiskScore: 0,
+  lineSwingScore: 0,
+  sentenceJumpScore: 0,
+  breathSpikeRisk: 0,
+  pauseNoiseRisk: 0,
+  compressionScore: 0,
+  clickScore: 0,
+  reverbScore: 0,
+  echoScore: 0,
+  roomScore: 0,
+  echoDelayMs: null,
+  analysisConfidence: 0,
+  drynessScore: 0,
+  flags: ["File could not be analyzed."],
+  recommendations: ["Check that the file is a valid PCM WAV and retry."],
+  error,
+});
 
 const analyzeFrameFeatures = (
   fileName: string,
@@ -401,276 +384,19 @@ const analyzeFrameFeatures = (
   clipPct: number,
   sampleSpikeCount: number
 ): QcReport => {
-  const frameCount = frameDb.length;
-  if (frameCount < 30) {
-    return {
-      fileName,
-      fileSize,
-      status: "error",
-      overallRisk: 0,
-      durationSec,
-      sampleRate,
-      peakDb,
-      clipPct,
-      noiseFloorDb: -120,
-      pauseNoiseFloorDb: -120,
-      noiseContrastDb: 0,
-      speechRatioPct: 0,
-      speechDutyCyclePct: 0,
-      medianSpeechRunMs: 0,
-      dynamicRangeDb: 0,
-      instabilityScore: 0,
-      onsetOvershootScore: 0,
-      midLineSagScore: 0,
-      endFadeRiskScore: 0,
-      compressionScore: 0,
-      clickScore: 0,
-      echoScore: 0,
-      flags: [],
-      recommendations: [],
-      error: "Audio is too short for reliable QC analysis.",
-    };
+  if (frameDb.length < 30) {
+    return createErrorReport(fileName, fileSize, "Audio is too short for reliable QC analysis.", sampleRate, durationSec);
   }
 
-  const baseNoiseFloorDb = percentile(frameDb, 25) ?? -72;
-  const speechThresholdDb = clamp(baseNoiseFloorDb + 10.5, -58, -24);
-  const speechMask = frameDb.map((db) => db > speechThresholdDb);
-
-  const speechDb: number[] = [];
-  const pauseDb: number[] = [];
-  const speechCrest: number[] = [];
-  let nonSpeechFrames = 0;
-  let clickFrames = 0;
-
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    const crestDb = toDb((framePeak[frame] + 1e-9) / (frameRms[frame] + 1e-9));
-    const peakFrameDb = toDb(framePeak[frame] + 1e-12);
-    if (speechMask[frame]) {
-      speechDb.push(frameDb[frame]);
-      speechCrest.push(crestDb);
-      if ((crestDb > 20.5 && peakFrameDb > -18) || frameSharpness[frame] > -29) {
-        clickFrames += 0.5;
-      }
-    } else {
-      nonSpeechFrames += 1;
-      pauseDb.push(frameDb[frame]);
-      if ((crestDb > 15 && peakFrameDb > -30) || frameSharpness[frame] > -32) {
-        clickFrames += 1;
-      }
-    }
-  }
-
-  const pauseNoiseFloorDb = clamp(
-    percentile(pauseDb.length > 10 ? pauseDb : frameDb, 70) ?? -72,
-    -110,
-    -28
-  );
-  const noiseFloorDb = pauseNoiseFloorDb;
-  const speechRatioPct = (speechDb.length / Math.max(frameCount, 1)) * 100;
-  const speechDutyCyclePct = speechRatioPct;
-  const p90Speech = percentile(speechDb, 90) ?? -24;
-  const p10Speech = percentile(speechDb, 10) ?? p90Speech;
-  const p50Speech = percentile(speechDb, 50) ?? p90Speech;
-  const dynamicRangeDb = Math.max(0, p90Speech - p10Speech);
-  const pauseP80 = percentile(pauseDb, 80) ?? pauseNoiseFloorDb;
-  const noiseContrastDb = clamp(p50Speech - pauseP80, 0, 80);
-
-  let instabilityScore = 0;
-  if (speechDb.length >= 12) {
-    const smoothSpeech = speechDb.map((value, idx) => {
-      const a = speechDb[idx - 1] ?? value;
-      const b = value;
-      const c = speechDb[idx + 1] ?? value;
-      return (a + b + c) / 3;
-    });
-    const deltas: number[] = [];
-    for (let i = 1; i < smoothSpeech.length; i += 1) {
-      deltas.push(Math.abs(smoothSpeech[i] - smoothSpeech[i - 1]));
-    }
-    const p80 = percentile(deltas, 80) ?? 0;
-    const p95 = percentile(deltas, 95) ?? 0;
-    instabilityScore = clamp(
-      clamp((p80 - 1.2) / 3.1, 0, 1) * 0.62 + clamp((p95 - 2.2) / 4.6, 0, 1) * 0.38,
-      0,
-      1
-    );
-  }
-
-  const speechRuns: Array<{ start: number; end: number }> = [];
-  let runStart = 0;
-  let runIsSpeech = speechMask[0] ?? false;
-  for (let i = 1; i <= frameCount; i += 1) {
-    const currentIsSpeech = i < frameCount ? speechMask[i] : !runIsSpeech;
-    if (i < frameCount && currentIsSpeech === runIsSpeech) continue;
-    if (runIsSpeech && i > runStart) {
-      speechRuns.push({ start: runStart, end: i });
-    }
-    runStart = i;
-    runIsSpeech = currentIsSpeech;
-  }
-  const speechRunMs = speechRuns.map((run) => (run.end - run.start) * FRAME_MS);
-  const medianSpeechRunMs = median(speechRunMs) ?? 0;
-
-  const meanSlice = (values: number[], start: number, end: number) => {
-    const safeStart = Math.max(0, start);
-    const safeEnd = Math.min(values.length, end);
-    if (safeEnd <= safeStart) return null;
-    let sum = 0;
-    for (let i = safeStart; i < safeEnd; i += 1) sum += values[i];
-    return sum / (safeEnd - safeStart);
-  };
-
-  const onsetEventScores: number[] = [];
-  const midSagEventScores: number[] = [];
-  const endFadeEventScores: number[] = [];
-  const speechFloorGuardDb = speechThresholdDb - 8;
-  for (let runIndex = 0; runIndex < speechRuns.length; runIndex += 1) {
-    const run = speechRuns[runIndex];
-    const runFrames = run.end - run.start;
-    const prevEnd = runIndex > 0 ? speechRuns[runIndex - 1].end : 0;
-    const nextStart = runIndex + 1 < speechRuns.length ? speechRuns[runIndex + 1].start : frameCount;
-    const preSilenceFrames = Math.max(0, run.start - prevEnd);
-    const postSilenceFrames = Math.max(0, nextStart - run.end);
-
-    if (preSilenceFrames >= 20 && runFrames >= 70) {
-      const onsetDb = meanSlice(frameDb, run.start + 12, Math.min(run.end, run.start + 22));
-      const bodyDb = meanSlice(frameDb, run.start + 25, Math.min(run.end, run.start + 70));
-      if (onsetDb !== null && bodyDb !== null) {
-        onsetEventScores.push(clamp((onsetDb - bodyDb - 2.5) / 4.5, 0, 1));
-      }
-    }
-
-    if (runFrames >= 90) {
-      const third = Math.floor(runFrames / 3);
-      const startDb = meanSlice(frameDb, run.start, run.start + third);
-      const midDb = meanSlice(frameDb, run.start + third, run.start + third * 2);
-      const endDb = meanSlice(frameDb, run.start + third * 2, run.end);
-      if (startDb !== null && midDb !== null && endDb !== null) {
-        const edgeMean = (startDb + endDb) / 2;
-        midSagEventScores.push(clamp((edgeMean - midDb - 1.8) / 4.2, 0, 1));
-      }
-    }
-
-    if (runFrames >= 70 && postSilenceFrames >= 10) {
-      const preTailDb = meanSlice(frameDb, Math.max(run.start, run.end - 50), Math.max(run.start, run.end - 22));
-      const tailDb = meanSlice(frameDb, Math.max(run.start, run.end - 22), run.end);
-      if (preTailDb !== null && tailDb !== null && tailDb > speechFloorGuardDb) {
-        endFadeEventScores.push(clamp((preTailDb - tailDb - 3.2) / 4.8, 0, 1));
-      }
-    }
-  }
-  const onsetOvershootScore = clamp(percentile(onsetEventScores, 75) ?? 0, 0, 1);
-  const midLineSagScore = clamp(percentile(midSagEventScores, 75) ?? 0, 0, 1);
-  const endFadeRiskScore = clamp(percentile(endFadeEventScores, 75) ?? 0, 0, 1);
-
-  const centered = frameRms.map((value) => value - mean(frameRms));
-  let bestCorr = 0;
-  for (let lag = 4; lag <= 20; lag += 1) {
-    let num = 0;
-    let denA = 0;
-    let denB = 0;
-    for (let i = 0; i < centered.length - lag; i += 1) {
-      const a = centered[i];
-      const b = centered[i + lag];
-      num += a * b;
-      denA += a * a;
-      denB += b * b;
-    }
-    const denom = Math.sqrt(denA * denB) + 1e-12;
-    const corr = num / denom;
-    if (corr > bestCorr) bestCorr = corr;
-  }
-  const autoCorrEcho = clamp((bestCorr - 0.22) / 0.22, 0, 1);
-
-  const tailEventScores: number[] = [];
-  let speechRun = 0;
-  for (let frame = 0; frame < frameCount - 30; frame += 1) {
-    if (speechMask[frame]) {
-      speechRun += 1;
-      continue;
-    }
-    if (speechRun >= 6) {
-      const early = mean(frameRms.slice(frame + 1, frame + 8));
-      const late = mean(frameRms.slice(frame + 14, frame + 28));
-      const pauseFloorAmp = Math.pow(10, pauseNoiseFloorDb / 20);
-      const lateLiftDb = toDb((late + 1e-9) / (pauseFloorAmp + 1e-9));
-      const decayDb = toDb((early + 1e-9) / (late + 1e-9));
-      const eventScore = clamp(
-        clamp((lateLiftDb - 3.5) / 10.5, 0, 1) * 0.58 + clamp((5.5 - decayDb) / 5.5, 0, 1) * 0.42,
-        0,
-        1
-      );
-      tailEventScores.push(eventScore);
-    }
-    speechRun = 0;
-  }
-  const tailEcho = tailEventScores.length > 0 ? mean(tailEventScores) : 0;
-  const echoScore = clamp(tailEcho * 0.72 + autoCorrEcho * 0.28, 0, 1);
-
-  const frameClickDensity = clickFrames / Math.max(nonSpeechFrames, 1);
-  const sampleClicksPerMinute = (sampleSpikeCount / Math.max(durationSec, 1e-6)) * 60;
-  const clickScore = clamp(frameClickDensity * 1.9 + sampleClicksPerMinute / 18, 0, 1);
-
-  const crestSpeechDb = speechCrest.length > 0 ? mean(speechCrest) : 12;
-  const compressionScore = clamp(
-    clamp((10.2 - dynamicRangeDb) / 5.2, 0, 1) * 0.68 +
-      clamp((11.5 - crestSpeechDb) / 5.8, 0, 1) * 0.32,
-    0,
-    1
-  );
-  const noiseLiftRisk =
-    clamp((pauseNoiseFloorDb + 62) / 18, 0, 1) * 0.45 + clamp((24 - noiseContrastDb) / 16, 0, 1) * 0.55;
-  const clipScore = clamp(clipPct / 0.03, 0, 1);
-  const overallRisk = clamp(
-    instabilityScore * 0.18 +
-      onsetOvershootScore * 0.1 +
-      midLineSagScore * 0.1 +
-      endFadeRiskScore * 0.1 +
-      compressionScore * 0.24 +
-      noiseLiftRisk * 0.22 +
-      clickScore * 0.14 +
-      echoScore * 0.12 +
-      clipScore * 0.08,
-    0,
-    1
-  );
-
-  const baseReport: QcReport = {
-    fileName,
-    fileSize,
-    status:
-      overallRisk >= 0.56 || instabilityScore >= 0.74 || noiseLiftRisk >= 0.72 || clickScore >= 0.66
-        ? "warning"
-        : "ok",
-    overallRisk,
-    durationSec,
+  const metrics = analyzeFrameAudio(frameRms, framePeak, frameDb, frameSharpness, {
     sampleRate,
+    durationSec,
+    frameMs: AUDIO_QC_FRAME_MS,
     peakDb,
     clipPct,
-    noiseFloorDb,
-    pauseNoiseFloorDb,
-    noiseContrastDb,
-    speechRatioPct,
-    speechDutyCyclePct,
-    medianSpeechRunMs,
-    dynamicRangeDb,
-    instabilityScore,
-    onsetOvershootScore,
-    midLineSagScore,
-    endFadeRiskScore,
-    compressionScore,
-    clickScore,
-    echoScore,
-    flags: [],
-    recommendations: [],
-  };
-
-  const { flags, recommendations } = buildFlagsAndRecommendations(baseReport);
-  return {
-    ...baseReport,
-    flags,
-    recommendations,
-  };
+    sampleSpikeCount,
+  });
+  return toQcReport(fileName, fileSize, sampleRate, durationSec, metrics);
 };
 
 const analyzeSamples = (
@@ -682,67 +408,17 @@ const analyzeSamples = (
   peakDb: number,
   clipPct: number
 ): QcReport => {
-  const frameSize = Math.max(1, Math.round((sampleRate * FRAME_MS) / 1000));
-  const frameCount = Math.floor(samples.length / frameSize);
-  const frameRms = new Array<number>(frameCount);
-  const frameDb = new Array<number>(frameCount);
-  const framePeak = new Array<number>(frameCount);
-  const frameSharpness = new Array<number>(frameCount);
-
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    const start = frame * frameSize;
-    let sumSquares = 0;
-    let peak = 0;
-    let sharpEnergy = 0;
-    for (let i = 0; i < frameSize; i += 1) {
-      const value = samples[start + i] ?? 0;
-      const abs = Math.abs(value);
-      if (abs > peak) peak = abs;
-      sumSquares += value * value;
-      const prev = i > 0 ? samples[start + i - 1] ?? 0 : value;
-      const next = i + 1 < frameSize ? samples[start + i + 1] ?? 0 : value;
-      const spike = value - (prev + next) * 0.5;
-      sharpEnergy += spike * spike;
-    }
-    const rms = Math.sqrt(sumSquares / frameSize);
-    frameRms[frame] = rms;
-    framePeak[frame] = peak;
-    frameDb[frame] = Math.max(-120, toDb(rms + 1e-12));
-    frameSharpness[frame] = toDb(Math.sqrt(sharpEnergy / frameSize) + 1e-12);
-  }
-
-  let sampleSpikeCount = 0;
-  const refractorySamples = Math.max(1, Math.round(sampleRate * 0.004));
-  let lastSpikeIndex = -refractorySamples;
-  for (let i = 1; i < samples.length; i += 1) {
-    const current = samples[i] ?? 0;
-    const previous = samples[i - 1] ?? 0;
-    const diff = Math.abs(current - previous);
-    if (diff < 0.09) continue;
-    if (Math.abs(current) < 0.015) continue;
-    if (i - lastSpikeIndex < refractorySamples) continue;
-    sampleSpikeCount += 1;
-    lastSpikeIndex = i;
-  }
-
-  return analyzeFrameFeatures(
-    fileName,
-    fileSize,
-    frameRms,
-    framePeak,
-    frameDb,
-    frameSharpness,
-    sampleRate,
-    durationSec,
+  const metrics = analyzeFloatSamples(samples, sampleRate, AUDIO_QC_FRAME_MS);
+  return toQcReport(fileName, fileSize, sampleRate, durationSec, {
+    ...metrics,
     peakDb,
     clipPct,
-    sampleSpikeCount
-  );
+  });
 };
 
 const analyzePcmWavStreaming = async (file: File): Promise<QcReport> => {
   const wav = await parseWavHeader(file);
-  const frameSize = Math.max(1, Math.round((wav.sampleRate * FRAME_MS) / 1000));
+  const frameSize = Math.max(1, Math.round((wav.sampleRate * AUDIO_QC_FRAME_MS) / 1000));
   const frameCount = Math.floor(wav.totalFrames / frameSize);
 
   const frameRms = new Array<number>(Math.max(0, frameCount));
@@ -925,33 +601,7 @@ export default function QcReportLab() {
           }
           nextReports.push(report);
         } catch (error) {
-          nextReports.push({
-            fileName: file.name,
-            fileSize: file.size,
-            status: "error",
-            overallRisk: 1,
-            durationSec: 0,
-            sampleRate: 0,
-            peakDb: -120,
-            clipPct: 0,
-            noiseFloorDb: -120,
-            pauseNoiseFloorDb: -120,
-            noiseContrastDb: 0,
-            speechRatioPct: 0,
-            speechDutyCyclePct: 0,
-            medianSpeechRunMs: 0,
-            dynamicRangeDb: 0,
-            instabilityScore: 0,
-            onsetOvershootScore: 0,
-            midLineSagScore: 0,
-            endFadeRiskScore: 0,
-            compressionScore: 0,
-            clickScore: 0,
-            echoScore: 0,
-            flags: ["File could not be analyzed."],
-            recommendations: ["Check that the file is a valid PCM WAV and retry."],
-            error: error instanceof Error ? error.message : String(error),
-          });
+          nextReports.push(createErrorReport(file.name, file.size, error instanceof Error ? error.message : String(error)));
         }
       }
       setReports(nextReports);
@@ -1113,8 +763,16 @@ export default function QcReportLab() {
                       <strong>{formatSignedPercent(comparison.deltaCompression)}</strong>
                     </div>
                     <div className={styles.metric}>
+                      <span>Line swing delta</span>
+                      <strong>{formatSignedPercent(comparison.deltaLineSwing)}</strong>
+                    </div>
+                    <div className={styles.metric}>
                       <span>Pause noise floor delta</span>
                       <strong>{formatSignedDb(comparison.deltaNoiseFloor)}</strong>
+                    </div>
+                    <div className={styles.metric}>
+                      <span>Pause noise risk delta</span>
+                      <strong>{formatSignedPercent(comparison.deltaPauseNoiseRisk)}</strong>
                     </div>
                     <div className={styles.metric}>
                       <span>Noise contrast delta</span>
@@ -1194,8 +852,16 @@ export default function QcReportLab() {
                         <strong>{Math.round(report.compressionScore * 100)}%</strong>
                       </div>
                       <div className={styles.metric}>
+                        <span>Line swing risk</span>
+                        <strong>{Math.round(report.lineSwingScore * 100)}%</strong>
+                      </div>
+                      <div className={styles.metric}>
                         <span>Noise floor</span>
                         <strong>{report.noiseFloorDb.toFixed(1)} dB</strong>
+                      </div>
+                      <div className={styles.metric}>
+                        <span>Pause noise risk</span>
+                        <strong>{Math.round(report.pauseNoiseRisk * 100)}%</strong>
                       </div>
                       <div className={styles.metric}>
                         <span>Click score</span>
