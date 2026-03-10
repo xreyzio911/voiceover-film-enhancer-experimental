@@ -295,6 +295,11 @@ type FailedOptimization = {
   reason: string;
 };
 
+type AnalysisResult = {
+  analysis: FileAnalysis;
+  ffmpeg: FFmpeg;
+};
+
 type QueueItemStatus = "pending" | "working" | "done" | "error";
 
 type QueueItem = {
@@ -1215,8 +1220,15 @@ const summarizeFailureReason = (error: unknown) => {
     return aggregated;
   };
 
-  const analyzeFile = async (ffmpeg: FFmpeg, inputName: string): Promise<FileAnalysis> => {
+  const analyzeFile = async (ffmpeg: FFmpeg, inputName: string): Promise<AnalysisResult> => {
     let durationSeconds: number | null = null;
+    let recoveryInputBytes: Uint8Array | null = null;
+    const ensureRecoveryInputBytes = async () => {
+      if (recoveryInputBytes === null) {
+        recoveryInputBytes = await readVirtualFileBytes(ffmpeg, inputName);
+      }
+      return recoveryInputBytes;
+    };
     try {
       durationSeconds = await probeInputDurationSeconds(ffmpeg, inputName);
     } catch {
@@ -1274,7 +1286,7 @@ const summarizeFailureReason = (error: unknown) => {
 
     if (durationSeconds === null || durationSeconds < DISTRIBUTED_ANALYSIS_THRESHOLD_SECONDS) {
       baseAnalysis.longSparseModeEligible = false;
-      return baseAnalysis;
+      return { analysis: baseAnalysis, ffmpeg };
     }
 
     const silenceDb = clamp(
@@ -1305,7 +1317,7 @@ const summarizeFailureReason = (error: unknown) => {
       const useDistributedCoverage =
         durationSeconds >= DISTRIBUTED_ANALYSIS_THRESHOLD_SECONDS || speechStats.longSparseModeEligible;
       if (!useDistributedCoverage) {
-        return baseAnalysis;
+        return { analysis: baseAnalysis, ffmpeg };
       }
 
       const distributedWindowSec = speechStats.longSparseModeEligible
@@ -1336,24 +1348,41 @@ const summarizeFailureReason = (error: unknown) => {
 
       const windowAnalyses: Array<{ analysis: FileAnalysis; weight: number }> = [];
       for (const window of windows) {
-        try {
-          const windowAnalysis = await analyzeFileWindow(ffmpeg, inputName, window.startSec, window.durationSec);
-          const speechCoverage = clamp((window.occupancyPct ?? windowAnalysis.speechDutyCyclePct ?? 0) / 100, 0, 1);
-          const confidence = clamp(windowAnalysis.analysisConfidence ?? 0.25, 0, 1);
-          const roomPenalty = clamp(1 - (windowAnalysis.roomScore ?? 0), 0, 1);
-          const weight = clamp(speechCoverage * 0.55 + confidence * 0.35 + roomPenalty * 0.1, 0.05, 1);
-          windowAnalyses.push({ analysis: windowAnalysis, weight });
-        } catch (error) {
-          appendLog(
-            `[Analysis] Window fallback (${sanitizeBase(inputName)} @ ${window.startSec.toFixed(1)}s): ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
+        let windowCompleted = false;
+        for (let attempt = 0; attempt < 2 && !windowCompleted; attempt += 1) {
+          try {
+            const windowAnalysis = await analyzeFileWindow(ffmpeg, inputName, window.startSec, window.durationSec);
+            const speechCoverage = clamp((window.occupancyPct ?? windowAnalysis.speechDutyCyclePct ?? 0) / 100, 0, 1);
+            const confidence = clamp(windowAnalysis.analysisConfidence ?? 0.25, 0, 1);
+            const roomPenalty = clamp(1 - (windowAnalysis.roomScore ?? 0), 0, 1);
+            const weight = clamp(speechCoverage * 0.55 + confidence * 0.35 + roomPenalty * 0.1, 0.05, 1);
+            windowAnalyses.push({ analysis: windowAnalysis, weight });
+            windowCompleted = true;
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            appendLog(
+              `[Analysis] Window fallback (${sanitizeBase(inputName)} @ ${window.startSec.toFixed(1)}s${
+                attempt > 0 ? ` retry ${attempt}` : ""
+              }): ${errorMessage}`
+            );
+            if (attempt === 0 && shouldResetFfmpegForError(error)) {
+              const inputBytes = await ensureRecoveryInputBytes();
+              ffmpeg = await refreshFfmpeg(
+                `analysis window retry on ${sanitizeBase(inputName)} @ ${window.startSec.toFixed(1)}s`
+              );
+              await ffmpeg.writeFile(inputName, inputBytes);
+              continue;
+            }
+            break;
+          }
         }
       }
 
       if (windowAnalyses.length > 0) {
-        return aggregateWindowAnalyses(baseAnalysis, windowAnalyses, speechStats);
+        return {
+          analysis: aggregateWindowAnalyses(baseAnalysis, windowAnalyses, speechStats),
+          ffmpeg,
+        };
       }
     } catch (error) {
       appendLog(
@@ -1361,7 +1390,7 @@ const summarizeFailureReason = (error: unknown) => {
       );
     }
 
-    return baseAnalysis;
+    return { analysis: baseAnalysis, ffmpeg };
   };
 
   const buildBatchReference = (analyses: FileAnalysis[]) => {
@@ -3227,7 +3256,9 @@ const summarizeFailureReason = (error: unknown) => {
           setActiveQueueStage(job.base, "Analyze", `Pass ${i + 1} of ${jobs.length}`);
           try {
             await writeJobInput(ffmpeg, job);
-            const analysis = await analyzeFile(ffmpeg, job.inputName);
+            const analysisResult = await analyzeFile(ffmpeg, job.inputName);
+            ffmpeg = analysisResult.ffmpeg;
+            const analysis = analysisResult.analysis;
             analysisByBase.set(job.base, analysis);
             analyses.push(analysis);
             markQueuePending(job.base, "Ready for render", "Analysis complete");
@@ -3385,7 +3416,9 @@ const summarizeFailureReason = (error: unknown) => {
 
               let candidateAnalysis: FileAnalysis | null = null;
               try {
-                candidateAnalysis = await analyzeFile(ffmpeg, candidateName);
+                const analysisResult = await analyzeFile(ffmpeg, candidateName);
+                ffmpeg = analysisResult.ffmpeg;
+                candidateAnalysis = analysisResult.analysis;
               } catch (error) {
                 appendLog(
                   `[CandidateQC] ${job.base}/${candidateLabel}: analysis fallback (${
