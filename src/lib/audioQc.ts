@@ -315,9 +315,11 @@ const computeLineSwingScore = (
 const computeSentenceJumpScore = (
   frameDb: number[],
   speechRuns: FrameRun[],
-  frameMs: number
+  frameMs: number,
+  speechDutyCyclePct: number
 ) => {
-  const bodyMeans: Array<{ run: FrameRun; meanDb: number }> = [];
+  const sparseMode = speechDutyCyclePct < 6 || speechRuns.length <= 8;
+  const bodyMeans: Array<{ run: FrameRun; meanDb: number; medianDb: number }> = [];
   for (const run of speechRuns) {
     const runFrames = run.end - run.start;
     if (runFrames < 55) continue;
@@ -325,24 +327,33 @@ const computeSentenceJumpScore = (
     const bodyStart = Math.min(run.end - 1, run.start + edgeTrimFrames);
     const bodyEnd = Math.max(bodyStart + 1, run.end - edgeTrimFrames);
     const meanDb = meanSlice(frameDb, bodyStart, bodyEnd) ?? meanSlice(frameDb, run.start, run.end);
-    if (meanDb !== null) {
-      bodyMeans.push({ run, meanDb });
+    const bodyMedianDb =
+      median(frameDb.slice(bodyStart, bodyEnd)) ??
+      median(frameDb.slice(run.start, run.end)) ??
+      meanDb;
+    if (meanDb !== null && bodyMedianDb !== null) {
+      bodyMeans.push({ run, meanDb, medianDb: bodyMedianDb });
     }
   }
 
-  const gapFloorFrames = Math.max(1, Math.round(120 / frameMs));
+  const gapFloorFrames = Math.max(1, Math.round((sparseMode ? 80 : 120) / frameMs));
   const jumps: number[] = [];
   for (let index = 1; index < bodyMeans.length; index += 1) {
     const previous = bodyMeans[index - 1];
     const current = bodyMeans[index];
     const gapFrames = Math.max(0, current.run.start - previous.run.end);
     if (gapFrames < gapFloorFrames) continue;
-    const jumpDb = Math.abs(current.meanDb - previous.meanDb);
-    const gapNorm = clamp(((gapFrames * frameMs) - 120) / 900, 0, 1);
-    jumps.push(clamp(clamp((jumpDb - 1.8) / 4.2, 0, 1) * 0.82 + gapNorm * 0.18, 0, 1));
+    const bodyJumpDb = Math.abs(
+      (sparseMode ? current.medianDb : current.meanDb) - (sparseMode ? previous.medianDb : previous.meanDb)
+    );
+    const supportJumpDb = Math.abs(current.meanDb - previous.meanDb);
+    const jumpDb = sparseMode ? Math.max(bodyJumpDb, supportJumpDb * 0.8) : bodyJumpDb;
+    const gapNorm = clamp(((gapFrames * frameMs) - (sparseMode ? 80 : 120)) / (sparseMode ? 700 : 900), 0, 1);
+    const jumpNorm = clamp((jumpDb - (sparseMode ? 1.2 : 1.8)) / (sparseMode ? 3.3 : 4.2), 0, 1);
+    jumps.push(clamp(jumpNorm * (sparseMode ? 0.9 : 0.82) + gapNorm * (sparseMode ? 0.1 : 0.18), 0, 1));
   }
 
-  return clamp(percentile(jumps, 75) ?? 0, 0, 1);
+  return clamp(percentile(jumps, sparseMode ? 80 : 75) ?? 0, 0, 1);
 };
 
 export const buildFlagsAndRecommendations = (
@@ -614,7 +625,7 @@ export const analyzeFrameAudio = (
   const midLineSagScore = clamp(percentile(midSagEventScores, 75) ?? 0, 0, 1);
   const endFadeRiskScore = clamp(percentile(endFadeEventScores, 75) ?? 0, 0, 1);
   const lineSwingScore = computeLineSwingScore(frameDb, speechRuns);
-  const sentenceJumpScore = computeSentenceJumpScore(frameDb, speechRuns, frameMs);
+  const sentenceJumpScore = computeSentenceJumpScore(frameDb, speechRuns, frameMs, speechDutyCyclePct);
 
   const breathSpikeEventScores: number[] = [];
   for (const pauseFrame of nearSpeechPauseFrames) {
@@ -634,9 +645,43 @@ export const analyzeFrameAudio = (
     }
   }
   const breathRunScores: number[] = [];
+  const leadInBreathScores: number[] = [];
   for (let runIndex = 0; runIndex < speechRuns.length; runIndex += 1) {
     const run = speechRuns[runIndex];
     const runFrames = run.end - run.start;
+    const previousEnd = runIndex > 0 ? speechRuns[runIndex - 1].end : 0;
+    const leadWindowFrames = Math.min(Math.max(0, run.start - previousEnd), Math.max(1, Math.round(250 / frameMs)));
+    if (leadWindowFrames >= Math.max(3, Math.round(40 / frameMs)) && runFrames >= 28) {
+      const followingBodyStart = Math.min(run.end - 1, run.start + Math.max(2, Math.round(40 / frameMs)));
+      const followingBodyEnd = Math.min(run.end, run.start + Math.max(6, Math.round(120 / frameMs)));
+      const followingMeanDb =
+        meanSlice(frameDb, followingBodyStart, Math.max(followingBodyStart + 1, followingBodyEnd)) ??
+        meanSlice(frameDb, run.start, Math.min(run.end, run.start + Math.max(8, Math.round(160 / frameMs))));
+      if (followingMeanDb !== null) {
+        const leadStart = run.start - leadWindowFrames;
+        let transientPeakDb = AUDIO_QC_FLOOR_DB;
+        let transientFrames = 0;
+        for (let frame = leadStart; frame < run.start; frame += 1) {
+          const peakDb = toDb((framePeak[frame] ?? 0) + 1e-12);
+          const rmsDb = frameDb[frame] ?? AUDIO_QC_FLOOR_DB;
+          const exceedFollowing = peakDb - followingMeanDb;
+          if (exceedFollowing < 5 || rmsDb >= followingMeanDb - 0.4) continue;
+          transientFrames += 1;
+          transientPeakDb = Math.max(transientPeakDb, peakDb);
+        }
+        if (transientFrames > 0) {
+          const exceedNorm = clamp((transientPeakDb - followingMeanDb - 5) / 7, 0, 1);
+          const transientShortNorm = clamp(
+            (Math.max(1, Math.round(120 / frameMs)) - transientFrames) / Math.max(1, Math.round(120 / frameMs)),
+            0,
+            1
+          );
+          const proximityNorm = clamp((leadWindowFrames - transientFrames) / Math.max(leadWindowFrames, 1), 0, 1);
+          leadInBreathScores.push(clamp(exceedNorm * 0.58 + transientShortNorm * 0.24 + proximityNorm * 0.18, 0, 1));
+        }
+      }
+    }
+
     if (runFrames < 4 || runFrames > 26) continue;
     const nextRun = runIndex + 1 < speechRuns.length ? speechRuns[runIndex + 1] : null;
     if (!nextRun) continue;
@@ -665,7 +710,9 @@ export const analyzeFrameAudio = (
       clamp(percentile(breathSpikeEventScores, 80) ?? 0, 0, 1) * 0.78 +
         clamp((breathSpikeEventScores.length - 2) / 6, 0, 1) * 0.22,
       clamp(percentile(breathRunScores, 75) ?? 0, 0, 1) * 0.82 +
-        clamp((breathRunScores.length - 1) / 4, 0, 1) * 0.18
+        clamp((breathRunScores.length - 1) / 4, 0, 1) * 0.18,
+      clamp(percentile(leadInBreathScores, 80) ?? 0, 0, 1) * 0.86 +
+        clamp((leadInBreathScores.length - 1) / 4, 0, 1) * 0.14
     ),
     0,
     1

@@ -5,6 +5,16 @@ import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import JSZip from "jszip";
 import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { analyzeFloatSamples, type AudioQcMetrics } from "../lib/audioQc";
+import {
+  buildRenderRiskProfile,
+  isHealthySegmentedRender,
+  shouldPreferCandidate,
+  type CandidateRenderMeta,
+  type CandidateScore,
+  type DegradeReason,
+  type RenderPath,
+  type RenderRiskProfile,
+} from "../lib/renderRecovery";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -221,6 +231,10 @@ type FileAnalysis = {
   midLineSagScore: number | null;
   endFadeRiskScore: number | null;
   analysisWindowCount: number | null;
+  analysisWindowsAttempted: number | null;
+  analysisWindowsSucceeded: number | null;
+  analysisWindowsDropped: number | null;
+  analysisWindowRetryCount: number | null;
   longSparseModeEligible: boolean | null;
 };
 
@@ -270,6 +284,7 @@ type AdaptiveProfile = {
   disableDynaThresholdForStability: boolean;
   strictEndingProtection: boolean;
   preferSinglePassContinuity: boolean;
+  longSparseModeEligible: boolean;
   segmentMatchTargetI: number | null;
   useSpeechAlignedSegmentation: boolean;
   useSpeechPauseSegmentation: boolean;
@@ -349,6 +364,10 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   midLineSagScore: null,
   endFadeRiskScore: null,
   analysisWindowCount: null,
+  analysisWindowsAttempted: null,
+  analysisWindowsSucceeded: null,
+  analysisWindowsDropped: null,
+  analysisWindowRetryCount: null,
   longSparseModeEligible: null,
 });
 
@@ -1220,14 +1239,25 @@ const summarizeFailureReason = (error: unknown) => {
     return aggregated;
   };
 
-  const analyzeFile = async (ffmpeg: FFmpeg, inputName: string): Promise<AnalysisResult> => {
+  const analyzeFile = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    recoveryInputNames: string[] = []
+  ): Promise<AnalysisResult> => {
     let durationSeconds: number | null = null;
-    let recoveryInputBytes: Uint8Array | null = null;
-    const ensureRecoveryInputBytes = async () => {
-      if (recoveryInputBytes === null) {
-        recoveryInputBytes = await readVirtualFileBytes(ffmpeg, inputName);
+    const recoveryInputs = Array.from(new Set([inputName, ...recoveryInputNames]));
+    const recoveryInputBytes = new Map<string, Uint8Array>();
+    const ensureRecoveryInputBytes = async (name: string) => {
+      const cached = recoveryInputBytes.get(name);
+      if (cached) return cached;
+      const bytes = await readVirtualFileBytes(ffmpeg, name);
+      recoveryInputBytes.set(name, bytes);
+      return bytes;
+    };
+    const restoreRecoveryInputs = async (target: FFmpeg) => {
+      for (const name of recoveryInputs) {
+        await target.writeFile(name, await ensureRecoveryInputBytes(name));
       }
-      return recoveryInputBytes;
     };
     try {
       durationSeconds = await probeInputDurationSeconds(ffmpeg, inputName);
@@ -1283,6 +1313,10 @@ const summarizeFailureReason = (error: unknown) => {
 
     const baseAnalysis = await analyzeFileWindow(ffmpeg, inputName, baseWindowStart, baseWindowDuration);
     baseAnalysis.analysisWindowCount = 1;
+    baseAnalysis.analysisWindowsAttempted = 0;
+    baseAnalysis.analysisWindowsSucceeded = 0;
+    baseAnalysis.analysisWindowsDropped = 0;
+    baseAnalysis.analysisWindowRetryCount = 0;
 
     if (durationSeconds === null || durationSeconds < DISTRIBUTED_ANALYSIS_THRESHOLD_SECONDS) {
       baseAnalysis.longSparseModeEligible = false;
@@ -1323,8 +1357,11 @@ const summarizeFailureReason = (error: unknown) => {
       const distributedWindowSec = speechStats.longSparseModeEligible
         ? LONG_SPARSE_ANALYSIS_WINDOW_SECONDS
         : DISTRIBUTED_ANALYSIS_WINDOW_SECONDS;
+      const capLongSparseWindows = speechStats.longSparseModeEligible && speechStats.speechDutyCyclePct < 6;
       const distributedWindowCount = speechStats.longSparseModeEligible
-        ? LONG_SPARSE_ANALYSIS_WINDOW_TARGET_COUNT
+        ? capLongSparseWindows
+          ? 5
+          : LONG_SPARSE_ANALYSIS_WINDOW_TARGET_COUNT
         : Math.max(
             DISTRIBUTED_ANALYSIS_TARGET_COUNT,
             Math.min(
@@ -1347,6 +1384,9 @@ const summarizeFailureReason = (error: unknown) => {
       );
 
       const windowAnalyses: Array<{ analysis: FileAnalysis; weight: number }> = [];
+      let windowRetryCount = 0;
+      let windowDropCount = 0;
+      baseAnalysis.analysisWindowsAttempted = windows.length;
       for (const window of windows) {
         let windowCompleted = false;
         for (let attempt = 0; attempt < 2 && !windowCompleted; attempt += 1) {
@@ -1366,17 +1406,21 @@ const summarizeFailureReason = (error: unknown) => {
               }): ${errorMessage}`
             );
             if (attempt === 0 && shouldResetFfmpegForError(error)) {
-              const inputBytes = await ensureRecoveryInputBytes();
+              windowRetryCount += 1;
               ffmpeg = await refreshFfmpeg(
                 `analysis window retry on ${sanitizeBase(inputName)} @ ${window.startSec.toFixed(1)}s`
               );
-              await ffmpeg.writeFile(inputName, inputBytes);
+              await restoreRecoveryInputs(ffmpeg);
               continue;
             }
+            windowDropCount += 1;
             break;
           }
         }
       }
+      baseAnalysis.analysisWindowsSucceeded = windowAnalyses.length;
+      baseAnalysis.analysisWindowsDropped = windowDropCount;
+      baseAnalysis.analysisWindowRetryCount = windowRetryCount;
 
       if (windowAnalyses.length > 0) {
         return {
@@ -1681,6 +1725,7 @@ const summarizeFailureReason = (error: unknown) => {
       disableDynaThresholdForStability,
       strictEndingProtection,
       preferSinglePassContinuity,
+      longSparseModeEligible: !!analysis.longSparseModeEligible,
       segmentMatchTargetI: analysis.inputI,
       useSpeechAlignedSegmentation,
       useSpeechPauseSegmentation,
@@ -1766,9 +1811,13 @@ const summarizeFailureReason = (error: unknown) => {
     disableAdaptiveNoiseReduction?: boolean;
     minimalStabilityChain?: boolean;
     disableLimiter?: boolean;
+    disableSegmentGainMatch?: boolean;
     segmentBoundaryPadInMs?: number;
     segmentBoundaryPadOutMs?: number;
     trimSegmentPadMs?: number;
+    segmentLite?: boolean;
+    maxProcessedSpeechSegments?: number;
+    mergePauseThresholdSec?: number;
     segmentMode?: "fixed" | "speech-aligned" | "speech-pause";
     candidateVariant?: "cinematic-stable" | "continuity-safe" | "pause-safe";
     skipSpeechSegmentation?: boolean;
@@ -2606,6 +2655,68 @@ const summarizeFailureReason = (error: unknown) => {
     return segments;
   };
 
+  const countProcessedRenderSegments = (segments: RenderSegment[]) => segments.filter((segment) => segment.process).length;
+
+  const mergeRenderSegmentsForRisk = (
+    segments: RenderSegment[],
+    pauseThresholdSec: number,
+    maxProcessedSegments: number
+  ) => {
+    const merged = segments.map((segment) => ({ ...segment }));
+    while (countProcessedRenderSegments(merged) > maxProcessedSegments) {
+      let mergeIndex = -1;
+      let bestPauseSec = Number.POSITIVE_INFINITY;
+      for (let index = 1; index < merged.length - 1; index += 1) {
+        const previous = merged[index - 1];
+        const current = merged[index];
+        const next = merged[index + 1];
+        if (current.process || !previous.process || !next.process) continue;
+        const pauseSec = current.endSec - current.startSec;
+        if (pauseSec > pauseThresholdSec || pauseSec >= bestPauseSec) continue;
+        mergeIndex = index;
+        bestPauseSec = pauseSec;
+      }
+      if (mergeIndex < 0) break;
+
+      const previous = merged[mergeIndex - 1];
+      const next = merged[mergeIndex + 1];
+      merged.splice(mergeIndex - 1, 3, {
+        startSec: previous.startSec,
+        endSec: next.endSec,
+        process: true,
+        trimInMs: previous.trimInMs,
+        trimOutMs: next.trimOutMs,
+        forceEndingProtection: (previous.forceEndingProtection ?? false) || (next.forceEndingProtection ?? false),
+      });
+    }
+    return merged;
+  };
+
+  const describeRenderPath = (path: RenderPath) =>
+    path === "speech-pause-segmented"
+      ? "speech-pause segmented"
+      : path === "speech-aligned-segmented"
+        ? "speech-aligned segmented"
+        : path === "fixed-segmented"
+          ? "fixed segmented"
+          : path === "single-pass-recovered"
+            ? "single-pass recovered"
+            : "single-pass";
+
+  const summarizeDegradeReasons = (reasons: DegradeReason[]) => {
+    if (reasons.length === 0) return "none";
+    return reasons.join("+");
+  };
+
+  const summarizeCandidateMeta = (meta: CandidateRenderMeta) =>
+    `chain ${meta.strategyLabel}, path ${describeRenderPath(meta.renderPath)}, degraded ${
+      meta.degraded ? "yes" : "no"
+    } (${summarizeDegradeReasons(meta.degradeReasons)}), windows ${meta.analysisWindowsSucceeded}/${
+      meta.analysisWindowsAttempted
+    }${
+      meta.analysisWindowsDropped > 0 ? ` dropped ${meta.analysisWindowsDropped}` : ""
+    }`;
+
   const buildSilenceSegmentFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions) => {
     const filters: string[] = [];
     const candidateVariant = options?.candidateVariant ?? "cinematic-stable";
@@ -2635,11 +2746,9 @@ const summarizeFailureReason = (error: unknown) => {
     outputName: string,
     profile: AdaptiveProfile | null,
     durationSeconds: number,
-    silenceSpans: SilenceSpan[],
-    speechSpans: SpeechSpan[],
+    segments: RenderSegment[],
     options?: MixRenderOptions
   ) => {
-    const segments = buildSpeechAlignedRenderSegments(speechSpans, silenceSpans, durationSeconds, profile);
     if (segments.length < 2) {
       throw new Error("Speech-aligned segmentation skipped (insufficient segments).");
     }
@@ -2652,6 +2761,7 @@ const summarizeFailureReason = (error: unknown) => {
     const enableSegmentGainMatch =
       !!profile &&
       profile.segmentMatchTargetI !== null &&
+      !options?.disableSegmentGainMatch &&
       (profile.preferSinglePassContinuity ||
         profile.sentenceJumpScore >= 0.28 ||
         profile.breathSpikeRisk >= 0.34 ||
@@ -2948,17 +3058,17 @@ const summarizeFailureReason = (error: unknown) => {
     durationSeconds: number;
     silenceSpans: SilenceSpan[];
     speechSpans: SpeechSpan[];
+    plannedSegmentCount: number;
+    longSparseMode: boolean;
     mode: "speech-aligned" | "speech-pause";
   };
 
   type CandidateVariant = NonNullable<MixRenderOptions["candidateVariant"]>;
 
-  type CandidateScore = {
-    stability: number;
-    pause: number;
-    compression: number;
-    echo: number;
-    total: number;
+  type RenderAttemptResult = {
+    ffmpeg: FFmpeg;
+    meta: CandidateRenderMeta;
+    speechAlignedSegmentCountUsed: number | null;
   };
 
   const formatCandidateVariant = (variant: CandidateVariant) =>
@@ -2979,11 +3089,11 @@ const summarizeFailureReason = (error: unknown) => {
   const buildCandidateScore = (analysis: FileAnalysis | null): CandidateScore => {
     if (!analysis) {
       return {
-        stability: Number.POSITIVE_INFINITY,
-        pause: Number.POSITIVE_INFINITY,
-        compression: Number.POSITIVE_INFINITY,
-        echo: Number.POSITIVE_INFINITY,
-        total: Number.POSITIVE_INFINITY,
+        stability: 1,
+        pause: 1,
+        compression: 1,
+        echo: 1,
+        total: 1111,
       };
     }
 
@@ -3012,14 +3122,6 @@ const summarizeFailureReason = (error: unknown) => {
       clamp(((analysis.pauseNoiseFloorDb ?? -120) + 62) / 18, 0, 1) * 0.18;
     const total = stability * 1000 + pause * 100 + compression * 10 + echo;
     return { stability, pause, compression, echo, total };
-  };
-
-  const compareCandidateScores = (left: CandidateScore, right: CandidateScore) => {
-    if (left.stability !== right.stability) return left.stability - right.stability;
-    if (left.pause !== right.pause) return left.pause - right.pause;
-    if (left.compression !== right.compression) return left.compression - right.compression;
-    if (left.echo !== right.echo) return left.echo - right.echo;
-    return left.total - right.total;
   };
 
   const summarizeCandidateScore = (score: CandidateScore) =>
@@ -3064,10 +3166,19 @@ const summarizeFailureReason = (error: unknown) => {
       return null;
     }
 
+    const plannedSegments = buildSpeechAlignedRenderSegments(
+      silenceMap.speechSpans,
+      silenceMap.silenceSpans,
+      durationSeconds,
+      profile
+    );
+
     return {
       durationSeconds,
       silenceSpans: silenceMap.silenceSpans,
       speechSpans: silenceMap.speechSpans,
+      plannedSegmentCount: plannedSegments.filter((segment) => segment.process).length,
+      longSparseMode: profile?.longSparseModeEligible ?? false,
       mode: profile.useSpeechPauseSegmentation ? "speech-pause" : "speech-aligned",
     };
   };
@@ -3082,7 +3193,7 @@ const summarizeFailureReason = (error: unknown) => {
     stageLabel: string,
     options?: MixRenderOptions,
     speechRenderPlan?: SpeechRenderPlan | null
-  ) => {
+  ): Promise<RenderAttemptResult> => {
     const hasRoomFilters = roomCleanup && !!profile && (profile.useTailGate || profile.echoNotchCutDb >= 0.25);
     const hasAdaptiveNoiseReduction = noiseGuard && !!profile && profile.noiseRisk !== "low";
     const fallbackStrategies: Array<{ label: string; options?: MixRenderOptions }> = [{ label: "primary chain" }];
@@ -3113,11 +3224,11 @@ const summarizeFailureReason = (error: unknown) => {
       },
     });
 
-    let fallbackApplied: string | null = null;
     let lastMixError: unknown = null;
     let mixRendered = false;
     let inputDurationSeconds: number | null | undefined = speechRenderPlan?.durationSeconds;
     let speechAlignedSegmentCountUsed: number | null = null;
+    let renderMeta: CandidateRenderMeta | null = null;
 
     const ensureInputDuration = async () => {
       if (inputDurationSeconds !== undefined) return inputDurationSeconds;
@@ -3129,12 +3240,85 @@ const summarizeFailureReason = (error: unknown) => {
       return inputDurationSeconds;
     };
 
+    const buildMeta = (
+      strategyLabel: string,
+      renderPath: RenderPath,
+      degradeReasons: DegradeReason[]
+    ): CandidateRenderMeta => {
+      const reasons = Array.from(new Set(degradeReasons));
+      return {
+        strategyLabel,
+        renderPath,
+        segmentedHealthy:
+          (renderPath === "speech-pause-segmented" ||
+            renderPath === "speech-aligned-segmented" ||
+            renderPath === "fixed-segmented") &&
+          !reasons.includes("segment-render-memory-fault") &&
+          !reasons.includes("single-pass-recovery"),
+        degraded: reasons.length > 0,
+        degradeReasons: reasons,
+        analysisWindowsAttempted: 0,
+        analysisWindowsSucceeded: 0,
+        analysisWindowsDropped: 0,
+      };
+    };
+
     for (let strategyIndex = 0; strategyIndex < fallbackStrategies.length; strategyIndex += 1) {
       const strategy = fallbackStrategies[strategyIndex];
       const effectiveOptions = { ...options, ...strategy.options };
+      const strategyDegradeReasons: DegradeReason[] = [];
       try {
         if (speechRenderPlan && !effectiveOptions.skipSpeechSegmentation) {
-          try {
+          const plannedSegments = buildSpeechAlignedRenderSegments(
+            speechRenderPlan.speechSpans,
+            speechRenderPlan.silenceSpans,
+            speechRenderPlan.durationSeconds,
+            profile
+          );
+          const mergedSegments = mergeRenderSegmentsForRisk(
+            plannedSegments,
+            0.6,
+            18
+          );
+          const useRoomCleanupForStrategy = hasRoomFilters && !effectiveOptions.disableRoomCleanup;
+          const useAdaptiveNoiseReductionForStrategy =
+            hasAdaptiveNoiseReduction && !effectiveOptions.disableAdaptiveNoiseReduction;
+          let renderRisk: RenderRiskProfile = buildRenderRiskProfile({
+            durationSeconds: speechRenderPlan.durationSeconds,
+            longSparseMode: speechRenderPlan.longSparseMode,
+            plannedSegmentCount: speechRenderPlan.plannedSegmentCount,
+            speechSpanCount: speechRenderPlan.speechSpans.length,
+            candidateVariant: effectiveOptions.candidateVariant ?? "cinematic-stable",
+            useRoomCleanup: useRoomCleanupForStrategy,
+            useAdaptiveNoiseReduction: useAdaptiveNoiseReductionForStrategy,
+            priorFatalRenderError: false,
+            sentenceJumpScore: profile?.sentenceJumpScore ?? 0,
+            mergedSegmentCount: countProcessedRenderSegments(mergedSegments),
+          });
+
+          if (renderRisk.recycleWorkerBeforeRender) {
+            ffmpeg = await refreshFfmpeg(`render risk preflight on ${job.base}/${strategy.label}`);
+            await writeJobInput(ffmpeg, job);
+          }
+
+          const runFixedSegmentation = async () => {
+            setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
+            setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
+            await runMixReadySegmented(ffmpeg, job.inputName, outputName, profile, speechRenderPlan.durationSeconds, {
+              ...effectiveOptions,
+              segmentMode: "fixed",
+            });
+            speechAlignedSegmentCountUsed = Math.ceil(speechRenderPlan.durationSeconds / MIX_SEGMENT_SECONDS);
+            mixRendered = true;
+            renderMeta = buildMeta(strategy.label, "fixed-segmented", strategyDegradeReasons);
+            appendLog(
+              `[Segmented] ${job.base}: fixed render used ${speechAlignedSegmentCountUsed} segments (${formatCandidateVariant(
+                effectiveOptions.candidateVariant ?? "cinematic-stable"
+              )}).`
+            );
+          };
+
+          const runSpeechSegmentation = async (segments: RenderSegment[], segmentLite: boolean) => {
             setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
             setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
             speechAlignedSegmentCountUsed = await runMixReadySpeechAlignedSegmented(
@@ -3143,31 +3327,109 @@ const summarizeFailureReason = (error: unknown) => {
               outputName,
               profile,
               speechRenderPlan.durationSeconds,
-              speechRenderPlan.silenceSpans,
-              speechRenderPlan.speechSpans,
-              { ...effectiveOptions, segmentMode: speechRenderPlan.mode }
+              segments,
+              {
+                ...effectiveOptions,
+                segmentMode: speechRenderPlan.mode,
+                segmentLite,
+                disableSegmentGainMatch:
+                  effectiveOptions.disableSegmentGainMatch || (segmentLite ? true : renderRisk.disableSegmentGainMatch),
+              }
             );
             mixRendered = true;
-            fallbackApplied =
-              strategyIndex === 0
-                ? `${speechRenderPlan.mode} segmented`
-                : `${strategy.label} (${speechRenderPlan.mode} segmented)`;
+            renderMeta = buildMeta(
+              strategy.label,
+              speechRenderPlan.mode === "speech-pause" ? "speech-pause-segmented" : "speech-aligned-segmented",
+              strategyDegradeReasons
+            );
             appendLog(
               `[Segmented] ${job.base}: ${speechRenderPlan.mode} render used ${speechAlignedSegmentCountUsed} segments (${formatCandidateVariant(
                 effectiveOptions.candidateVariant ?? "cinematic-stable"
-              )}).`
+              )}${segmentLite ? ", lite" : ""}).`
             );
-            break;
-          } catch (segError) {
-            lastMixError = segError;
+          };
+
+          if (renderRisk.shouldUseFixedSegmentation) {
             appendLog(
-              `[Segmented] ${job.base}: ${speechRenderPlan.mode} ${strategy.label} failed (${describeError(
-                segError
-              )}), trying single-pass ${strategy.label}.`
+              `[Segmented] ${job.base}: high render risk on ${strategy.label}, using fixed segmentation preflight.`
             );
-            if (shouldResetFfmpegForError(segError)) {
-              ffmpeg = await refreshFfmpeg(`${speechRenderPlan.mode} mix fallback on ${job.base}`);
-              await writeJobInput(ffmpeg, job);
+            try {
+              await runFixedSegmentation();
+              break;
+            } catch (fixedError) {
+              lastMixError = fixedError;
+              if (shouldResetFfmpegForError(fixedError)) {
+                strategyDegradeReasons.push("segment-render-memory-fault");
+                ffmpeg = await refreshFfmpeg(`fixed-segmented fallback on ${job.base}`);
+                await writeJobInput(ffmpeg, job);
+              }
+            }
+          } else {
+            const primarySegments =
+              renderRisk.level === "high" && countProcessedRenderSegments(mergedSegments) < countProcessedRenderSegments(plannedSegments)
+                ? mergedSegments
+                : plannedSegments;
+            try {
+              await runSpeechSegmentation(primarySegments, false);
+              break;
+            } catch (segError) {
+              lastMixError = segError;
+              appendLog(
+                `[Segmented] ${job.base}: ${speechRenderPlan.mode} ${strategy.label} failed (${describeError(
+                  segError
+                )}), trying segmented-lite ${strategy.label}.`
+              );
+              if (shouldResetFfmpegForError(segError)) {
+                strategyDegradeReasons.push("segment-render-memory-fault");
+                ffmpeg = await refreshFfmpeg(`${speechRenderPlan.mode} mix fallback on ${job.base}`);
+                await writeJobInput(ffmpeg, job);
+              }
+              renderRisk = buildRenderRiskProfile({
+                durationSeconds: speechRenderPlan.durationSeconds,
+                longSparseMode: speechRenderPlan.longSparseMode,
+                plannedSegmentCount: speechRenderPlan.plannedSegmentCount,
+                speechSpanCount: speechRenderPlan.speechSpans.length,
+                candidateVariant: effectiveOptions.candidateVariant ?? "cinematic-stable",
+                useRoomCleanup: useRoomCleanupForStrategy,
+                useAdaptiveNoiseReduction: useAdaptiveNoiseReductionForStrategy,
+                priorFatalRenderError: strategyDegradeReasons.includes("segment-render-memory-fault"),
+                sentenceJumpScore: profile?.sentenceJumpScore ?? 0,
+                mergedSegmentCount: countProcessedRenderSegments(mergedSegments),
+              });
+              if (!renderRisk.shouldUseFixedSegmentation) {
+                try {
+                  await runSpeechSegmentation(mergedSegments, true);
+                  break;
+                } catch (liteError) {
+                  lastMixError = liteError;
+                  appendLog(
+                    `[Segmented] ${job.base}: segmented-lite ${strategy.label} failed (${describeError(
+                      liteError
+                    )}), trying fixed segmented ${strategy.label}.`
+                  );
+                  if (shouldResetFfmpegForError(liteError)) {
+                    if (!strategyDegradeReasons.includes("segment-render-memory-fault")) {
+                      strategyDegradeReasons.push("segment-render-memory-fault");
+                    }
+                    ffmpeg = await refreshFfmpeg(`segmented-lite fallback on ${job.base}`);
+                    await writeJobInput(ffmpeg, job);
+                  }
+                }
+              }
+
+              try {
+                await runFixedSegmentation();
+                break;
+              } catch (fixedError) {
+                lastMixError = fixedError;
+                if (shouldResetFfmpegForError(fixedError)) {
+                  if (!strategyDegradeReasons.includes("segment-render-memory-fault")) {
+                    strategyDegradeReasons.push("segment-render-memory-fault");
+                  }
+                  ffmpeg = await refreshFfmpeg(`fixed-segmented fallback on ${job.base}`);
+                  await writeJobInput(ffmpeg, job);
+                }
+              }
             }
           }
         }
@@ -3176,7 +3438,14 @@ const summarizeFailureReason = (error: unknown) => {
         setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
         await runMixReady(ffmpeg, job.inputName, outputName, profile, effectiveOptions);
         mixRendered = true;
-        fallbackApplied = strategyIndex === 0 ? null : strategy.label;
+        if (strategyDegradeReasons.includes("segment-render-memory-fault")) {
+          strategyDegradeReasons.push("single-pass-recovery");
+        }
+        renderMeta = buildMeta(
+          strategy.label,
+          strategyDegradeReasons.includes("single-pass-recovery") ? "single-pass-recovered" : "single-pass",
+          strategyDegradeReasons
+        );
         break;
       } catch (error) {
         lastMixError = error;
@@ -3196,11 +3465,12 @@ const summarizeFailureReason = (error: unknown) => {
             );
             await runMixReadySegmented(ffmpeg, job.inputName, outputName, profile, durationSeconds, effectiveOptions);
             mixRendered = true;
-            fallbackApplied = strategyIndex === 0 ? "primary chain (segmented)" : `${strategy.label} (segmented)`;
+            renderMeta = buildMeta(strategy.label, "fixed-segmented", strategyDegradeReasons);
             break;
           } catch (segmentedError) {
             lastMixError = segmentedError;
             if (shouldResetFfmpegForError(segmentedError)) {
+              strategyDegradeReasons.push("segment-render-memory-fault");
               ffmpeg = await refreshFfmpeg(`segmented mix fallback on ${job.base}`);
               await writeJobInput(ffmpeg, job);
             }
@@ -3223,7 +3493,11 @@ const summarizeFailureReason = (error: unknown) => {
       throw lastMixError ?? new Error("Mix-ready render failed.");
     }
 
-    return { ffmpeg, fallbackApplied, speechAlignedSegmentCountUsed };
+    if (!renderMeta) {
+      renderMeta = buildMeta("primary chain", "single-pass", []);
+    }
+
+    return { ffmpeg, meta: renderMeta, speechAlignedSegmentCountUsed };
   };
 
   const processFiles = async () => {
@@ -3368,7 +3642,7 @@ const summarizeFailureReason = (error: unknown) => {
               appendLog(
                 `[SegmentPlan] ${job.base}: ${speechRenderPlan.mode} ready with ${
                   speechRenderPlan.speechSpans.length
-                } speech spans and ${speechRenderPlan.silenceSpans.length} silence spans.`
+                } speech spans and ${speechRenderPlan.silenceSpans.length} silence spans (${speechRenderPlan.plannedSegmentCount} planned segments).`
               );
             }
           } catch (error) {
@@ -3389,7 +3663,11 @@ const summarizeFailureReason = (error: unknown) => {
           let selectedBytes: Uint8Array | null = null;
           let selectedScore: CandidateScore | null = null;
           let selectedAnalysis: FileAnalysis | null = null;
-          let selectedFallbackApplied: string | null = null;
+          let selectedMeta: CandidateRenderMeta | null = null;
+          let selectedReason: string | null = null;
+          let attemptedCandidates = 0;
+          let degradedCandidates = 0;
+          let healthySegmentedCandidates = 0;
 
           for (const candidateVariant of candidateVariants) {
             const candidateLabel = formatCandidateVariant(candidateVariant);
@@ -3412,19 +3690,45 @@ const summarizeFailureReason = (error: unknown) => {
                 speechRenderPlan
               );
               ffmpeg = renderResult.ffmpeg;
+              attemptedCandidates += 1;
               const candidateBytes = await readVirtualFileBytes(ffmpeg, candidateName);
 
               let candidateAnalysis: FileAnalysis | null = null;
+              let candidateMeta = renderResult.meta;
               try {
-                const analysisResult = await analyzeFile(ffmpeg, candidateName);
+                const candidateAnalysisFfmpeg = ffmpeg;
+                const analysisResult = await analyzeFile(ffmpeg, candidateName, [job.inputName]);
                 ffmpeg = analysisResult.ffmpeg;
                 candidateAnalysis = analysisResult.analysis;
+                const degradeReasons = [...candidateMeta.degradeReasons];
+                if ((candidateAnalysis.analysisWindowRetryCount ?? 0) > 0) {
+                  degradeReasons.push("analysis-window-retry");
+                }
+                if ((candidateAnalysis.analysisWindowsDropped ?? 0) > 0) {
+                  degradeReasons.push("analysis-window-drop");
+                }
+                candidateMeta = {
+                  ...candidateMeta,
+                  degradeReasons: Array.from(new Set(degradeReasons)),
+                  degraded: degradeReasons.length > 0,
+                  analysisWindowsAttempted: candidateAnalysis.analysisWindowsAttempted ?? 0,
+                  analysisWindowsSucceeded: candidateAnalysis.analysisWindowsSucceeded ?? 0,
+                  analysisWindowsDropped: candidateAnalysis.analysisWindowsDropped ?? 0,
+                };
+                if (ffmpeg !== candidateAnalysisFfmpeg) {
+                  await writeJobInput(ffmpeg, job);
+                }
               } catch (error) {
                 appendLog(
                   `[CandidateQC] ${job.base}/${candidateLabel}: analysis fallback (${
                     error instanceof Error ? error.message : String(error)
                   }).`
                 );
+                candidateMeta = {
+                  ...candidateMeta,
+                  degraded: true,
+                  degradeReasons: Array.from(new Set([...candidateMeta.degradeReasons, "analysis-window-drop"])),
+                };
                 if (shouldResetFfmpegForError(error)) {
                   ffmpeg = await refreshFfmpeg(`candidate QC on ${job.base}`);
                   await writeJobInput(ffmpeg, job);
@@ -3433,20 +3737,24 @@ const summarizeFailureReason = (error: unknown) => {
 
               const candidateScore = buildCandidateScore(candidateAnalysis);
               appendLog(
-                `[CandidateQC] ${job.base}/${candidateLabel}: ${summarizeCandidateScore(candidateScore)}${
-                  renderResult.fallbackApplied ? `, fallback ${renderResult.fallbackApplied}` : ""
-                }.`
+                `[CandidateQC] ${job.base}/${candidateLabel}: ${summarizeCandidateScore(candidateScore)}, ${summarizeCandidateMeta(
+                  candidateMeta
+                )}.`
               );
-              const shouldSelect =
-                selectedBytes === null ||
-                selectedScore === null ||
-                compareCandidateScores(candidateScore, selectedScore) < 0;
-              if (shouldSelect) {
+              if (candidateMeta.degraded) {
+                degradedCandidates += 1;
+              }
+              if (isHealthySegmentedRender(candidateMeta)) {
+                healthySegmentedCandidates += 1;
+              }
+              const decision = shouldPreferCandidate(candidateScore, candidateMeta, selectedScore, selectedMeta);
+              if (decision.select) {
                 selectedVariant = candidateVariant;
                 selectedBytes = candidateBytes;
                 selectedScore = candidateScore;
                 selectedAnalysis = candidateAnalysis;
-                selectedFallbackApplied = renderResult.fallbackApplied;
+                selectedMeta = candidateMeta;
+                selectedReason = decision.reason;
               }
 
               await safeDeleteFile(ffmpeg, candidateName);
@@ -3469,9 +3777,33 @@ const summarizeFailureReason = (error: unknown) => {
 
           await ffmpeg.writeFile(job.mixName, selectedBytes);
           appendLog(
-            `[CandidateSelect] ${job.base}: kept ${formatCandidateVariant(selectedVariant)}${
-              selectedFallbackApplied ? ` (${selectedFallbackApplied})` : ""
-            } with ${summarizeCandidateScore(selectedScore ?? buildCandidateScore(selectedAnalysis))}.`
+            `[CandidateSelect] ${job.base}: kept ${formatCandidateVariant(selectedVariant)} via ${summarizeCandidateMeta(
+              selectedMeta ?? {
+                strategyLabel: "primary chain",
+                renderPath: "single-pass",
+                segmentedHealthy: false,
+                degraded: false,
+                degradeReasons: [],
+                analysisWindowsAttempted: 0,
+                analysisWindowsSucceeded: 0,
+                analysisWindowsDropped: 0,
+              }
+            )} with ${summarizeCandidateScore(selectedScore ?? buildCandidateScore(selectedAnalysis))}${
+              selectedReason && selectedReason !== "first completed candidate" && selectedReason !== "better score"
+                ? `, ${selectedReason}`
+                : ""
+            }.`
+          );
+          appendLog(
+            `[CandidateSummary] ${job.base}: ${
+              attemptedCandidates > 0 && degradedCandidates === attemptedCandidates
+                ? "all candidates degraded"
+                : selectedMeta?.renderPath === "single-pass-recovered"
+                  ? "degraded recovered winner"
+                  : healthySegmentedCandidates > 0 && !selectedMeta?.degraded
+                    ? "healthy segmented winner"
+                    : "best-effort winner"
+            }.`
           );
 
           const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean");

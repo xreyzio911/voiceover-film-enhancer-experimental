@@ -204,6 +204,49 @@ test("sentence-jump scoring rises when grouped lines land at different body leve
   assert.ok(jumpy.sentenceJumpScore > protectedTail.sentenceJumpScore + 0.45);
 });
 
+test("sparse sentence-jump scoring still rises when isolated lines land at different levels", () => {
+  const steadySparse = analyzeSections([
+    { frames: 200, fromDb: -78 },
+    { frames: 80, fromDb: -30 },
+    { frames: 180, fromDb: -78 },
+    { frames: 76, fromDb: -30 },
+    { frames: 220, fromDb: -78 },
+    { frames: 72, fromDb: -30 },
+    { frames: 180, fromDb: -78 },
+  ]);
+  const jumpySparse = analyzeSections([
+    { frames: 200, fromDb: -78 },
+    { frames: 80, fromDb: -29 },
+    { frames: 180, fromDb: -78 },
+    { frames: 76, fromDb: -36 },
+    { frames: 220, fromDb: -78 },
+    { frames: 72, fromDb: -31 },
+    { frames: 180, fromDb: -78 },
+  ]);
+
+  assert.ok(jumpySparse.sentenceJumpScore > steadySparse.sentenceJumpScore + 0.28);
+});
+
+test("lead-in breath-spike scoring rises for short pre-word transients above following speech", () => {
+  const steady = analyzeSections([
+    { frames: 180, fromDb: -78 },
+    { frames: 24, fromDb: -78 },
+    { frames: 24, fromDb: -31 },
+    { frames: 80, fromDb: -29 },
+    { frames: 200, fromDb: -78 },
+  ]);
+  const leadBurst = analyzeSections([
+    { frames: 180, fromDb: -78 },
+    { frames: 6, fromDb: -48, peakLiftDb: 28, sharpnessDb: -50 },
+    { frames: 24, fromDb: -78 },
+    { frames: 24, fromDb: -31 },
+    { frames: 80, fromDb: -29 },
+    { frames: 200, fromDb: -78 },
+  ]);
+
+  assert.ok(leadBurst.breathSpikeRisk > steady.breathSpikeRisk + 0.18);
+});
+
 test("line swing scoring rises for high-low-high speech contours", () => {
   const protectedTail = analyzeSections([
     { frames: 120, fromDb: -75 },

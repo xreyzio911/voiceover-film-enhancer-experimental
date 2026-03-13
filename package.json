@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:audio-qc": "node --test --experimental-strip-types src/lib/audioQc.test.ts",
+    "test:audio-qc": "node --test --experimental-strip-types src/lib/audioQc.test.ts src/lib/renderRecovery.test.ts",
     "postinstall": "node scripts/copy-ffmpeg-core.mjs"
   },
   "dependencies": {
