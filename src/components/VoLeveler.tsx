@@ -169,7 +169,7 @@ const shouldRecycleFfmpegForBatch = (completedCount: number, totalCount: number)
 
 type OutputEntry = {
   name: string;
-  url: string;
+  blob: Blob;
   size: number;
   kind: "mixready" | "loudness";
   variant: "clean" | "blend";
@@ -413,12 +413,6 @@ export default function VoLeveler() {
 
   const loudnessConfig = useMemo(() => LOUDNESS_PRESETS[loudnessTarget], [loudnessTarget]);
   const smartMatchConfig = useMemo(() => SMART_MATCH_PRESETS[smartMatchMode], [smartMatchMode]);
-
-  useEffect(() => {
-    return () => {
-      outputs.forEach((output) => URL.revokeObjectURL(output.url));
-    };
-  }, [outputs]);
 
   useEffect(() => {
     return () => {
@@ -2400,7 +2394,7 @@ const summarizeFailureReason = (error: unknown) => {
     const blob = new Blob([bytes], { type: "audio/wav" });
     return {
       name,
-      url: URL.createObjectURL(blob),
+      blob,
       size: blob.size,
       kind,
       variant,
@@ -4000,6 +3994,29 @@ const summarizeFailureReason = (error: unknown) => {
     handleFiles(event.dataTransfer.files);
   };
 
+  const triggerDownload = (blob: Blob, fileName: string) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    link.rel = "noopener";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  };
+
+  const downloadOutputFile = (output: OutputEntry) => {
+    try {
+      if (!(output.blob instanceof Blob)) {
+        throw new Error("Output blob missing. Refresh the page and re-run the batch.");
+      }
+      triggerDownload(output.blob, output.name);
+    } catch (error) {
+      appendLog(`Download failed (${output.name}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
   const downloadOutputsZip = async () => {
     if (outputs.length === 0 || zipBusy) return;
 
@@ -4011,9 +4028,10 @@ const summarizeFailureReason = (error: unknown) => {
 
       for (let i = 0; i < outputs.length; i += 1) {
         const output = outputs[i];
-        const response = await fetch(output.url);
-        const blob = await response.blob();
-        zip.file(output.name, blob);
+        if (!(output.blob instanceof Blob)) {
+          throw new Error("Output blob missing. Refresh the page and re-run the batch.");
+        }
+        zip.file(output.name, output.blob);
         setZipProgress(Math.round(((i + 1) / outputs.length) * 70));
       }
 
@@ -4030,15 +4048,7 @@ const summarizeFailureReason = (error: unknown) => {
 
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const archiveName = `vo_leveler_outputs_${stamp}.zip`;
-      const zipUrl = URL.createObjectURL(zipBlob);
-      const link = document.createElement("a");
-      link.href = zipUrl;
-      link.download = archiveName;
-      link.rel = "noopener";
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      setTimeout(() => URL.revokeObjectURL(zipUrl), 30_000);
+      triggerDownload(zipBlob, archiveName);
       appendLog(`ZIP created: ${archiveName} (${formatBytes(zipBlob.size)})`);
     } catch (error) {
       appendLog(`ZIP export failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -4464,9 +4474,13 @@ const summarizeFailureReason = (error: unknown) => {
                     )}
                   </div>
                 </div>
-                <a href={output.url} download={output.name}>
+                <button
+                  type="button"
+                  className={styles.outputDownload}
+                  onClick={() => downloadOutputFile(output)}
+                >
                   Download
-                </a>
+                </button>
               </div>
             ))}
           </div>

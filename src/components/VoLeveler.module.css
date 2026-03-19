@@ -176,9 +176,19 @@
   background: rgba(12, 14, 18, 0.6);
 }
 
-.outputItem a {
+.outputDownload {
+  width: fit-content;
+  padding: 0;
+  background: transparent;
+  border: none;
   color: var(--accent-2);
   font-weight: 600;
+  cursor: pointer;
+  font: inherit;
+}
+
+.outputDownload:hover {
+  text-decoration: underline;
 }
 
 .outputMeta {
