@@ -71,7 +71,6 @@ const SMART_MATCH_PRESETS = {
   Balanced: { tone: 0.7, dynamics: 0.5 },
 } as const;
 
-const CORE_BASE_URL = "ffmpeg/ffmpeg-core";
 const ANALYSIS_SAMPLE_SECONDS = 180;
 const ANALYSIS_SAMPLE_RATE = 16000;
 const ENVELOPE_FRAME_MS = 10;
@@ -174,6 +173,12 @@ type OutputEntry = {
   size: number;
   kind: "mixready" | "loudness";
   variant: "clean" | "blend";
+};
+
+type FfmpegAssetUrls = {
+  coreURL: string;
+  wasmURL: string;
+  workerURL?: string;
 };
 
 type SilenceSpan = {
@@ -373,6 +378,8 @@ const createEmptyAnalysis = (): FileAnalysis => ({
 
 export default function VoLeveler() {
   const ffmpegRef = useRef<FFmpeg | null>(null);
+  const ffmpegLoadPromiseRef = useRef<Promise<FFmpeg> | null>(null);
+  const ffmpegAssetUrlsRef = useRef<FfmpegAssetUrls | null>(null);
   const logBufferRef = useRef<string[]>([]);
   const activeQueueBaseRef = useRef<string | null>(null);
   const activeQueueStageRef = useRef<string>("Queued");
@@ -415,14 +422,15 @@ export default function VoLeveler() {
 
   useEffect(() => {
     return () => {
-      if (ffmpegRef.current) {
-        try {
-          ffmpegRef.current.terminate();
-        } catch {
-          // Ignore terminate failures during unmount.
-        }
-        ffmpegRef.current = null;
+      teardownFfmpeg();
+      const assetUrls = ffmpegAssetUrlsRef.current;
+      if (!assetUrls) return;
+      URL.revokeObjectURL(assetUrls.coreURL);
+      URL.revokeObjectURL(assetUrls.wasmURL);
+      if (assetUrls.workerURL) {
+        URL.revokeObjectURL(assetUrls.workerURL);
       }
+      ffmpegAssetUrlsRef.current = null;
     };
   }, []);
 
@@ -521,35 +529,43 @@ export default function VoLeveler() {
     }
   };
 
-  const teardownFfmpeg = () => {
-    if (!ffmpegRef.current) return;
+  const resolveFfmpegAssetUrl = (name: string) =>
+    typeof window === "undefined" ? `/ffmpeg/${name}` : new URL(`/ffmpeg/${name}`, window.location.origin).toString();
+
+  const ensureFfmpegAssetUrls = async () => {
+    if (ffmpegAssetUrlsRef.current) return ffmpegAssetUrlsRef.current;
+
+    let coreURL: string | null = null;
+    let wasmURL: string | null = null;
+    let workerURL: string | undefined;
+
     try {
-      ffmpegRef.current.terminate();
-    } catch {
-      // Ignore terminate failures while resetting worker state.
-    } finally {
-      ffmpegRef.current = null;
-      logBufferRef.current = [];
+      coreURL = await toBlobURL(resolveFfmpegAssetUrl("ffmpeg-core.js"), "text/javascript");
+      wasmURL = await toBlobURL(resolveFfmpegAssetUrl("ffmpeg-core.wasm"), "application/wasm");
+      workerURL = await toBlobURLSafe(resolveFfmpegAssetUrl("ffmpeg-core.worker.js"), "text/javascript");
+
+      const assetUrls = {
+        coreURL,
+        wasmURL,
+        ...(workerURL ? { workerURL } : {}),
+      };
+      ffmpegAssetUrlsRef.current = assetUrls;
+      return assetUrls;
+    } catch (error) {
+      if (coreURL) {
+        URL.revokeObjectURL(coreURL);
+      }
+      if (wasmURL) {
+        URL.revokeObjectURL(wasmURL);
+      }
+      if (workerURL) {
+        URL.revokeObjectURL(workerURL);
+      }
+      throw error;
     }
   };
 
-  const hasFatalFfmpegSignal = (text: string) => FATAL_FFMPEG_PATTERN.test(text);
-
-  const shouldResetFfmpegForError = (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    return hasFatalFfmpegSignal(message) || /RuntimeError|memory access out of bounds/i.test(message);
-  };
-
-  const refreshFfmpeg = async (reason: string) => {
-    appendLog(`Resetting FFmpeg worker (${reason})...`);
-    teardownFfmpeg();
-    return await ensureFfmpeg();
-  };
-
-  const ensureFfmpeg = async () => {
-    if (ffmpegRef.current) return ffmpegRef.current;
-
-    const ffmpeg = new FFmpeg();
+  const attachFfmpegListeners = (ffmpeg: FFmpeg) => {
     ffmpeg.on("log", ({ message }) => {
       if (message.trim() === "Aborted()") {
         // Common during terminate/reset; not a reliable execution failure signal.
@@ -581,21 +597,82 @@ export default function VoLeveler() {
         }
       }
     });
+  };
+
+  const createLoadedFfmpeg = async () => {
+    const ffmpeg = new FFmpeg();
+    attachFfmpegListeners(ffmpeg);
 
     setStatus("Loading FFmpeg core...");
-    const coreURL = await toBlobURL(`${CORE_BASE_URL}.js`, "text/javascript");
-    const wasmURL = await toBlobURL(`${CORE_BASE_URL}.wasm`, "application/wasm");
-    const workerURL = await toBlobURLSafe(`${CORE_BASE_URL}.worker.js`, "text/javascript");
+    const assetUrls = await ensureFfmpegAssetUrls();
 
-    await ffmpeg.load({
-      coreURL,
-      wasmURL,
-      ...(workerURL ? { workerURL } : {}),
+    try {
+      await ffmpeg.load(assetUrls);
+      setStatus("FFmpeg ready");
+      return ffmpeg;
+    } catch (error) {
+      try {
+        ffmpeg.terminate();
+      } catch {
+        // Ignore terminate failures if the fresh worker never fully booted.
+      }
+      throw error;
+    }
+  };
+
+  const teardownFfmpeg = () => {
+    if (!ffmpegRef.current) return;
+    try {
+      ffmpegRef.current.terminate();
+    } catch {
+      // Ignore terminate failures while resetting worker state.
+    } finally {
+      ffmpegRef.current = null;
+      ffmpegLoadPromiseRef.current = null;
+      logBufferRef.current = [];
+    }
+  };
+
+  const hasFatalFfmpegSignal = (text: string) => FATAL_FFMPEG_PATTERN.test(text);
+
+  const shouldResetFfmpegForError = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    return hasFatalFfmpegSignal(message) || /RuntimeError|memory access out of bounds/i.test(message);
+  };
+
+  const refreshFfmpeg = async (reason: string) => {
+    appendLog(`Resetting FFmpeg worker (${reason})...`);
+    const previous = ffmpegRef.current;
+    const next = await createLoadedFfmpeg().catch((error) => {
+      ffmpegRef.current = previous;
+      throw error;
     });
 
-    ffmpegRef.current = ffmpeg;
-    setStatus("FFmpeg ready");
-    return ffmpeg;
+    ffmpegRef.current = next;
+    if (previous) {
+      try {
+        previous.terminate();
+      } catch {
+        // Ignore terminate failures while rotating worker state.
+      }
+    }
+    logBufferRef.current = [];
+    return next;
+  };
+
+  const ensureFfmpeg = async () => {
+    if (ffmpegRef.current) return ffmpegRef.current;
+    if (!ffmpegLoadPromiseRef.current) {
+      ffmpegLoadPromiseRef.current = createLoadedFfmpeg()
+        .then((ffmpeg) => {
+          ffmpegRef.current = ffmpeg;
+          return ffmpeg;
+        })
+        .finally(() => {
+          ffmpegLoadPromiseRef.current = null;
+        });
+    }
+    return await ffmpegLoadPromiseRef.current;
   };
 
   const resetLogBuffer = () => {
