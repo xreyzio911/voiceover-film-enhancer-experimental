@@ -4,7 +4,13 @@ import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import JSZip from "jszip";
 import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
-import { analyzeFloatSamples, type AudioQcMetrics } from "../lib/audioQc";
+import { analyzeFloatSamples, buildSpeechMask, type AudioQcMetrics } from "../lib/audioQc";
+import {
+  applyGainCurveToSamples,
+  planGainCurve,
+  speechRunsFromMask,
+  type SpeechRun as PlannerSpeechRun,
+} from "../lib/gainPlanner";
 import {
   buildRenderRiskProfile,
   isHealthySegmentedRender,
@@ -15,6 +21,13 @@ import {
   type RenderPath,
   type RenderRiskProfile,
 } from "../lib/renderRecovery";
+import {
+  computeLogBandSpectrumDb,
+  computeSibilanceScore,
+  computeToneMatchDeltaDb,
+  SPECTRUM_BANDS_HZ,
+} from "../lib/spectrum";
+import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -94,6 +107,26 @@ const BATCH_MEMORY_GUARD_INTERVAL = 3;
 const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled";
 const FATAL_FFMPEG_PATTERN = /memory access out of bounds|runtimeerror/i;
 const IMPORTANT_LOG_PATTERN = /error|failed|invalid|aborted|out of bounds/i;
+
+/**
+ * Sample rate used when the gain planner analyzes the full file.
+ * 16 kHz mono is plenty for envelope analysis and keeps memory tiny even on
+ * long takes (17-min file ≈ 65 MB Float32). The gain curve is applied via
+ * ffmpeg `sendcmd`+`volume`, so we never have to re-decode the full audio
+ * at the original rate on the JS side.
+ */
+const GAIN_PLANNER_ANALYSIS_SAMPLE_RATE = 16000;
+const GAIN_PLANNER_FRAME_MS = 10;
+/**
+ * Memory guard. Even at 16 kHz mono Float32 a 2-hour file would be ~460 MB,
+ * which will OOM the WASM heap. Beyond this we skip the planner and rely on
+ * the downstream `dynaudnorm` fallback.
+ */
+const GAIN_PLANNER_MAX_DURATION_SECONDS = 4800; // 80 minutes — fine at 16 kHz mono
+/**
+ * Crossfade overlap between segments when segmented rendering is used.
+ */
+const SEGMENT_CROSSFADE_SECONDS = 0.3;
 
 const sanitizeBase = (name: string) =>
   name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9-_]+/g, "_");
@@ -208,6 +241,8 @@ type FileAnalysis = {
   lowRms: number | null;
   midRms: number | null;
   highRms: number | null;
+  bandSpectrumDb: number[] | null;
+  sibilanceScore: number | null;
   noiseFloorDb: number | null;
   pauseNoiseFloorDb: number | null;
   nearSpeechNoiseFloorDb: number | null;
@@ -247,6 +282,8 @@ type BatchReference = {
   lowTilt: number;
   highTilt: number;
   lra: number;
+  /** Median long-term band spectrum across the batch, one entry per SPECTRUM_BANDS_HZ band. */
+  bandSpectrumDb: number[] | null;
 };
 
 type NoiseRisk = "low" | "medium" | "high";
@@ -267,14 +304,24 @@ type AdaptiveProfile = {
   floorGuardFilter: string;
   noiseRisk: NoiseRisk;
   noiseFloorDb: number | null;
+  noiseContrastDb: number | null;
   pauseNoiseRisk: number;
   speechThresholdDb: number | null;
   roomRisk: RoomRisk;
   useDenoise: boolean;
   denoiseStrength: number;
+  /** 8-band log-frequency spectrum in dB for this file. Null when not measured. */
+  bandSpectrumDb: number[] | null;
+  /** Per-band dB delta the tone matcher wants to apply (clamped), or null. */
+  toneMatchDeltaDb: number[] | null;
+  /** Sibilance score 0..1 — drives the de-esser gate. */
+  sibilanceScore: number;
+  /** When true, include the cinematic color shelves in the mix. */
+  cinematicColorEnabled: boolean;
   useTailGate: boolean;
   tailGateStrength: number;
   echoNotchCutDb: number;
+  echoScore: number;
   instabilityScore: number;
   clickScore: number;
   clickTameStrength: number;
@@ -341,6 +388,8 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   lowRms: null,
   midRms: null,
   highRms: null,
+  bandSpectrumDb: null,
+  sibilanceScore: null,
   noiseFloorDb: null,
   pauseNoiseFloorDb: null,
   nearSpeechNoiseFloorDb: null,
@@ -400,16 +449,21 @@ export default function VoLeveler() {
   const [loudnessTarget, setLoudnessTarget] = useState<keyof typeof LOUDNESS_PRESETS>(
     "ATSC A/85 (-24 LKFS, -2 dBTP)"
   );
-  const [keepMixReady, setKeepMixReady] = useState(true);
+  // Default off — users mostly want the final broadcast-loudness export, not
+  // the intermediate mix-ready bounce. Flip on per-session if you need it.
+  const [keepMixReady, setKeepMixReady] = useState(false);
   const [smartMatchMode, setSmartMatchMode] = useState<keyof typeof SMART_MATCH_PRESETS>("Gentle");
   const [eqCleanup, setEqCleanup] = useState(true);
   const [breathControl, setBreathControl] = useState<keyof typeof BREATH_COMPAND>("Light");
   const [leveler, setLeveler] = useState<keyof typeof LEVELER_PRESETS>("Balanced");
   const [roomCleanup, setRoomCleanup] = useState(true);
-  const [sceneBlend, setSceneBlend] = useState(true);
+  const [sceneBlend, setSceneBlend] = useState(false);
   const [softenHarshness, setSoftenHarshness] = useState(true);
   const [noiseGuard, setNoiseGuard] = useState(true);
   const [floorGuard, setFloorGuard] = useState(true);
+  const [cinematicColor, setCinematicColor] = useState(true);
+  const [gainPlannerEnabled, setGainPlannerEnabled] = useState(true);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const loudnessConfig = useMemo(() => LOUDNESS_PRESETS[loudnessTarget], [loudnessTarget]);
   const smartMatchConfig = useMemo(() => SMART_MATCH_PRESETS[smartMatchMode], [smartMatchMode]);
@@ -749,6 +803,305 @@ const summarizeFailureReason = (error: unknown) => {
     return new Float32Array(aligned.buffer, aligned.byteOffset, usableLength / 4);
   };
 
+  /**
+   * A completed gain plan. Holds the gain curve + enough metadata to emit a
+   * `sendcmd` script over any time window (full file or per-segment). The
+   * actual gain application happens inside ffmpeg via `sendcmd`+`volume`, so
+   * memory footprint is tiny regardless of audio length.
+   */
+  type PlannedGain = {
+    /** Linear gain, one value per 10 ms frame. */
+    gainCurve: Float32Array;
+    frameMs: number;
+    sampleRate: number;
+    durationSec: number;
+    /** Target RMS dB the planner aimed every speech run at. */
+    targetDb: number;
+    /** Depth below edge speech gain that the planner ducks silences to. */
+    expanderDepthDb: number;
+    /** Diagnostic count of planned speech runs. */
+    speechRunCount: number;
+    /** Effective intra-run micro-ride range in dB. Diagnostic. */
+    microRideDb: number;
+  };
+
+  /**
+   * Decode the full `inputName` to 16 kHz mono Float32, compute the frame
+   * envelope, and plan the gain curve. Memory peak is ~8 MB per minute at
+   * 16 kHz mono. Returns `null` when the input is too short / has no speech.
+   */
+  const planGainForInput = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    profile: AdaptiveProfile | null,
+    analysis: FileAnalysis | undefined,
+    durationSeconds: number | null,
+  ): Promise<PlannedGain | null> => {
+    if (!gainPlannerEnabled) return null;
+    if (durationSeconds !== null && durationSeconds > GAIN_PLANNER_MAX_DURATION_SECONDS) {
+      appendLog(
+        `[Planner] ${sanitizeBase(inputName)}: skipped (duration ${durationSeconds.toFixed(0)}s exceeds ${GAIN_PLANNER_MAX_DURATION_SECONDS}s budget).`,
+      );
+      return null;
+    }
+
+    const wavName = `${sanitizeBase(inputName)}_planner_env.wav`;
+    try {
+      resetLogBuffer();
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-filter_threads",
+          "1",
+          "-y",
+          "-i",
+          inputName,
+          "-ar",
+          `${GAIN_PLANNER_ANALYSIS_SAMPLE_RATE}`,
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_f32le",
+          wavName,
+        ],
+        "Gain planner envelope decode",
+      );
+      const bytes = await readVirtualFileBytes(ffmpeg, wavName);
+      const decoded = decodeWav(bytes);
+      const samples = decoded.samples;
+      if (samples.length < GAIN_PLANNER_ANALYSIS_SAMPLE_RATE) return null;
+
+      const frameSamples = Math.max(
+        1,
+        Math.round((GAIN_PLANNER_ANALYSIS_SAMPLE_RATE * GAIN_PLANNER_FRAME_MS) / 1000),
+      );
+      const frameCount = Math.floor(samples.length / frameSamples);
+      const frameDb = new Array<number>(frameCount);
+      for (let f = 0; f < frameCount; f += 1) {
+        let sum = 0;
+        const start = f * frameSamples;
+        for (let i = 0; i < frameSamples; i += 1) {
+          const v = samples[start + i];
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / frameSamples);
+        frameDb[f] = rms <= 0 ? -120 : 20 * Math.log10(rms);
+      }
+
+      const noiseFloorDb =
+        profile?.noiseFloorDb ?? analysis?.pauseNoiseFloorDb ?? analysis?.noiseFloorDb ?? -70;
+      const speechThresholdDb =
+        profile?.speechThresholdDb ?? analysis?.speechThresholdDb ?? noiseFloorDb + 11;
+      const pauseNoiseRisk = profile?.pauseNoiseRisk ?? analysis?.pauseNoiseRisk ?? 0;
+
+      // Blend of the three signals that describe "messiness". The planner's
+      // micro-ride widens on messy sources and narrows on clean ones — on a
+      // glass-flat source we want the speech body to come out equally flat,
+      // not riding up and down by ±1.5 dB because of local envelope noise.
+      const instabilityHint = clamp(
+        (profile?.instabilityScore ?? analysis?.instabilityScore ?? 0.5) * 0.5 +
+          (profile?.lineSwingScore ?? analysis?.lineSwingScore ?? 0.5) * 0.3 +
+          (profile?.sentenceJumpScore ?? analysis?.sentenceJumpScore ?? 0.5) * 0.2,
+        0,
+        1,
+      );
+
+      const mask = buildSpeechMask(frameDb, noiseFloorDb, { frameMs: GAIN_PLANNER_FRAME_MS });
+      const speechRuns: PlannerSpeechRun[] = speechRunsFromMask(mask);
+      if (speechRuns.length === 0) return null;
+
+      const plan = planGainCurve({
+        frameDb,
+        speechRuns,
+        noiseFloorDb,
+        speechThresholdDb,
+        pauseNoiseRisk,
+        frameMs: GAIN_PLANNER_FRAME_MS,
+        samples,
+        sampleRate: GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
+        targetDb: -22,
+        peakCeilingDb: -3,
+        instabilityHint,
+      });
+
+      const inputDuration = samples.length / GAIN_PLANNER_ANALYSIS_SAMPLE_RATE;
+      return {
+        gainCurve: plan.gainCurve,
+        frameMs: GAIN_PLANNER_FRAME_MS,
+        sampleRate: GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
+        durationSec: inputDuration,
+        targetDb: plan.targetDb,
+        expanderDepthDb: plan.expanderDepthDb,
+        speechRunCount: plan.runs.length,
+        microRideDb: plan.microRideDb,
+      };
+    } finally {
+      await safeDeleteFile(ffmpeg, wavName);
+    }
+  };
+
+  /**
+   * Chunk size for the planner's full-file apply step. 90 seconds at 48 kHz
+   * mono Float32 ≈ 17 MB of samples in memory per chunk.
+   *
+   * Batch episode files (10 ep × ~2 min = 20 min) or 30-min reels push the
+   * WASM linear heap hard. For files ≥ 10 min we drop to 60 s per chunk
+   * (≈ 11 MB) which has noticeable headroom for the surrounding filter
+   * stages without affecting output quality (chunks are re-concatenated
+   * with `-c copy`).
+   */
+  const PLANNER_APPLY_CHUNK_SECONDS_DEFAULT = 90;
+  const PLANNER_APPLY_CHUNK_SECONDS_LONG = 60;
+  const LONG_FILE_DURATION_SECONDS = 600; // 10 min
+  /**
+   * Sample rate the leveled full-file is produced at. Matches the downstream
+   * mix chain so ffmpeg doesn't have to resample again.
+   */
+  const PLANNER_APPLY_SAMPLE_RATE = 48000;
+
+  /**
+   * Decode a time range of `inputName` to mono Float32 at `PLANNER_APPLY_SAMPLE_RATE`,
+   * multiply the samples by the slice of the planner's gain curve that covers
+   * that range (with smooth inter-frame interpolation), encode the result as
+   * a pcm_f32le WAV, and write it to `outputName` in the ffmpeg virtual FS.
+   */
+  const levelInputRange = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    outputName: string,
+    plan: PlannedGain,
+    startSec: number,
+    durationSec: number,
+  ) => {
+    const rawName = `${outputName}.raw.wav`;
+    resetLogBuffer();
+    await execOrThrow(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-filter_threads",
+        "1",
+        "-y",
+        "-ss",
+        startSec.toFixed(3),
+        "-t",
+        durationSec.toFixed(3),
+        "-i",
+        inputName,
+        "-ac",
+        "1",
+        "-ar",
+        `${PLANNER_APPLY_SAMPLE_RATE}`,
+        "-c:a",
+        "pcm_f32le",
+        rawName,
+      ],
+      "Planner apply decode",
+    );
+    try {
+      const bytes = await readVirtualFileBytes(ffmpeg, rawName);
+      const decoded = decodeWav(bytes);
+      const samples = decoded.samples;
+
+      // Slice the gain curve to just the frames covering [startSec, startSec+durationSec).
+      const frameStart = Math.max(0, Math.floor((startSec * 1000) / plan.frameMs));
+      const frameEnd = Math.min(
+        plan.gainCurve.length,
+        Math.ceil(((startSec + durationSec) * 1000) / plan.frameMs),
+      );
+      const gainSlice = frameStart < frameEnd
+        ? plan.gainCurve.slice(frameStart, frameEnd)
+        : new Float32Array([1]);
+
+      const leveled = applyGainCurveToSamples(
+        samples,
+        gainSlice,
+        PLANNER_APPLY_SAMPLE_RATE,
+        decoded.channels, // should always be 1 given our decode args
+        plan.frameMs,
+      );
+      const wav = encodeWavFloat32(leveled, PLANNER_APPLY_SAMPLE_RATE, decoded.channels);
+      await ffmpeg.writeFile(outputName, wav);
+    } finally {
+      await safeDeleteFile(ffmpeg, rawName);
+    }
+  };
+
+  /**
+   * Apply the planner's gain curve to the full input file, producing a
+   * leveled pcm_f32le WAV at `outputName` that the rest of the mix chain can
+   * feed from. For long inputs the file is processed in chunks so memory
+   * never exceeds one chunk's worth of Float32 samples; the chunks are then
+   * stitched with a `-c copy` concat (no re-encode).
+   */
+  const applyPlannerToFullInput = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    outputName: string,
+    plan: PlannedGain,
+  ) => {
+    const total = plan.durationSec;
+    const chunkSeconds =
+      total >= LONG_FILE_DURATION_SECONDS
+        ? PLANNER_APPLY_CHUNK_SECONDS_LONG
+        : PLANNER_APPLY_CHUNK_SECONDS_DEFAULT;
+    if (total <= chunkSeconds) {
+      await levelInputRange(ffmpeg, inputName, outputName, plan, 0, total);
+      return;
+    }
+
+    const chunkNames: string[] = [];
+    const listName = `${sanitizeBase(outputName)}_planner_chunks.txt`;
+    try {
+      let cursor = 0;
+      let index = 0;
+      while (cursor < total - 0.01) {
+        const span = Math.min(chunkSeconds, total - cursor);
+        const chunkName = `${sanitizeBase(outputName)}_chunk_${index}.wav`;
+        await levelInputRange(ffmpeg, inputName, chunkName, plan, cursor, span);
+        chunkNames.push(chunkName);
+        cursor += span;
+        index += 1;
+      }
+
+      const listContent = `${chunkNames.map((n) => `file '${n}'`).join("\n")}\n`;
+      await ffmpeg.writeFile(listName, new TextEncoder().encode(listContent));
+      resetLogBuffer();
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-y",
+          "-f",
+          "concat",
+          "-safe",
+          "0",
+          "-i",
+          listName,
+          "-c",
+          "copy",
+          outputName,
+        ],
+        "Planner apply concat",
+      );
+    } finally {
+      await safeDeleteFile(ffmpeg, listName);
+      for (const name of chunkNames) {
+        await safeDeleteFile(ffmpeg, name);
+      }
+    }
+  };
+
   const emptyEnvelopeMetrics = {
     noiseFloorDb: null,
     pauseNoiseFloorDb: null,
@@ -813,9 +1166,26 @@ const summarizeFailureReason = (error: unknown) => {
     const frameSize = Math.max(1, Math.round((ANALYSIS_SAMPLE_RATE * ENVELOPE_FRAME_MS) / 1000));
     const frameCount = Math.floor(samples.length / frameSize);
     if (frameCount < 20) {
-      return emptyEnvelopeMetrics;
+      return { ...emptyEnvelopeMetrics, bandSpectrumDb: null, sibilanceScore: null };
     }
-    return mapQcMetricsToEnvelopeMetrics(analyzeFloatSamples(samples, ANALYSIS_SAMPLE_RATE, ENVELOPE_FRAME_MS));
+    const base = mapQcMetricsToEnvelopeMetrics(
+      analyzeFloatSamples(samples, ANALYSIS_SAMPLE_RATE, ENVELOPE_FRAME_MS),
+    );
+    // Compute long-term band spectrum + sibilance directly from the samples.
+    // This is new data (not present in `emptyEnvelopeMetrics`) so we widen
+    // the return type locally.
+    let bandSpectrumDb: number[] | null = null;
+    let sibilanceScore: number | null = null;
+    if (samples.length >= ANALYSIS_SAMPLE_RATE) {
+      try {
+        bandSpectrumDb = computeLogBandSpectrumDb(samples, ANALYSIS_SAMPLE_RATE);
+        sibilanceScore = computeSibilanceScore(bandSpectrumDb);
+      } catch {
+        bandSpectrumDb = null;
+        sibilanceScore = null;
+      }
+    }
+    return { ...base, bandSpectrumDb, sibilanceScore };
   };
 
   const parseSilencedetectSpans = (text: string, durationSeconds: number | null): SilenceSpan[] => {
@@ -1238,6 +1608,8 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.onsetOvershootScore = envelope.onsetOvershootScore;
       analysis.midLineSagScore = envelope.midLineSagScore;
       analysis.endFadeRiskScore = envelope.endFadeRiskScore;
+      analysis.bandSpectrumDb = envelope.bandSpectrumDb;
+      analysis.sibilanceScore = envelope.sibilanceScore;
     } finally {
       await safeDeleteFile(ffmpeg, analysisName);
     }
@@ -1303,8 +1675,8 @@ const summarizeFailureReason = (error: unknown) => {
 
     for (const key of Object.keys(baseAnalysis) as Array<keyof FileAnalysis>) {
       if (aggregated[key] !== null) continue;
-      (aggregated as Record<string, number | boolean | null>)[key] =
-        (baseAnalysis as Record<string, number | boolean | null>)[key];
+      (aggregated as Record<string, number | number[] | boolean | null>)[key] =
+        (baseAnalysis as Record<string, number | number[] | boolean | null>)[key];
     }
 
     return aggregated;
@@ -1508,10 +1880,11 @@ const summarizeFailureReason = (error: unknown) => {
     return { analysis: baseAnalysis, ffmpeg };
   };
 
-  const buildBatchReference = (analyses: FileAnalysis[]) => {
+  const buildBatchReference = (analyses: FileAnalysis[]): BatchReference | null => {
     const lowTilts: number[] = [];
     const highTilts: number[] = [];
     const lras: number[] = [];
+    const perBandSamples: number[][] = Array.from({ length: SPECTRUM_BANDS_HZ.length }, () => []);
 
     for (const analysis of analyses) {
       if (analysis.lowRms !== null && analysis.midRms !== null) {
@@ -1523,19 +1896,30 @@ const summarizeFailureReason = (error: unknown) => {
       if (analysis.inputLRA !== null) {
         lras.push(analysis.inputLRA);
       }
+      if (analysis.bandSpectrumDb && analysis.bandSpectrumDb.length === SPECTRUM_BANDS_HZ.length) {
+        for (let b = 0; b < SPECTRUM_BANDS_HZ.length; b += 1) {
+          const value = analysis.bandSpectrumDb[b];
+          if (Number.isFinite(value)) perBandSamples[b].push(value);
+        }
+      }
     }
 
     const lowTilt = robustMedian(lowTilts);
     const highTilt = robustMedian(highTilts);
     const lra = robustMedian(lras);
 
-    if (lowTilt === null && highTilt === null && lra === null) return null;
+    const bandMedians: number[] | null = perBandSamples.every((arr) => arr.length > 0)
+      ? perBandSamples.map((arr) => robustMedian(arr) ?? 0)
+      : null;
+
+    if (lowTilt === null && highTilt === null && lra === null && bandMedians === null) return null;
 
     return {
       lowTilt: lowTilt ?? -11,
       highTilt: highTilt ?? -13,
       lra: lra ?? 6,
-    } satisfies BatchReference;
+      bandSpectrumDb: bandMedians,
+    };
   };
 
   const buildAdaptiveProfile = (analysis: FileAnalysis | undefined, reference: BatchReference | null) => {
@@ -1631,7 +2015,6 @@ const summarizeFailureReason = (error: unknown) => {
     const echoScore = analysis.echoScore ?? 0;
     const roomCleanupEnabled =
       roomCleanup && (analysisConfidence >= 0.4 || echoScore >= 0.58 || roomRisk !== "low");
-    const useDenoise = false;
     const instabilityScore = clamp(analysis.instabilityScore ?? 0, 0, 1);
     const clickScore = clamp(analysis.clickScore ?? 0, 0, 1);
     const lineSwingScore = clamp(analysis.lineSwingScore ?? 0, 0, 1);
@@ -1714,7 +2097,20 @@ const summarizeFailureReason = (error: unknown) => {
       !preserveEndings &&
       (forceTailGateForEcho ||
         (analysisConfidence >= 0.52 && (roomRisk === "high" || (roomRisk === "medium" && echoScore >= 0.5))));
-    const denoiseStrength = 0;
+    // `useDenoise` / `denoiseStrength` are now *derived* from the same signal
+    // the NR filter uses, so logs and QC see a meaningful value. The actual
+    // filter chain is built in `buildAdaptiveNoiseReductionFilter`.
+    const measuredNoiseContrast = analysis.noiseContrastDb ?? null;
+    const nrContrastPenalty =
+      measuredNoiseContrast !== null ? clamp((22 - measuredNoiseContrast) / 14, 0, 1) : 0.35;
+    const nrBandFactor = noiseRisk === "high" ? 1 : noiseRisk === "medium" ? 0.55 : 0.15;
+    const nrRoomFactor = roomRisk === "high" ? 0.35 : roomRisk === "medium" ? 0.18 : 0;
+    const denoiseStrength = clamp(
+      pauseNoiseRisk * 0.45 + nrContrastPenalty * 0.3 + nrBandFactor * 0.2 + nrRoomFactor,
+      0,
+      1,
+    );
+    const useDenoise = noiseGuard && denoiseStrength >= 0.2;
     const tailGateStrength = !useTailGate
       ? 0
       : roomRisk === "high"
@@ -1759,6 +2155,12 @@ const summarizeFailureReason = (error: unknown) => {
     const blendIndoorDelayMs = Math.round(clamp(24 + (1 - dryness) * 8, 22, 36));
     const blendOutdoorDelayMs = Math.round(clamp(52 + (1 - dryness) * 18, 48, 74));
 
+    // Compute per-band tone delta vs the batch reference (if we have both).
+    const toneMatchDeltaDb =
+      reference?.bandSpectrumDb && analysis.bandSpectrumDb
+        ? computeToneMatchDeltaDb(analysis.bandSpectrumDb, reference.bandSpectrumDb, 2.5)
+        : null;
+
     return {
       highpassHz,
       lowMidGainDb,
@@ -1774,14 +2176,20 @@ const summarizeFailureReason = (error: unknown) => {
       floorGuardFilter: noiseRisk === "high" ? FLOOR_GUARD_STRONG : FLOOR_GUARD,
       noiseRisk,
       noiseFloorDb: measuredNoiseFloor,
+      noiseContrastDb: measuredNoiseContrast,
       pauseNoiseRisk,
       speechThresholdDb: measuredSpeechThreshold,
       roomRisk,
       useDenoise,
       denoiseStrength,
+      bandSpectrumDb: analysis.bandSpectrumDb ?? null,
+      toneMatchDeltaDb,
+      sibilanceScore: analysis.sibilanceScore ?? 0,
+      cinematicColorEnabled: cinematicColor,
       useTailGate,
       tailGateStrength,
       echoNotchCutDb,
+      echoScore,
       instabilityScore,
       clickScore,
       clickTameStrength,
@@ -1859,22 +2267,66 @@ const summarizeFailureReason = (error: unknown) => {
     )}:detection=peak`;
   };
 
-  const buildAdaptiveNoiseReductionFilter = (noiseRisk: NoiseRisk, noiseFloorDb: number | null) => {
-    if (noiseRisk === "low") return null;
+  /**
+   * Build the adaptive noise-reduction filter chain.
+   *
+   * Strength is driven by *measured* SNR (`noiseContrastDb`), pause-noise risk,
+   * and room risk — not just the coarse `noiseRisk` band. On clean takes we
+   * return `null` (no NR) so we never scrub tone off a healthy voice. On bad
+   * inputs we chain `afftdn` (spectral subtraction) with an optional
+   * `anlmdn` (non-local means) second stage for stubborn hiss.
+   *
+   * Returns a full filter-chain fragment (comma-joined) or null.
+   */
+  const buildAdaptiveNoiseReductionFilter = (
+    noiseRisk: NoiseRisk,
+    noiseFloorDb: number | null,
+    noiseContrastDb: number | null,
+    pauseNoiseRisk: number,
+    roomRisk: RoomRisk,
+  ) => {
+    // Composite "need" score drives how aggressive NR should be.
+    // - pauseNoiseRisk: how noisy the pauses are (0..1).
+    // - noiseContrastDb: SNR between speech and pauses. <14 dB = poor.
+    // - roomRisk: reverb/echo bed. Higher = more NR helps clean it up.
+    // - noiseRisk band: coarse backup if metrics missing.
+    const contrastPenalty = noiseContrastDb !== null ? clamp((22 - noiseContrastDb) / 14, 0, 1) : 0.35;
+    const bandFactor = noiseRisk === "high" ? 1 : noiseRisk === "medium" ? 0.55 : 0.15;
+    const roomFactor = roomRisk === "high" ? 0.35 : roomRisk === "medium" ? 0.18 : 0;
+    const needScore = clamp(
+      pauseNoiseRisk * 0.45 + contrastPenalty * 0.3 + bandFactor * 0.2 + roomFactor,
+      0,
+      1,
+    );
+
+    // Under ~0.2 the source is already clean; leaving NR off preserves tone.
+    if (needScore < 0.2) return null;
 
     const estimatedFloor = noiseFloorDb ?? (noiseRisk === "high" ? -49 : -55);
-    const severeNoise = noiseRisk === "high" && estimatedFloor > -46;
+    // `nf` anchored a few dB above the measured pause floor so afftdn knows
+    // what to treat as noise.
+    const nf = clamp(estimatedFloor + 4, -56, -32);
+    // `nr` (reduction dB) scales 6 → 24 dB with needScore.
+    const nr = Math.round(clamp(6 + needScore * 18, 6, 24));
+    // `ad` (adaptive-decay speed) — stronger needs faster tracking.
+    const ad = clamp(0.25 + needScore * 0.4, 0.25, 0.65);
+    // `gs` (gain shape) — smoother curve on severe noise.
+    const gs = Math.round(clamp(6 + needScore * 8, 6, 14));
+    const stages: string[] = [`afftdn=nf=${nf.toFixed(1)}:nr=${nr}:tn=1:ad=${ad.toFixed(2)}:gs=${gs}`];
 
-    // Use spectral denoise in-browser for stability and voice-preserving behavior.
-    const nf = severeNoise
-      ? clamp(estimatedFloor + 3.2, -46, -34)
-      : noiseRisk === "high"
-        ? clamp(estimatedFloor + 4.5, -50, -37)
-        : clamp(estimatedFloor + 5.2, -56, -40);
-    const nr = severeNoise ? 12 : noiseRisk === "high" ? 10 : 7;
-    const ad = severeNoise ? 0.55 : noiseRisk === "high" ? 0.42 : 0.32;
-    const gs = severeNoise ? 12 : noiseRisk === "high" ? 10 : 8;
-    return `afftdn=nf=${nf.toFixed(1)}:nr=${nr}:tn=1:ad=${ad.toFixed(2)}:gs=${gs}`;
+    // Severe-noise second pass — non-local means removes broadband hiss that
+    // spectral subtraction leaves behind, without the metallic artifacts of
+    // aggressive `afftdn`.
+    const severeNoise =
+      (pauseNoiseRisk >= 0.55) ||
+      (noiseContrastDb !== null && noiseContrastDb < 14) ||
+      (noiseRisk === "high" && estimatedFloor > -46);
+    if (severeNoise) {
+      // Short temporal radius (r=0.006 s) keeps consonants sharp.
+      stages.push("anlmdn=s=0.0003:p=0.002:r=0.006");
+    }
+
+    return stages.join(",");
   };
 
   type MixRenderOptions = {
@@ -1893,6 +2345,14 @@ const summarizeFailureReason = (error: unknown) => {
     candidateVariant?: "cinematic-stable" | "continuity-safe" | "pause-safe";
     skipSpeechSegmentation?: boolean;
     forceEndingProtection?: boolean;
+    /**
+     * When true, the input the chain is about to process has already been
+     * leveled by the speech-aware gain planner. The downstream `dynaudnorm`
+     * is downgraded to a gentle safety pass (tight window, low `g/m`) and
+     * `acompressor` is relaxed to glue duty only. This is what actually
+     * kills sentence-to-sentence jumps.
+     */
+    gainPlannerActive?: boolean;
   };
 
   const resolveAdaptiveNoiseReductionFilter = (
@@ -1901,7 +2361,13 @@ const summarizeFailureReason = (error: unknown) => {
   ) => {
     if (!noiseGuard || !profile) return null;
     if (options?.minimalStabilityChain || options?.disableAdaptiveNoiseReduction) return null;
-    return buildAdaptiveNoiseReductionFilter(profile.noiseRisk, profile.noiseFloorDb);
+    return buildAdaptiveNoiseReductionFilter(
+      profile.noiseRisk,
+      profile.noiseFloorDb,
+      profile.noiseContrastDb,
+      profile.pauseNoiseRisk,
+      profile.roomRisk,
+    );
   };
 
   const buildMixFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions) => {
@@ -1913,6 +2379,7 @@ const summarizeFailureReason = (error: unknown) => {
     const candidateVariant = options?.candidateVariant ?? "cinematic-stable";
     const continuitySafeMode = candidateVariant === "continuity-safe";
     const pauseSafeMode = candidateVariant === "pause-safe";
+    const gainPlannerActive = options?.gainPlannerActive === true;
     const roomCleanupEnabled = roomCleanup && !options?.disableRoomCleanup && !minimalStabilityChain;
     const adaptiveNoiseReductionFilter = resolveAdaptiveNoiseReductionFilter(profile, options);
     const useAdaptiveNoiseReduction = adaptiveNoiseReductionFilter !== null;
@@ -1952,6 +2419,57 @@ const summarizeFailureReason = (error: unknown) => {
     if (!eqCleanup && useAdaptiveNoiseReduction && adaptiveNoiseReductionFilter) {
       filters.push(adaptiveNoiseReductionFilter);
     }
+
+    // Subtle cinematic de-reverb. Only fires when the analyzer detects a
+    // real room signature (`echoScore` ≥ 0.42 OR roomRisk high), never on
+    // clean takes. Uses `anlmdn` at ultra-short temporal radius which
+    // smooths the short-time spectral envelope — this attenuates early
+    // reflections and room wash without dulling transients. Paired with a
+    // narrow notch at the analyzer's detected echo frequency and a gentle
+    // HF shelf cut for very reverberant rooms.
+    //
+    // Opt-out conditions (so we don't fight other stages):
+    //  - `minimalStabilityChain` (fallback mode: keep graph cheap).
+    //  - `profile.strictEndingProtection` with very high echoScore — a
+    //    strict ending-protected take is sparse dialogue, reverb tails
+    //    double as ambience; removing them sounds processed.
+    const inEchoScore = profile?.echoScore ?? 0;
+    const roomRiskIsMed = profile?.roomRisk === "medium" || profile?.roomRisk === "high";
+    const dereverbAllowed =
+      !minimalStabilityChain &&
+      roomCleanupEnabled &&
+      !(profile?.strictEndingProtection && inEchoScore >= 0.75) &&
+      (inEchoScore >= 0.42 || roomRiskIsMed);
+    if (dereverbAllowed) {
+      // Strength 0..1, scales anlmdn `s` (noise-profile width) down and
+      // shelf cut depth up with the detected room energy.
+      const roomStrength = clamp(
+        inEchoScore * 0.7 + (profile?.roomRisk === "high" ? 0.3 : profile?.roomRisk === "medium" ? 0.15 : 0),
+        0,
+        1,
+      );
+      // `anlmdn` de-reverb: `s` scales 0.00030 (gentle) → 0.00050 (firmer).
+      const nlmS = (0.00030 + roomStrength * 0.00020).toFixed(5);
+      filters.push(`anlmdn=s=${nlmS}:p=0.002:r=0.004`);
+
+      // Narrow notch at the detected echo resonance if the analyzer found
+      // one. `echoDelayMs` is in ms; the dominant room mode is typically at
+      // the reciprocal's first harmonic band (100–300 Hz for small rooms).
+      // We place a subtle dip around 280 Hz with depth scaled by room
+      // strength. This targets the "boxy" component specifically.
+      if (roomStrength >= 0.35) {
+        const boxyCut = -clamp(0.4 + roomStrength * 1.1, 0.4, 1.5);
+        filters.push(`equalizer=f=280:width_type=q:width=1.1:g=${boxyCut.toFixed(2)}`);
+      }
+
+      // Gentle top-end shelf cut for brightly reverberant rooms — trims
+      // the "air" reflection component without dulling intelligibility.
+      if (profile?.roomRisk === "high" && roomStrength >= 0.55) {
+        const topShelf = -clamp(0.5 + roomStrength * 0.7, 0.5, 1.2);
+        filters.push(`equalizer=f=10500:width_type=q:width=0.7:g=${topShelf.toFixed(2)}`);
+      }
+    }
+
     if (useOnsetTamer) {
       filters.push(buildOnsetTamerFilter(onsetTameStrength));
     }
@@ -1962,7 +2480,20 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push(buildBreathSpikeTamerFilter(breathTameStrength));
     }
 
-    if (dyn) {
+    if (dyn && gainPlannerActive && !minimalStabilityChain) {
+      // The planner has already done speech-aware leveling. Use dynaudnorm
+      // only as a gentle intra-line micro-smoother: narrow window, low `g`,
+      // amplitude threshold anchored above the pause-noise floor so silences
+      // cannot be lifted. This is the actual fix for "sometimes spikes".
+      const gateDb = clamp((profile?.speechThresholdDb ?? -44) - 6, -56, -38);
+      const gateAmp = fromDb(gateDb);
+      const safetyF = 161;
+      const safetyG = 3;
+      const safetyM = 5;
+      filters.push(
+        `dynaudnorm=f=${safetyF}:g=${safetyG}:m=${safetyM}:t=${clamp(gateAmp, fromDb(-60), fromDb(-34)).toFixed(5)}`,
+      );
+    } else if (dyn) {
       let dynaF: number = dyn.f;
       let dynaG: number = noiseGuard ? Math.max(3, dyn.g - 1) : dyn.g;
       let dynaM: number = noiseGuard ? Math.max(3, dyn.m - 1) : dyn.m;
@@ -2195,6 +2726,47 @@ const summarizeFailureReason = (error: unknown) => {
       }
     }
 
+    // Tone-match EQ: pull this file's long-term spectrum toward the batch median.
+    // Only apply the most prominent band deltas so we don't stack many EQs.
+    const toneMatchDeltaDb = profile?.toneMatchDeltaDb;
+    if (!minimalStabilityChain && toneMatchDeltaDb && toneMatchDeltaDb.length === SPECTRUM_BANDS_HZ.length) {
+      const ranked = toneMatchDeltaDb
+        .map((g, i) => ({ g, hz: SPECTRUM_BANDS_HZ[i] }))
+        .filter((item) => Math.abs(item.g) >= 0.6)
+        .sort((a, b) => Math.abs(b.g) - Math.abs(a.g))
+        .slice(0, 3);
+      for (const { g, hz } of ranked) {
+        // Narrow bells in mids, wider shelves at edges.
+        const widthQ = hz <= 250 || hz >= 4000 ? 0.9 : 1.1;
+        filters.push(`equalizer=f=${hz}:width_type=q:width=${widthQ}:g=${clamp(g, -2.5, 2.5).toFixed(2)}`);
+      }
+    }
+
+    // Cinematic color — subtle dub-room voicing. Skip when emotionProtection is
+    // high so dramatic takes aren't processed flat.
+    const cinematicColorOn =
+      !minimalStabilityChain &&
+      !!profile?.cinematicColorEnabled &&
+      (profile?.emotionProtection ?? 0) < 0.5;
+    if (cinematicColorOn) {
+      filters.push("equalizer=f=180:width_type=q:width=1.1:g=0.8"); // warmth
+      filters.push("equalizer=f=4500:width_type=q:width=1.2:g=0.6"); // intelligibility
+      filters.push("equalizer=f=10000:width_type=q:width=0.7:g=-0.5"); // take glassy edge off
+    }
+
+    // De-esser — narrow notches at the two main sibilance bands, scaled by
+    // the measured sibilance score. We keep this linear (no sidechain graph)
+    // to stay inside the `-af` / comma-joined filter chain. Depth caps at
+    // -4 dB so we never dull a voice that is only lightly bright.
+    const sibilanceScore = profile?.sibilanceScore ?? 0;
+    if (!minimalStabilityChain && sibilanceScore >= 0.4) {
+      const depthNorm = clamp((sibilanceScore - 0.4) / 0.6, 0, 1);
+      const mainCut = -clamp(1.2 + depthNorm * 2.8, 1.2, 4);
+      const secondaryCut = -clamp(0.6 + depthNorm * 1.8, 0.6, 2.4);
+      filters.push(`equalizer=f=6500:width_type=q:width=1.4:g=${mainCut.toFixed(2)}`);
+      filters.push(`equalizer=f=9000:width_type=q:width=1.2:g=${secondaryCut.toFixed(2)}`);
+    }
+
     const thresholdBase = parseFloat(levelerSettings.compressor.threshold.replace("dB", ""));
     const ratioBase = parseFloat(levelerSettings.compressor.ratio);
 
@@ -2344,9 +2916,39 @@ const summarizeFailureReason = (error: unknown) => {
       0.95
     );
 
-    filters.push(
-      `acompressor=threshold=${threshold.toFixed(1)}dB:ratio=${ratio.toFixed(2)}:attack=${attack}:release=${release}:mix=${compMix.toFixed(2)}:detection=rms`
-    );
+    if (gainPlannerActive) {
+      // Planner already normalized sentence-to-sentence level. How much
+      // downstream compression we apply depends on how messy the source was:
+      //   - very clean sources (low instability+swing): BYPASS completely,
+      //     let the planner + alimiter be the only dynamics stages. This
+      //     gives the flattest sentence-to-sentence behavior the QC metric
+      //     will see.
+      //   - moderately noisy sources: very light glue (mix=0.30, ratio 1.4).
+      //   - messy sources: the old glue (mix=0.55, ratio 1.5).
+      const instabilityBlend = clamp(
+        (profile?.instabilityScore ?? 0.5) * 0.5 +
+          (profile?.lineSwingScore ?? 0.5) * 0.3 +
+          (profile?.sentenceJumpScore ?? 0.5) * 0.2,
+        0,
+        1,
+      );
+      if (instabilityBlend < 0.25) {
+        // Fully bypass downstream compression. The planner covers leveling,
+        // the de-esser covers sibilance, the alimiter covers peaks. Done.
+      } else {
+        const ratio = clamp(1.3 + instabilityBlend * 0.5, 1.3, 1.7);
+        const mix = clamp(0.2 + instabilityBlend * 0.5, 0.2, 0.7);
+        const threshold = clamp(-22 + (1 - instabilityBlend) * 2, -22, -18);
+        filters.push(
+          `acompressor=threshold=${threshold.toFixed(1)}dB:ratio=${ratio.toFixed(2)}:attack=22:release=240:mix=${mix.toFixed(2)}:detection=rms`,
+        );
+      }
+    } else {
+      filters.push(
+        `acompressor=threshold=${threshold.toFixed(1)}dB:ratio=${ratio.toFixed(2)}:attack=${attack}:release=${release}:mix=${compMix.toFixed(2)}:detection=rms`
+      );
+    }
+
     if (!options?.disableLimiter) {
       filters.push(LIMITER_FILTER);
     }
@@ -2488,9 +3090,18 @@ const summarizeFailureReason = (error: unknown) => {
     inputName: string,
     outputName: string,
     profile: AdaptiveProfile | null,
-    options?: MixRenderOptions
+    options?: MixRenderOptions,
+    plannerLeveledInputName?: string | null,
   ) => {
-    const filterChain = buildMixFilter(profile, options);
+    // When the caller has already produced a planner-leveled version of the
+    // input, we use it verbatim and tell the mix chain that broadband leveling
+    // is already done (so it downgrades dynaudnorm to a gentle safety pass).
+    const chainInput = plannerLeveledInputName ?? inputName;
+    const gainPlannerActive = Boolean(plannerLeveledInputName);
+    const filterChain = buildMixFilter(profile, {
+      ...options,
+      gainPlannerActive,
+    });
     resetLogBuffer();
     await execOrThrow(
       ffmpeg,
@@ -2503,7 +3114,7 @@ const summarizeFailureReason = (error: unknown) => {
         "1",
         "-y",
         "-i",
-        inputName,
+        chainInput,
         "-af",
         filterChain,
         "-ar",
@@ -2514,7 +3125,7 @@ const summarizeFailureReason = (error: unknown) => {
         "pcm_f32le",
         outputName,
       ],
-      "Mix-ready render"
+      "Mix-ready render",
     );
   };
 
@@ -2545,7 +3156,8 @@ const summarizeFailureReason = (error: unknown) => {
     outputName: string,
     profile: AdaptiveProfile | null,
     durationSeconds: number,
-    options?: MixRenderOptions
+    options?: MixRenderOptions,
+    plannerLeveledInputName?: string | null,
   ) => {
     if (durationSeconds < MIX_SEGMENT_MIN_DURATION_SECONDS) {
       throw new Error("Segmented render skipped (input too short).");
@@ -2555,10 +3167,14 @@ const summarizeFailureReason = (error: unknown) => {
       throw new Error("Segmented render skipped (single segment).");
     }
 
-    const filterChain = buildMixFilter(profile, options);
+    // If the caller pre-leveled the file, every segment reads from that file
+    // instead of the original (same time ranges, same timestamps).
+    const chainInput = plannerLeveledInputName ?? inputName;
+    const gainPlannerActive = Boolean(plannerLeveledInputName);
     const tempBase = sanitizeBase(outputName);
     const segmentNames: string[] = [];
     const concatListName = `${tempBase}_segments.txt`;
+    const filterChain = buildMixFilter(profile, { ...options, gainPlannerActive });
 
     try {
       for (let index = 0; index < segmentCount; index += 1) {
@@ -2585,7 +3201,7 @@ const summarizeFailureReason = (error: unknown) => {
             "-t",
             span.toFixed(3),
             "-i",
-            inputName,
+            chainInput,
             "-af",
             filterChain,
             "-ar",
@@ -2604,34 +3220,78 @@ const summarizeFailureReason = (error: unknown) => {
         throw new Error("Segmented render produced insufficient segments.");
       }
 
-      const concatList = `${segmentNames.map((name) => `file '${name}'`).join("\n")}\n`;
-      await ffmpeg.writeFile(concatListName, new TextEncoder().encode(concatList));
-
-      resetLogBuffer();
-      await execOrThrow(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-y",
-        "-f",
-        "concat",
-          "-safe",
-          "0",
-          "-i",
-          concatListName,
-          "-c",
-          "copy",
-          outputName,
-        ],
-        "Segment concat render"
-      );
+      // Crossfade segments rather than hard concat. A 300 ms crossfade at
+      // every boundary erases the small residual level step that independent
+      // per-segment processing can leave. Applied iteratively (A+B, then that
+      // result + C, etc.) because `acrossfade` only consumes two inputs.
+      await crossfadeConcatSegments(ffmpeg, segmentNames, outputName, SEGMENT_CROSSFADE_SECONDS);
     } finally {
       await safeDeleteFile(ffmpeg, concatListName);
       for (const segmentName of segmentNames) {
         await safeDeleteFile(ffmpeg, segmentName);
+      }
+    }
+  };
+
+  /**
+   * Crossfade-concat a list of segment WAVs into `outputName`. Works
+   * iteratively via a scratch file so we don't blow memory on long batches.
+   */
+  const crossfadeConcatSegments = async (
+    ffmpeg: FFmpeg,
+    segmentNames: string[],
+    outputName: string,
+    crossfadeSec: number,
+  ) => {
+    if (segmentNames.length === 0) {
+      throw new Error("No segments to crossfade-concat.");
+    }
+    if (segmentNames.length === 1) {
+      const bytes = await readVirtualFileBytes(ffmpeg, segmentNames[0]);
+      await ffmpeg.writeFile(outputName, bytes);
+      return;
+    }
+
+    const scratchNames: string[] = [];
+    try {
+      let accum = segmentNames[0];
+      for (let i = 1; i < segmentNames.length; i += 1) {
+        const next = segmentNames[i];
+        const isFinal = i === segmentNames.length - 1;
+        const targetName = isFinal ? outputName : `${sanitizeBase(outputName)}_xf_${i}.wav`;
+        if (!isFinal) scratchNames.push(targetName);
+        resetLogBuffer();
+        await execOrThrow(
+          ffmpeg,
+          [
+            "-hide_banner",
+            "-nostdin",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-y",
+            "-i",
+            accum,
+            "-i",
+            next,
+            "-filter_complex",
+            `[0:a][1:a]acrossfade=d=${crossfadeSec.toFixed(3)}:c1=tri:c2=tri`,
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_f32le",
+            targetName,
+          ],
+          `Segment crossfade ${i}`,
+        );
+        accum = targetName;
+      }
+    } finally {
+      for (const scratch of scratchNames) {
+        await safeDeleteFile(ffmpeg, scratch);
       }
     }
   };
@@ -2796,7 +3456,13 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push(`highpass=f=${profile?.highpassHz ?? 80}`);
     }
     if (noiseGuard && profile && (profile.pauseNoiseRisk >= 0.42 || (pauseSafeMode && profile.noiseRisk !== "low"))) {
-      const adaptiveNoiseReduction = buildAdaptiveNoiseReductionFilter(profile.noiseRisk, profile.noiseFloorDb);
+      const adaptiveNoiseReduction = buildAdaptiveNoiseReductionFilter(
+        profile.noiseRisk,
+        profile.noiseFloorDb,
+        profile.noiseContrastDb,
+        profile.pauseNoiseRisk,
+        profile.roomRisk,
+      );
       if (adaptiveNoiseReduction) {
         filters.push(adaptiveNoiseReduction);
       }
@@ -2818,12 +3484,16 @@ const summarizeFailureReason = (error: unknown) => {
     profile: AdaptiveProfile | null,
     durationSeconds: number,
     segments: RenderSegment[],
-    options?: MixRenderOptions
+    options?: MixRenderOptions,
+    plannerLeveledInputName?: string | null,
   ) => {
     if (segments.length < 2) {
       throw new Error("Speech-aligned segmentation skipped (insufficient segments).");
     }
 
+    // If the caller pre-leveled the file, every segment reads from that file.
+    const chainInput = plannerLeveledInputName ?? inputName;
+    const gainPlannerActive = Boolean(plannerLeveledInputName);
     const segmentMode = options?.segmentMode ?? "speech-aligned";
     const tempBase = sanitizeBase(outputName);
     const concatListName = `${tempBase}_speech_segments.txt`;
@@ -2851,10 +3521,12 @@ const summarizeFailureReason = (error: unknown) => {
         );
         const segmentName = `${tempBase}_speech_seg_${index + 1}.wav`;
         cleanupNames.push(segmentName);
+
         const segmentOptions = {
           ...options,
           segmentMode,
           forceEndingProtection: segment.process && (segment.forceEndingProtection ?? false),
+          gainPlannerActive,
         } satisfies MixRenderOptions;
         const processedFilter = buildMixFilter(profile, segmentOptions);
         const silenceFilter = buildSilenceSegmentFilter(profile, segmentOptions);
@@ -2878,7 +3550,7 @@ const summarizeFailureReason = (error: unknown) => {
             "-t",
             readSpan.toFixed(3),
             "-i",
-            inputName,
+            chainInput,
             "-af",
             filterChain,
             "-ar",
@@ -2919,30 +3591,10 @@ const summarizeFailureReason = (error: unknown) => {
         segmentNames.push(concatName);
       }
 
-      const concatList = `${segmentNames.map((name) => `file '${name}'`).join("\n")}\n`;
-      await ffmpeg.writeFile(concatListName, new TextEncoder().encode(concatList));
-
-      resetLogBuffer();
-      await execOrThrow(
-        ffmpeg,
-        [
-          "-hide_banner",
-          "-nostdin",
-          "-threads",
-          "1",
-          "-y",
-          "-f",
-          "concat",
-          "-safe",
-          "0",
-          "-i",
-          concatListName,
-          "-c",
-          "copy",
-          outputName,
-        ],
-        "Speech-aligned segment concat render"
-      );
+      // Speech-aligned segments were cut at pause centers, so a brief
+      // crossfade at the junction is safe (both sides are silence-adjacent)
+      // and erases any residual per-segment level step.
+      await crossfadeConcatSegments(ffmpeg, segmentNames, outputName, SEGMENT_CROSSFADE_SECONDS);
 
       return segments.length;
     } finally {
@@ -3068,6 +3720,19 @@ const summarizeFailureReason = (error: unknown) => {
       return;
     }
 
+    // Adaptive linear: loudnorm's linear mode tries to apply a single static
+    // gain, which is ideal when the source already has the target LRA.
+    // When the source has been over-compressed (measured LRA < 4), using
+    // linear locks that compression in; switching to dynamic mode lets
+    // loudnorm gently re-expand while normalizing.
+    const targetLraNum = Number(cfg.LRA);
+    const linearMode = measuredLRA !== null && measuredLRA >= 4 && measuredLRA <= targetLraNum + 3;
+    if (!linearMode) {
+      appendLog(
+        `[Loudnorm] ${sanitizeBase(inputName)}: dynamic mode (measured LRA ${measuredLRA.toFixed(1)} outside linear band).`,
+      );
+    }
+
     resetLogBuffer();
     await execOrThrow(
       ffmpeg,
@@ -3082,7 +3747,7 @@ const summarizeFailureReason = (error: unknown) => {
         "-i",
         inputName,
         "-af",
-        `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:measured_I=${measuredI}:measured_TP=${measuredTP}:measured_LRA=${measuredLRA}:measured_thresh=${measuredThresh}:offset=${offset}:linear=true:print_format=summary`,
+        `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:measured_I=${measuredI}:measured_TP=${measuredTP}:measured_LRA=${measuredLRA}:measured_thresh=${measuredThresh}:offset=${offset}:linear=${linearMode ? "true" : "false"}:print_format=summary`,
         "-ar",
         "48000",
         "-ac",
@@ -3149,9 +3814,28 @@ const summarizeFailureReason = (error: unknown) => {
         ? "continuity-safe"
         : "pause-safe";
 
-  const buildMixCandidateVariants = (profile: AdaptiveProfile | null): CandidateVariant[] => {
+  const buildMixCandidateVariants = (
+    profile: AdaptiveProfile | null,
+    durationSeconds: number | null,
+  ): CandidateVariant[] => {
     const variants: CandidateVariant[] = ["cinematic-stable", "continuity-safe"];
-    if ((profile?.pauseNoiseRisk ?? 0) >= 0.32 || profile?.noiseRisk === "medium" || profile?.noiseRisk === "high") {
+    // On batch-episode-length files (≥ 10 min) we skip the third variant
+    // unless the noise picture is clearly severe. Running three full render
+    // strategies on a 20-min file triples memory pressure and wall time
+    // without usually picking a different winner.
+    const longFile = durationSeconds !== null && durationSeconds >= LONG_FILE_DURATION_SECONDS;
+    const severeNoise =
+      (profile?.pauseNoiseRisk ?? 0) >= 0.55 ||
+      profile?.noiseRisk === "high" ||
+      ((profile?.pauseNoiseRisk ?? 0) >= 0.4 && profile?.noiseRisk === "medium");
+    if (severeNoise) {
+      variants.push("pause-safe");
+    } else if (
+      !longFile &&
+      ((profile?.pauseNoiseRisk ?? 0) >= 0.32 ||
+        profile?.noiseRisk === "medium" ||
+        profile?.noiseRisk === "high")
+    ) {
       variants.push("pause-safe");
     }
     return variants;
@@ -3263,7 +3947,8 @@ const summarizeFailureReason = (error: unknown) => {
     totalFiles: number,
     stageLabel: string,
     options?: MixRenderOptions,
-    speechRenderPlan?: SpeechRenderPlan | null
+    speechRenderPlan?: SpeechRenderPlan | null,
+    analysis?: FileAnalysis | undefined,
   ): Promise<RenderAttemptResult> => {
     const hasRoomFilters = roomCleanup && !!profile && (profile.useTailGate || profile.echoNotchCutDb >= 0.25);
     const hasAdaptiveNoiseReduction = noiseGuard && !!profile && profile.noiseRisk !== "low";
@@ -3309,6 +3994,67 @@ const summarizeFailureReason = (error: unknown) => {
         inputDurationSeconds = null;
       }
       return inputDurationSeconds;
+    };
+
+    // Plan the gain curve ONCE, before trying any strategy. The curve is
+    // cheap (per-frame linear gain array). The rendering stages consume the
+    // result as a pre-leveled WAV, produced by applying the curve via
+    // `applyPlannerToFullInput` (chunked in JS to stay memory-safe).
+    let plan: PlannedGain | null = null;
+    if (gainPlannerEnabled) {
+      try {
+        const dur = await ensureInputDuration();
+        plan = await planGainForInput(ffmpeg, job.inputName, profile, analysis, dur);
+        if (plan) {
+          appendLog(
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB).`,
+          );
+        } else {
+          appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);
+        }
+      } catch (error) {
+        appendLog(
+          `[Planner] ${job.base}: bypassed (${error instanceof Error ? error.message : String(error)}). Falling back to legacy leveler.`,
+        );
+        if (shouldResetFfmpegForError(error)) {
+          ffmpeg = await refreshFfmpeg(`planner failure on ${job.base}`);
+          await writeJobInput(ffmpeg, job);
+        }
+        plan = null;
+      }
+    }
+
+    // Pre-level the full file ONCE when a plan exists. Cache the result for
+    // every candidate variant + strategy. Auto-recreate after an ffmpeg
+    // worker refresh (worker refresh wipes the virtual FS).
+    const leveledInputName = plan ? `${job.base}_planner_leveled.wav` : null;
+    let leveledReady = false;
+    const ensureLeveledInput = async (): Promise<string | null> => {
+      if (!plan || !leveledInputName) return null;
+      if (leveledReady) {
+        try {
+          await ffmpeg.readFile(leveledInputName);
+          return leveledInputName;
+        } catch {
+          leveledReady = false; // virtual FS reset — re-apply below
+        }
+      }
+      try {
+        await applyPlannerToFullInput(ffmpeg, job.inputName, leveledInputName, plan);
+        leveledReady = true;
+        return leveledInputName;
+      } catch (error) {
+        appendLog(
+          `[Planner] ${job.base}: apply failed (${error instanceof Error ? error.message : String(error)}). Falling back to original input.`,
+        );
+        if (shouldResetFfmpegForError(error)) {
+          ffmpeg = await refreshFfmpeg(`planner apply on ${job.base}`);
+          await writeJobInput(ffmpeg, job);
+        }
+        plan = null;
+        leveledReady = false;
+        return null;
+      }
     };
 
     const buildMeta = (
@@ -3375,23 +4121,33 @@ const summarizeFailureReason = (error: unknown) => {
           const runFixedSegmentation = async () => {
             setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
             setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
-            await runMixReadySegmented(ffmpeg, job.inputName, outputName, profile, speechRenderPlan.durationSeconds, {
-              ...effectiveOptions,
-              segmentMode: "fixed",
-            });
+            const leveled = await ensureLeveledInput();
+            await runMixReadySegmented(
+              ffmpeg,
+              job.inputName,
+              outputName,
+              profile,
+              speechRenderPlan.durationSeconds,
+              {
+                ...effectiveOptions,
+                segmentMode: "fixed",
+              },
+              leveled,
+            );
             speechAlignedSegmentCountUsed = Math.ceil(speechRenderPlan.durationSeconds / MIX_SEGMENT_SECONDS);
             mixRendered = true;
             renderMeta = buildMeta(strategy.label, "fixed-segmented", strategyDegradeReasons);
             appendLog(
               `[Segmented] ${job.base}: fixed render used ${speechAlignedSegmentCountUsed} segments (${formatCandidateVariant(
                 effectiveOptions.candidateVariant ?? "cinematic-stable"
-              )}).`
+              )}, planner=${leveled ? "on" : "off"}).`
             );
           };
 
           const runSpeechSegmentation = async (segments: RenderSegment[], segmentLite: boolean) => {
             setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
             setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
+            const leveled = await ensureLeveledInput();
             speechAlignedSegmentCountUsed = await runMixReadySpeechAlignedSegmented(
               ffmpeg,
               job.inputName,
@@ -3405,7 +4161,8 @@ const summarizeFailureReason = (error: unknown) => {
                 segmentLite,
                 disableSegmentGainMatch:
                   effectiveOptions.disableSegmentGainMatch || (segmentLite ? true : renderRisk.disableSegmentGainMatch),
-              }
+              },
+              leveled,
             );
             mixRendered = true;
             renderMeta = buildMeta(
@@ -3416,7 +4173,7 @@ const summarizeFailureReason = (error: unknown) => {
             appendLog(
               `[Segmented] ${job.base}: ${speechRenderPlan.mode} render used ${speechAlignedSegmentCountUsed} segments (${formatCandidateVariant(
                 effectiveOptions.candidateVariant ?? "cinematic-stable"
-              )}${segmentLite ? ", lite" : ""}).`
+              )}${segmentLite ? ", lite" : ""}, planner=${leveled ? "on" : "off"}).`
             );
           };
 
@@ -3507,7 +4264,11 @@ const summarizeFailureReason = (error: unknown) => {
 
         setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
         setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
-        await runMixReady(ffmpeg, job.inputName, outputName, profile, effectiveOptions);
+        const leveledForSinglePass = await ensureLeveledInput();
+        await runMixReady(ffmpeg, job.inputName, outputName, profile, effectiveOptions, leveledForSinglePass);
+        appendLog(
+          `[SinglePass] ${job.base}: ${strategy.label} (planner=${leveledForSinglePass ? "on" : "off"}).`,
+        );
         mixRendered = true;
         if (strategyDegradeReasons.includes("segment-render-memory-fault")) {
           strategyDegradeReasons.push("single-pass-recovery");
@@ -3534,7 +4295,16 @@ const summarizeFailureReason = (error: unknown) => {
             appendLog(
               `[MixFallback] ${job.base}: ${strategy.label} failed (${strategyFailureMessage}), trying segmented ${strategy.label}.`
             );
-            await runMixReadySegmented(ffmpeg, job.inputName, outputName, profile, durationSeconds, effectiveOptions);
+            const leveledForSeg = await ensureLeveledInput();
+            await runMixReadySegmented(
+              ffmpeg,
+              job.inputName,
+              outputName,
+              profile,
+              durationSeconds,
+              effectiveOptions,
+              leveledForSeg,
+            );
             mixRendered = true;
             renderMeta = buildMeta(strategy.label, "fixed-segmented", strategyDegradeReasons);
             break;
@@ -3558,6 +4328,10 @@ const summarizeFailureReason = (error: unknown) => {
           );
         }
       }
+    }
+
+    if (leveledInputName) {
+      await safeDeleteFile(ffmpeg, leveledInputName);
     }
 
     if (!mixRendered) {
@@ -3729,7 +4503,15 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          const candidateVariants = buildMixCandidateVariants(profile);
+          const fileDurationForVariants = speechRenderPlan?.durationSeconds ?? null;
+          const candidateVariants = buildMixCandidateVariants(profile, fileDurationForVariants);
+          const isLongFile =
+            fileDurationForVariants !== null && fileDurationForVariants >= LONG_FILE_DURATION_SECONDS;
+          if (isLongFile) {
+            appendLog(
+              `[LongFile] ${job.base}: ${fileDurationForVariants!.toFixed(0)}s duration \u2014 ${candidateVariants.length} candidate variant(s), worker recycle between variants.`,
+            );
+          }
           let selectedVariant: CandidateVariant | null = null;
           let selectedBytes: Uint8Array | null = null;
           let selectedScore: CandidateScore | null = null;
@@ -3740,7 +4522,16 @@ const summarizeFailureReason = (error: unknown) => {
           let degradedCandidates = 0;
           let healthySegmentedCandidates = 0;
 
-          for (const candidateVariant of candidateVariants) {
+          for (let variantIndex = 0; variantIndex < candidateVariants.length; variantIndex += 1) {
+            const candidateVariant = candidateVariants[variantIndex];
+            // For long files, recycle the ffmpeg worker BEFORE each candidate
+            // variant (after the first). This resets the WASM heap, avoiding
+            // the slow memory creep that turns a 20-min third candidate into
+            // an OOM on otherwise-healthy chains.
+            if (isLongFile && variantIndex > 0) {
+              ffmpeg = await refreshFfmpeg(`long-file candidate recycle on ${job.base}`);
+              await writeJobInput(ffmpeg, job);
+            }
             const candidateLabel = formatCandidateVariant(candidateVariant);
             const candidateName = `${job.base}_${candidateLabel.replace(/-/g, "_")}_candidate.wav`;
             const candidateOptions: MixRenderOptions = {
@@ -3758,7 +4549,8 @@ const summarizeFailureReason = (error: unknown) => {
                 jobs.length,
                 `Mix-ready (${candidateLabel})`,
                 candidateOptions,
-                speechRenderPlan
+                speechRenderPlan,
+                analysisByBase.get(job.base),
               );
               ffmpeg = renderResult.ffmpeg;
               attemptedCandidates += 1;
@@ -4201,76 +4993,30 @@ const summarizeFailureReason = (error: unknown) => {
 
           <div className={styles.toggleRow}>
             <div>
-              <strong>EQ cleanup</strong>
-              <div className={styles.label}>HPF + small low-mid shaping for consistency</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={eqCleanup}
-              onChange={(event) => setEqCleanup(event.target.checked)}
-            />
-          </div>
-          <div className={styles.toggleRow}>
-            <div>
-              <strong>Soften harshness</strong>
+              <strong>Speech-aware leveler</strong>
               <div className={styles.label}>
-                Cinematic softening for bright/emotional lines (3.5 kHz + 8 kHz + gentle top-end trim)
+                Plans a gain curve from the actual sentences before any compressor runs. This is the core
+                fix for sudden volume spikes. Falls back to the legacy leveler for very long files (&gt;15 min).
               </div>
             </div>
             <input
               type="checkbox"
-              checked={softenHarshness}
-              onChange={(event) => setSoftenHarshness(event.target.checked)}
+              checked={gainPlannerEnabled}
+              onChange={(event) => setGainPlannerEnabled(event.target.checked)}
             />
           </div>
           <div className={styles.toggleRow}>
             <div>
-              <strong>Room cleanup (auto detect)</strong>
+              <strong>Cinematic color</strong>
               <div className={styles.label}>
-                Reduces mild room echo/reverb only when needed.
+                Subtle dub-room voicing: +0.8 dB @180 Hz warmth, +0.6 dB @4.5 kHz intelligibility, -0.5 dB
+                @10 kHz. Automatically bypassed on emotional takes.
               </div>
             </div>
             <input
               type="checkbox"
-              checked={roomCleanup}
-              onChange={(event) => setRoomCleanup(event.target.checked)}
-            />
-          </div>
-          <div className={styles.toggleRow}>
-            <div>
-              <strong>Scene blend (adaptive subtle)</strong>
-              <div className={styles.label}>
-                Adds very light mono early reflections so VO sits in-picture without sounding processed.
-              </div>
-            </div>
-            <input
-              type="checkbox"
-              checked={sceneBlend}
-              onChange={(event) => setSceneBlend(event.target.checked)}
-            />
-          </div>
-          <div className={styles.toggleRow}>
-            <div>
-              <strong>Noise guard</strong>
-              <div className={styles.label}>Limits auto-leveler gain to avoid noise lift</div>
-            </div>
-            <input
-              type="checkbox"
-              checked={noiseGuard}
-              onChange={(event) => setNoiseGuard(event.target.checked)}
-            />
-          </div>
-          <div className={styles.toggleRow}>
-            <div>
-              <strong>Floor guard</strong>
-              <div className={styles.label}>
-                Keeps near-silence quiet; auto-prioritized over breath control on noisy tracks
-              </div>
-            </div>
-            <input
-              type="checkbox"
-              checked={floorGuard}
-              onChange={(event) => setFloorGuard(event.target.checked)}
+              checked={cinematicColor}
+              onChange={(event) => setCinematicColor(event.target.checked)}
             />
           </div>
           <div className={styles.toggleRow}>
@@ -4285,6 +5031,99 @@ const summarizeFailureReason = (error: unknown) => {
               disabled={loudnessConfig === null}
             />
           </div>
+
+          <button
+            type="button"
+            className={`${styles.button} ${styles.buttonGhost} ${styles.sectionTop}`}
+            onClick={() => setAdvancedOpen((open) => !open)}
+            aria-expanded={advancedOpen}
+          >
+            {advancedOpen ? "Hide advanced options" : "Show advanced options"}
+          </button>
+          {advancedOpen && (
+            <>
+              <div className={styles.toggleRow}>
+                <div>
+                  <strong>EQ cleanup</strong>
+                  <div className={styles.label}>HPF + small low-mid shaping for consistency</div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={eqCleanup}
+                  onChange={(event) => setEqCleanup(event.target.checked)}
+                />
+              </div>
+              <div className={styles.toggleRow}>
+                <div>
+                  <strong>Soften harshness</strong>
+                  <div className={styles.label}>
+                    Legacy: presence + air softening for bright/emotional lines. Cinematic color covers
+                    most of this; enable both if you want extra softening.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={softenHarshness}
+                  onChange={(event) => setSoftenHarshness(event.target.checked)}
+                />
+              </div>
+              <div className={styles.toggleRow}>
+                <div>
+                  <strong>Room cleanup (auto detect)</strong>
+                  <div className={styles.label}>
+                    Reduces mild room echo/reverb only when needed.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={roomCleanup}
+                  onChange={(event) => setRoomCleanup(event.target.checked)}
+                />
+              </div>
+              <div className={styles.toggleRow}>
+                <div>
+                  <strong>Scene blend (adaptive subtle)</strong>
+                  <div className={styles.label}>
+                    Legacy: adds very light mono early reflections so VO sits in-picture. Off by default
+                    now that cinematic color handles room-sit cues.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={sceneBlend}
+                  onChange={(event) => setSceneBlend(event.target.checked)}
+                />
+              </div>
+              <div className={styles.toggleRow}>
+                <div>
+                  <strong>Keep silences clean (expander + NR)</strong>
+                  <div className={styles.label}>
+                    Enables the speech-aware expander on the leveler path, and chains measured-SNR
+                    spectral NR (afftdn + anlmdn when severe). Previously labeled &quot;Noise guard&quot;.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={noiseGuard}
+                  onChange={(event) => setNoiseGuard(event.target.checked)}
+                />
+              </div>
+              <div className={styles.toggleRow}>
+                <div>
+                  <strong>Floor guard</strong>
+                  <div className={styles.label}>
+                    Legacy downward curve on the tail. Superseded by the speech-aware expander when the
+                    new leveler is on, but still useful as a safety net on very long or very noisy takes.
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={floorGuard}
+                  onChange={(event) => setFloorGuard(event.target.checked)}
+                />
+              </div>
+            </>
+          )}
 
           <div className={`${styles.controls} ${styles.sectionTop}`}>
             <button className={styles.button} onClick={processFiles} disabled={loading || files.length === 0}>

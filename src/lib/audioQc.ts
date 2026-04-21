@@ -34,6 +34,14 @@ export type AudioQcMetrics = {
   analysisConfidence: number;
   drynessScore: number;
   overallRisk: number;
+  /**
+   * Long-term band energy in dB. Populated only by `analyzeFloatSamplesWithSpectrum`
+   * (the core frame-based analyzer does not see raw samples). Null means not
+   * computed for this run.
+   */
+  bandSpectrumDb: number[] | null;
+  /** Sibilance score 0..1 derived from the band spectrum. Zero if spectrum not computed. */
+  sibilanceScore: number;
 };
 
 export type AudioQcAdvice = {
@@ -484,6 +492,8 @@ export const analyzeFrameAudio = (
       analysisConfidence: 0,
       drynessScore: 0,
       overallRisk: 0,
+      bandSpectrumDb: null,
+      sibilanceScore: 0,
     };
   }
 
@@ -845,6 +855,11 @@ export const analyzeFrameAudio = (
     analysisConfidence,
     drynessScore,
     overallRisk,
+    // `analyzeFrameAudio` works on pre-computed envelope data and does not see
+    // raw samples, so spectrum/sibilance are not available at this stage.
+    // `analyzeFloatSamples` fills them in from the raw signal.
+    bandSpectrumDb: null,
+    sibilanceScore: 0,
   };
 };
 

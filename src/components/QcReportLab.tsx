@@ -366,6 +366,8 @@ const createErrorReport = (
   echoDelayMs: null,
   analysisConfidence: 0,
   drynessScore: 0,
+  bandSpectrumDb: null,
+  sibilanceScore: 0,
   flags: ["File could not be analyzed."],
   recommendations: ["Check that the file is a valid PCM WAV and retry."],
   error,
@@ -723,6 +725,25 @@ export default function QcReportLab() {
           <div className={styles.reportList}>
             {comparisons.map((comparison) => {
               const regressed = comparison.deltaRisk > 0.05;
+              // Cinematic VO chain pass/fail gates. These mirror the plan's
+              // "Definition of done": a leveled VO should be more stable,
+              // not lift noise, and have smaller sentence-jumps.
+              const noiseNotLifted = comparison.deltaNoiseFloor <= 1; // +1 dB tolerance
+              const sentenceJumpDown = comparison.after.sentenceJumpScore - comparison.before.sentenceJumpScore <= 0.05;
+              const instabilityDown = comparison.deltaInstability <= 0.02;
+              const truePeakSafe = comparison.after.peakDb <= -1.5;
+              const sibilanceNotWorse =
+                comparison.after.sibilanceScore - comparison.before.sibilanceScore <= 0.05;
+              const checks = [
+                { label: "Volume stability", pass: instabilityDown, detail: `Δ instability ${formatSignedPercent(comparison.deltaInstability)}` },
+                { label: "Sentence-jump", pass: sentenceJumpDown, detail: `Δ ${formatSignedPercent(comparison.after.sentenceJumpScore - comparison.before.sentenceJumpScore)}` },
+                { label: "Noise floor not lifted", pass: noiseNotLifted, detail: `Δ ${formatSignedDb(comparison.deltaNoiseFloor)}` },
+                { label: "True peak ≤ -1.5 dBFS", pass: truePeakSafe, detail: `${comparison.after.peakDb.toFixed(1)} dB` },
+                { label: "Sibilance stable", pass: sibilanceNotWorse, detail: `Δ ${formatSignedPercent(comparison.after.sibilanceScore - comparison.before.sibilanceScore)}` },
+              ];
+              const passCount = checks.filter((c) => c.pass).length;
+              const allPass = passCount === checks.length;
+
               return (
                 <div className={styles.reportItem} key={comparison.key}>
                   <div className={styles.reportHeader}>
@@ -732,9 +753,24 @@ export default function QcReportLab() {
                         {comparison.before.fileName} {"->"} {comparison.after.fileName}
                       </div>
                     </div>
-                    <span className={`${styles.statusBadge} ${regressed ? styles.statusWarning : styles.statusOk}`}>
-                      {regressed ? "Regression risk" : "Improved/Stable"}
+                    <span
+                      className={`${styles.statusBadge} ${
+                        allPass ? styles.statusOk : regressed ? styles.statusWarning : styles.statusOk
+                      }`}
+                    >
+                      {allPass ? `All checks pass (${passCount}/${checks.length})` : regressed ? "Regression risk" : `${passCount}/${checks.length} checks pass`}
                     </span>
+                  </div>
+
+                  <div className={styles.metricGrid}>
+                    {checks.map((check) => (
+                      <div className={styles.metric} key={check.label}>
+                        <span>{check.label}</span>
+                        <strong>
+                          {check.pass ? "PASS" : "FAIL"} — {check.detail}
+                        </strong>
+                      </div>
+                    ))}
                   </div>
 
                   <div className={styles.metricGrid}>
