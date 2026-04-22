@@ -123,11 +123,6 @@ const GAIN_PLANNER_FRAME_MS = 10;
  * the downstream `dynaudnorm` fallback.
  */
 const GAIN_PLANNER_MAX_DURATION_SECONDS = 4800; // 80 minutes — fine at 16 kHz mono
-/**
- * Crossfade overlap between segments when segmented rendering is used.
- */
-const SEGMENT_CROSSFADE_SECONDS = 0.3;
-
 const sanitizeBase = (name: string) =>
   name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9-_]+/g, "_");
 
@@ -1071,29 +1066,8 @@ const summarizeFailureReason = (error: unknown) => {
         index += 1;
       }
 
-      const listContent = `${chunkNames.map((n) => `file '${n}'`).join("\n")}\n`;
-      await ffmpeg.writeFile(listName, new TextEncoder().encode(listContent));
-      resetLogBuffer();
-      await execOrThrow(
-        ffmpeg,
-        [
-          "-hide_banner",
-          "-nostdin",
-          "-threads",
-          "1",
-          "-y",
-          "-f",
-          "concat",
-          "-safe",
-          "0",
-          "-i",
-          listName,
-          "-c",
-          "copy",
-          outputName,
-        ],
-        "Planner apply concat",
-      );
+      await runExactConcat(ffmpeg, chunkNames, outputName, listName, "Planner apply concat");
+      await logDurationDelta(ffmpeg, "Planner apply concat", total, outputName);
     } finally {
       await safeDeleteFile(ffmpeg, listName);
       for (const name of chunkNames) {
@@ -3220,78 +3194,12 @@ const summarizeFailureReason = (error: unknown) => {
         throw new Error("Segmented render produced insufficient segments.");
       }
 
-      // Crossfade segments rather than hard concat. A 300 ms crossfade at
-      // every boundary erases the small residual level step that independent
-      // per-segment processing can leave. Applied iteratively (A+B, then that
-      // result + C, etc.) because `acrossfade` only consumes two inputs.
-      await crossfadeConcatSegments(ffmpeg, segmentNames, outputName, SEGMENT_CROSSFADE_SECONDS);
+      await runExactConcat(ffmpeg, segmentNames, outputName, concatListName, "Segment concat render");
+      await logDurationDelta(ffmpeg, "Fixed segmented render", durationSeconds, outputName);
     } finally {
       await safeDeleteFile(ffmpeg, concatListName);
       for (const segmentName of segmentNames) {
         await safeDeleteFile(ffmpeg, segmentName);
-      }
-    }
-  };
-
-  /**
-   * Crossfade-concat a list of segment WAVs into `outputName`. Works
-   * iteratively via a scratch file so we don't blow memory on long batches.
-   */
-  const crossfadeConcatSegments = async (
-    ffmpeg: FFmpeg,
-    segmentNames: string[],
-    outputName: string,
-    crossfadeSec: number,
-  ) => {
-    if (segmentNames.length === 0) {
-      throw new Error("No segments to crossfade-concat.");
-    }
-    if (segmentNames.length === 1) {
-      const bytes = await readVirtualFileBytes(ffmpeg, segmentNames[0]);
-      await ffmpeg.writeFile(outputName, bytes);
-      return;
-    }
-
-    const scratchNames: string[] = [];
-    try {
-      let accum = segmentNames[0];
-      for (let i = 1; i < segmentNames.length; i += 1) {
-        const next = segmentNames[i];
-        const isFinal = i === segmentNames.length - 1;
-        const targetName = isFinal ? outputName : `${sanitizeBase(outputName)}_xf_${i}.wav`;
-        if (!isFinal) scratchNames.push(targetName);
-        resetLogBuffer();
-        await execOrThrow(
-          ffmpeg,
-          [
-            "-hide_banner",
-            "-nostdin",
-            "-threads",
-            "1",
-            "-filter_threads",
-            "1",
-            "-y",
-            "-i",
-            accum,
-            "-i",
-            next,
-            "-filter_complex",
-            `[0:a][1:a]acrossfade=d=${crossfadeSec.toFixed(3)}:c1=tri:c2=tri`,
-            "-ar",
-            "48000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_f32le",
-            targetName,
-          ],
-          `Segment crossfade ${i}`,
-        );
-        accum = targetName;
-      }
-    } finally {
-      for (const scratch of scratchNames) {
-        await safeDeleteFile(ffmpeg, scratch);
       }
     }
   };
@@ -3591,10 +3499,14 @@ const summarizeFailureReason = (error: unknown) => {
         segmentNames.push(concatName);
       }
 
-      // Speech-aligned segments were cut at pause centers, so a brief
-      // crossfade at the junction is safe (both sides are silence-adjacent)
-      // and erases any residual per-segment level step.
-      await crossfadeConcatSegments(ffmpeg, segmentNames, outputName, SEGMENT_CROSSFADE_SECONDS);
+      await runExactConcat(
+        ffmpeg,
+        segmentNames,
+        outputName,
+        concatListName,
+        "Speech-aligned segment concat render",
+      );
+      await logDurationDelta(ffmpeg, `${segmentMode} segmented render`, durationSeconds, outputName);
 
       return segments.length;
     } finally {
@@ -3765,6 +3677,69 @@ const summarizeFailureReason = (error: unknown) => {
       await ffmpeg.deleteFile(name);
     } catch {
       // Ignore cleanup failures from missing temp files.
+    }
+  };
+
+  const buildConcatDemuxerList = (fileNames: string[]) =>
+    `${fileNames.map((name) => `file '${name.replace(/'/g, "'\\''")}'`).join("\n")}\n`;
+
+  const runExactConcat = async (
+    ffmpeg: FFmpeg,
+    inputNames: string[],
+    outputName: string,
+    listName: string,
+    context: string,
+  ) => {
+    if (inputNames.length === 0) {
+      throw new Error("No segments to concat.");
+    }
+    if (inputNames.length === 1) {
+      const bytes = await readVirtualFileBytes(ffmpeg, inputNames[0]);
+      await ffmpeg.writeFile(outputName, bytes);
+      return;
+    }
+
+    await ffmpeg.writeFile(listName, new TextEncoder().encode(buildConcatDemuxerList(inputNames)));
+    resetLogBuffer();
+    await execOrThrow(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        listName,
+        "-c",
+        "copy",
+        outputName,
+      ],
+      context,
+    );
+  };
+
+  const logDurationDelta = async (
+    ffmpeg: FFmpeg,
+    context: string,
+    inputDurationSeconds: number,
+    outputName: string,
+  ) => {
+    if (!Number.isFinite(inputDurationSeconds) || inputDurationSeconds <= 0) return;
+    try {
+      const outputDurationSeconds = await probeInputDurationSeconds(ffmpeg, outputName);
+      if (outputDurationSeconds === null || !Number.isFinite(outputDurationSeconds)) return;
+      appendLog(
+        `[Duration] ${context}: input ${inputDurationSeconds.toFixed(3)}s -> output ${outputDurationSeconds.toFixed(
+          3,
+        )}s (delta ${formatSigned(outputDurationSeconds - inputDurationSeconds, 3)}s).`,
+      );
+    } catch {
+      // Ignore probe failures for post-render diagnostics.
     }
   };
 
