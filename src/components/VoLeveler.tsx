@@ -994,6 +994,8 @@ const summarizeFailureReason = (error: unknown) => {
     expanderDepthDb: number;
     /** Diagnostic count of planned speech runs. */
     speechRunCount: number;
+    /** Count of runs classified as transient-breath (subset of speechRunCount). */
+    breathRunCount: number;
     /** Effective intra-run micro-ride range in dB. Diagnostic. */
     microRideDb: number;
   };
@@ -1110,6 +1112,7 @@ const summarizeFailureReason = (error: unknown) => {
         targetDb: plan.targetDb,
         expanderDepthDb: plan.expanderDepthDb,
         speechRunCount: plan.runs.length,
+        breathRunCount: plan.breathRunCount,
         microRideDb: plan.microRideDb,
       };
     } finally {
@@ -1130,6 +1133,21 @@ const summarizeFailureReason = (error: unknown) => {
   const PLANNER_APPLY_CHUNK_SECONDS_DEFAULT = 90;
   const PLANNER_APPLY_CHUNK_SECONDS_LONG = 60;
   const LONG_FILE_DURATION_SECONDS = 600; // 10 min
+
+  /**
+   * Overlap between consecutive render chunks/segments, consumed by a
+   * `acrossfade=d=<overlap>` so:
+   *   - the output length exactly matches the input (no timing drift), AND
+   *   - every boundary is smoothed across ~20 ms, eliminating the 1-sample
+   *     clicks that a pure `-c copy` hard-concat can leave when the filter
+   *     state differs between segments or when two planner chunks meet at a
+   *     frame where the gain curve is stepping (speech/silence edge).
+   *
+   * 20 ms is short enough to be imperceptible as a fade (one phoneme ~ 80 ms)
+   * and is matched exactly by the overlap we read from the source, so timing
+   * is preserved sample-accurately.
+   */
+  const CHUNK_CROSSFADE_SECONDS = 0.02;
   /**
    * Sample rate the leveled full-file is produced at. Matches the downstream
    * mix chain so ffmpeg doesn't have to resample again.
@@ -1230,24 +1248,44 @@ const summarizeFailureReason = (error: unknown) => {
       return;
     }
 
-    const chunkNames: string[] = [];
-    const listName = `${sanitizeBase(outputName)}_planner_chunks.txt`;
-    try {
+    // Plan native (non-overlapping) chunk boundaries, then extend each
+    // non-last chunk by CHUNK_CROSSFADE_SECONDS of source material at its
+    // END so the downstream `acrossfade=d=CHUNK_CROSSFADE_SECONDS` consumes
+    // the duplicate region — sample-accurate timing, click-free seams.
+    const nativeStarts: number[] = [];
+    const nativeSpans: number[] = [];
+    {
       let cursor = 0;
-      let index = 0;
       while (cursor < total - 0.01) {
         const span = Math.min(chunkSeconds, total - cursor);
-        const chunkName = `${sanitizeBase(outputName)}_chunk_${index}.wav`;
-        await levelInputRange(ffmpeg, inputName, chunkName, plan, cursor, span);
-        chunkNames.push(chunkName);
+        nativeStarts.push(cursor);
+        nativeSpans.push(span);
         cursor += span;
-        index += 1;
+      }
+    }
+
+    const chunkNames: string[] = [];
+    try {
+      for (let index = 0; index < nativeStarts.length; index += 1) {
+        const isLast = index === nativeStarts.length - 1;
+        const start = nativeStarts[index];
+        const span = isLast
+          ? nativeSpans[index]
+          : Math.min(nativeSpans[index] + CHUNK_CROSSFADE_SECONDS, total - start);
+        const chunkName = `${sanitizeBase(outputName)}_chunk_${index}.wav`;
+        await levelInputRange(ffmpeg, inputName, chunkName, plan, start, span);
+        chunkNames.push(chunkName);
       }
 
-      await runExactConcat(ffmpeg, chunkNames, outputName, listName, "Planner apply concat");
-      await logDurationDelta(ffmpeg, "Planner apply concat", total, outputName);
+      await runCrossfadeConcat(
+        ffmpeg,
+        chunkNames,
+        outputName,
+        CHUNK_CROSSFADE_SECONDS,
+        "Planner apply crossfade",
+      );
+      await logDurationDelta(ffmpeg, "Planner apply crossfade", total, outputName);
     } finally {
-      await safeDeleteFile(ffmpeg, listName);
       for (const name of chunkNames) {
         await safeDeleteFile(ffmpeg, name);
       }
@@ -2586,38 +2624,53 @@ const summarizeFailureReason = (error: unknown) => {
     //    strict ending-protected take is sparse dialogue, reverb tails
     //    double as ambience; removing them sounds processed.
     const inEchoScore = profile?.echoScore ?? 0;
+    const inRoomScore = (profile?.echoNotchCutDb ?? 0) > 0 ? profile?.echoNotchCutDb ?? 0 : 0;
     const roomRiskIsMed = profile?.roomRisk === "medium" || profile?.roomRisk === "high";
+    // Gate matches the auto-reviewer's echo flag (echoScore ≥ 0.32) so we
+    // don't leave a band of files flagged "echo_roomy" but never treated.
+    // Conservative upper-bound still prevents firing on sparse-dialogue
+    // strict-ending-protection takes where the tail reverb is performance.
     const dereverbAllowed =
       !minimalStabilityChain &&
       roomCleanupEnabled &&
       !(profile?.strictEndingProtection && inEchoScore >= 0.75) &&
-      (inEchoScore >= 0.42 || roomRiskIsMed);
+      (inEchoScore >= 0.32 || roomRiskIsMed || inRoomScore >= 0.3);
     if (dereverbAllowed) {
-      // Strength 0..1, scales anlmdn `s` (noise-profile width) down and
-      // shelf cut depth up with the detected room energy.
+      // Strength 0..1, scales with measured echo. Now uses the ACTUAL
+      // `echoScore` as the primary driver (was 0.7×echoScore + bonus) so
+      // stronger rooms get proportionally stronger treatment. Caps at 1.0.
       const roomStrength = clamp(
-        inEchoScore * 0.7 + (profile?.roomRisk === "high" ? 0.3 : profile?.roomRisk === "medium" ? 0.15 : 0),
+        inEchoScore +
+          (profile?.roomRisk === "high" ? 0.2 : profile?.roomRisk === "medium" ? 0.1 : 0),
         0,
         1,
       );
-      // `anlmdn` de-reverb: `s` scales 0.00030 (gentle) → 0.00050 (firmer).
-      const nlmS = (0.00030 + roomStrength * 0.00020).toFixed(5);
+      // `anlmdn` de-reverb strength scales over a wider range (0.00025 →
+      // 0.00065). Stronger settings scrub more reflection smear; the
+      // extended range catches the 0.5–0.8 echoScore files that were
+      // still landing as `echo_roomy` in auto-review.
+      const nlmS = (0.00025 + roomStrength * 0.0004).toFixed(5);
       filters.push(`anlmdn=s=${nlmS}:p=0.002:r=0.004`);
 
-      // Narrow notch at the detected echo resonance if the analyzer found
-      // one. `echoDelayMs` is in ms; the dominant room mode is typically at
-      // the reciprocal's first harmonic band (100–300 Hz for small rooms).
-      // We place a subtle dip around 280 Hz with depth scaled by room
-      // strength. This targets the "boxy" component specifically.
-      if (roomStrength >= 0.35) {
-        const boxyCut = -clamp(0.4 + roomStrength * 1.1, 0.4, 1.5);
+      // Boxy-room notch — now fires at a lower strength threshold (0.25)
+      // so it reaches files that were flagged echo_roomy but skipped the
+      // notch before. Depth still modest.
+      if (roomStrength >= 0.25) {
+        const boxyCut = -clamp(0.4 + roomStrength * 1.3, 0.4, 1.7);
         filters.push(`equalizer=f=280:width_type=q:width=1.1:g=${boxyCut.toFixed(2)}`);
       }
 
-      // Gentle top-end shelf cut for brightly reverberant rooms — trims
-      // the "air" reflection component without dulling intelligibility.
-      if (profile?.roomRisk === "high" && roomStrength >= 0.55) {
-        const topShelf = -clamp(0.5 + roomStrength * 0.7, 0.5, 1.2);
+      // Mid-range room notch — 1 kHz "honky" band. Fires on stronger rooms.
+      if (roomStrength >= 0.45) {
+        const midCut = -clamp(0.5 + (roomStrength - 0.45) * 1.6, 0.5, 1.3);
+        filters.push(`equalizer=f=1050:width_type=q:width=1.3:g=${midCut.toFixed(2)}`);
+      }
+
+      // Top-end shelf cut — now fires on medium rooms too (was high only)
+      // when echoScore is high, because brightness reflection scatter lives
+      // in both medium and high room ratings.
+      if (roomStrength >= 0.5) {
+        const topShelf = -clamp(0.5 + (roomStrength - 0.5) * 1.4, 0.5, 1.3);
         filters.push(`equalizer=f=10500:width_type=q:width=0.7:g=${topShelf.toFixed(2)}`);
       }
     }
@@ -2633,18 +2686,34 @@ const summarizeFailureReason = (error: unknown) => {
     }
 
     if (dyn && gainPlannerActive && !minimalStabilityChain) {
-      // The planner has already done speech-aware leveling. Use dynaudnorm
-      // only as a gentle intra-line micro-smoother: narrow window, low `g`,
-      // amplitude threshold anchored above the pause-noise floor so silences
-      // cannot be lifted. This is the actual fix for "sometimes spikes".
-      const gateDb = clamp((profile?.speechThresholdDb ?? -44) - 6, -56, -38);
-      const gateAmp = fromDb(gateDb);
-      const safetyF = 161;
-      const safetyG = 3;
-      const safetyM = 5;
-      filters.push(
-        `dynaudnorm=f=${safetyF}:g=${safetyG}:m=${safetyM}:t=${clamp(gateAmp, fromDb(-60), fromDb(-34)).toFixed(5)}`,
+      // The planner has already done speech-aware leveling. What the
+      // dynaudnorm safety pass does from here depends on how clean the
+      // source is:
+      //  - Very clean (instabilityBlend < 0.30): BYPASS. Any intra-line
+      //    micro-smoothing is either already done by the planner's micro-
+      //    ride or is actively adding audible artifacts (the "too
+      //    compressed" complaint was tracked to this pass firing on
+      //    already-flat material).
+      //  - Otherwise: narrow-window safety pass with amplitude threshold
+      //    anchored above the pause-noise floor so silences cannot be
+      //    lifted.
+      const dynaSafetyBlend = clamp(
+        (profile?.instabilityScore ?? 0.5) * 0.5 +
+          (profile?.lineSwingScore ?? 0.5) * 0.3 +
+          (profile?.sentenceJumpScore ?? 0.5) * 0.2,
+        0,
+        1,
       );
+      if (dynaSafetyBlend >= 0.3) {
+        const gateDb = clamp((profile?.speechThresholdDb ?? -44) - 6, -56, -38);
+        const gateAmp = fromDb(gateDb);
+        const safetyF = 161;
+        const safetyG = 3;
+        const safetyM = 5;
+        filters.push(
+          `dynaudnorm=f=${safetyF}:g=${safetyG}:m=${safetyM}:t=${clamp(gateAmp, fromDb(-60), fromDb(-34)).toFixed(5)}`,
+        );
+      }
     } else if (dyn) {
       let dynaF: number = dyn.f;
       let dynaG: number = noiseGuard ? Math.max(3, dyn.g - 1) : dyn.g;
@@ -3069,14 +3138,12 @@ const summarizeFailureReason = (error: unknown) => {
     );
 
     if (gainPlannerActive) {
-      // Planner already normalized sentence-to-sentence level. How much
-      // downstream compression we apply depends on how messy the source was:
-      //   - very clean sources (low instability+swing): BYPASS completely,
-      //     let the planner + alimiter be the only dynamics stages. This
-      //     gives the flattest sentence-to-sentence behavior the QC metric
-      //     will see.
-      //   - moderately noisy sources: very light glue (mix=0.30, ratio 1.4).
-      //   - messy sources: the old glue (mix=0.55, ratio 1.5).
+      // Planner already normalized sentence-to-sentence level. Downstream
+      // compression is now *adaptive*: on clean takes we bypass entirely
+      // (planner + de-esser + alimiter are sufficient), on progressively
+      // messier takes we scale the glue up. Bypass threshold raised from
+      // 0.25 → 0.35 to address the "too_compressed" auto-review tag that
+      // fired on ~60 % of files.
       const instabilityBlend = clamp(
         (profile?.instabilityScore ?? 0.5) * 0.5 +
           (profile?.lineSwingScore ?? 0.5) * 0.3 +
@@ -3084,15 +3151,20 @@ const summarizeFailureReason = (error: unknown) => {
         0,
         1,
       );
-      if (instabilityBlend < 0.25) {
+      if (instabilityBlend < 0.35) {
         // Fully bypass downstream compression. The planner covers leveling,
         // the de-esser covers sibilance, the alimiter covers peaks. Done.
       } else {
-        const ratio = clamp(1.3 + instabilityBlend * 0.5, 1.3, 1.7);
-        const mix = clamp(0.2 + instabilityBlend * 0.5, 0.2, 0.7);
-        const threshold = clamp(-22 + (1 - instabilityBlend) * 2, -22, -18);
+        // Scale softly from 0.35..1.0 so the transition from bypass to glue
+        // doesn't cliff. Also lighter max mix (0.55 → 0.6) and lighter
+        // ratio ceiling (1.7 → 1.6) since the planner has already handled
+        // the bulk of dynamics control.
+        const norm = (instabilityBlend - 0.35) / 0.65; // 0 at 0.35, 1 at 1.0
+        const ratio = clamp(1.3 + norm * 0.3, 1.3, 1.6);
+        const mix = clamp(0.15 + norm * 0.45, 0.15, 0.6);
+        const threshold = clamp(-22 + (1 - norm) * 2, -22, -18);
         filters.push(
-          `acompressor=threshold=${threshold.toFixed(1)}dB:ratio=${ratio.toFixed(2)}:attack=22:release=240:mix=${mix.toFixed(2)}:detection=rms`,
+          `acompressor=threshold=${threshold.toFixed(1)}dB:ratio=${ratio.toFixed(2)}:attack=25:release=260:mix=${mix.toFixed(2)}:detection=rms`,
         );
       }
     } else {
@@ -3325,15 +3397,23 @@ const summarizeFailureReason = (error: unknown) => {
     const gainPlannerActive = Boolean(plannerLeveledInputName);
     const tempBase = sanitizeBase(outputName);
     const segmentNames: string[] = [];
-    const concatListName = `${tempBase}_segments.txt`;
     const filterChain = buildMixFilter(profile, { ...options, gainPlannerActive });
 
     try {
       for (let index = 0; index < segmentCount; index += 1) {
         const start = index * MIX_SEGMENT_SECONDS;
         const remaining = durationSeconds - start;
-        const span = Math.min(MIX_SEGMENT_SECONDS, Math.max(remaining, 0));
-        if (span <= 0.01) break;
+        const nativeSpan = Math.min(MIX_SEGMENT_SECONDS, Math.max(remaining, 0));
+        if (nativeSpan <= 0.01) break;
+        const isLast = index === segmentCount - 1 || start + nativeSpan >= durationSeconds - 0.01;
+        // Non-last segments include CHUNK_CROSSFADE_SECONDS of overlap so
+        // the downstream acrossfade consumes it without shortening the
+        // total output. Per-segment filter-state restart transients get
+        // blended across the overlap instead of leaving a sample-level
+        // click at the boundary.
+        const span = isLast
+          ? nativeSpan
+          : Math.min(nativeSpan + CHUNK_CROSSFADE_SECONDS, durationSeconds - start);
         const segmentName = `${tempBase}_seg_${index + 1}.wav`;
         segmentNames.push(segmentName);
 
@@ -3372,10 +3452,15 @@ const summarizeFailureReason = (error: unknown) => {
         throw new Error("Segmented render produced insufficient segments.");
       }
 
-      await runExactConcat(ffmpeg, segmentNames, outputName, concatListName, "Segment concat render");
+      await runCrossfadeConcat(
+        ffmpeg,
+        segmentNames,
+        outputName,
+        CHUNK_CROSSFADE_SECONDS,
+        "Fixed segment crossfade",
+      );
       await logDurationDelta(ffmpeg, "Fixed segmented render", durationSeconds, outputName);
     } finally {
-      await safeDeleteFile(ffmpeg, concatListName);
       for (const segmentName of segmentNames) {
         await safeDeleteFile(ffmpeg, segmentName);
       }
@@ -3582,7 +3667,6 @@ const summarizeFailureReason = (error: unknown) => {
     const gainPlannerActive = Boolean(plannerLeveledInputName);
     const segmentMode = options?.segmentMode ?? "speech-aligned";
     const tempBase = sanitizeBase(outputName);
-    const concatListName = `${tempBase}_speech_segments.txt`;
     const segmentNames: string[] = [];
     const cleanupNames: string[] = [];
     const enableSegmentGainMatch =
@@ -3597,13 +3681,21 @@ const summarizeFailureReason = (error: unknown) => {
     try {
       for (let index = 0; index < segments.length; index += 1) {
         const segment = segments[index];
+        const isLast = index === segments.length - 1;
         const readStart = Math.max(0, segment.startSec - segment.trimInMs / 1000);
-        const readEnd = Math.min(durationSeconds, segment.endSec + segment.trimOutMs / 1000);
+        // Non-last segments include CHUNK_CROSSFADE_SECONDS of overlap past
+        // their native end so `runCrossfadeConcat` can consume it without
+        // shifting timing.
+        const boundaryOverlap = isLast ? 0 : CHUNK_CROSSFADE_SECONDS;
+        const readEnd = Math.min(
+          durationSeconds,
+          segment.endSec + segment.trimOutMs / 1000 + boundaryOverlap,
+        );
         const readSpan = Math.max(0.05, readEnd - readStart);
         const trimStartSec = Math.max(0, (segment.startSec - readStart) + ((options?.trimSegmentPadMs ?? 0) / 1000));
         const trimEndSec = Math.max(
           trimStartSec + 0.02,
-          (segment.endSec - readStart) - ((options?.trimSegmentPadMs ?? 0) / 1000)
+          (segment.endSec - readStart) - ((options?.trimSegmentPadMs ?? 0) / 1000) + boundaryOverlap,
         );
         const segmentName = `${tempBase}_speech_seg_${index + 1}.wav`;
         cleanupNames.push(segmentName);
@@ -3677,18 +3769,17 @@ const summarizeFailureReason = (error: unknown) => {
         segmentNames.push(concatName);
       }
 
-      await runExactConcat(
+      await runCrossfadeConcat(
         ffmpeg,
         segmentNames,
         outputName,
-        concatListName,
-        "Speech-aligned segment concat render",
+        CHUNK_CROSSFADE_SECONDS,
+        "Speech-aligned segment crossfade",
       );
       await logDurationDelta(ffmpeg, `${segmentMode} segmented render`, durationSeconds, outputName);
 
       return segments.length;
     } finally {
-      await safeDeleteFile(ffmpeg, concatListName);
       for (const name of cleanupNames) {
         await safeDeleteFile(ffmpeg, name);
       }
@@ -3858,14 +3949,26 @@ const summarizeFailureReason = (error: unknown) => {
     }
   };
 
-  const buildConcatDemuxerList = (fileNames: string[]) =>
-    `${fileNames.map((name) => `file '${name.replace(/'/g, "'\\''")}'`).join("\n")}\n`;
-
-  const runExactConcat = async (
+  /**
+   * Stitch `inputNames` into `outputName` using iterative `acrossfade=d=<d>`.
+   *
+   * CRITICAL: every input except the LAST one must have been rendered with
+   * an extra `crossfadeSec` of source material at its end (i.e. rendered
+   * span = native_span + crossfadeSec). The crossfade between input i and
+   * input i+1 consumes that overlap, so the final output length equals the
+   * sum of NATIVE spans — sample-accurate timing relative to the source.
+   *
+   * This fixes two classes of boundary artifacts that `-c copy` hard concat
+   * leaves behind: per-segment filter-state restart transients, and
+   * gain-curve step discontinuities in planner chunks at speech/silence
+   * edges. At 20 ms the crossfade is well below the audibility threshold
+   * for a dub edit (which is ~40 ms) so nothing sounds "smeared".
+   */
+  const runCrossfadeConcat = async (
     ffmpeg: FFmpeg,
     inputNames: string[],
     outputName: string,
-    listName: string,
+    crossfadeSec: number,
     context: string,
   ) => {
     if (inputNames.length === 0) {
@@ -3876,29 +3979,48 @@ const summarizeFailureReason = (error: unknown) => {
       await ffmpeg.writeFile(outputName, bytes);
       return;
     }
-
-    await ffmpeg.writeFile(listName, new TextEncoder().encode(buildConcatDemuxerList(inputNames)));
-    resetLogBuffer();
-    await execOrThrow(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        listName,
-        "-c",
-        "copy",
-        outputName,
-      ],
-      context,
-    );
+    const scratchNames: string[] = [];
+    try {
+      let accum = inputNames[0];
+      for (let i = 1; i < inputNames.length; i += 1) {
+        const next = inputNames[i];
+        const isFinal = i === inputNames.length - 1;
+        const targetName = isFinal ? outputName : `${sanitizeBase(outputName)}_xfade_${i}.wav`;
+        if (!isFinal) scratchNames.push(targetName);
+        resetLogBuffer();
+        await execOrThrow(
+          ffmpeg,
+          [
+            "-hide_banner",
+            "-nostdin",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
+            "-y",
+            "-i",
+            accum,
+            "-i",
+            next,
+            "-filter_complex",
+            `[0:a][1:a]acrossfade=d=${crossfadeSec.toFixed(3)}:c1=tri:c2=tri`,
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+            "-c:a",
+            "pcm_f32le",
+            targetName,
+          ],
+          `${context} [${i}/${inputNames.length - 1}]`,
+        );
+        accum = targetName;
+      }
+    } finally {
+      for (const scratch of scratchNames) {
+        await safeDeleteFile(ffmpeg, scratch);
+      }
+    }
   };
 
   const logDurationDelta = async (
@@ -4178,8 +4300,11 @@ const summarizeFailureReason = (error: unknown) => {
         const dur = await ensureInputDuration();
         plan = await planGainForInput(ffmpeg, job.inputName, profile, analysis, dur);
         if (plan) {
+          const breathNote = plan.breathRunCount > 0
+            ? `, ${plan.breathRunCount} breath/transient run${plan.breathRunCount === 1 ? "" : "s"} tamed`
+            : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}).`,
           );
         } else {
           appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);

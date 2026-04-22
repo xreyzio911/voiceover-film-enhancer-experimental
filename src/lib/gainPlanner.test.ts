@@ -199,6 +199,232 @@ describe("gainPlanner", () => {
   });
 });
 
+describe("run classification", () => {
+  it("tags short high-crest runs as transient-breath and normal runs as body-speech", () => {
+    // Without sample data the planner estimates peak = max(frameDb) + 12 dB,
+    // so we can drive classification purely through frame-level dB values.
+    const frameDb: number[] = [];
+    // 1 s silence
+    for (let i = 0; i < 100; i += 1) frameDb.push(-70);
+    // 1.5 s dialogue body at -22 dB (frames 100..249, stable throughout —
+    // max ≈ body so crest ≈ 12 dB → body-speech).
+    for (let i = 0; i < 150; i += 1) frameDb.push(-22);
+    // 0.3 s silence
+    for (let i = 0; i < 30; i += 1) frameDb.push(-70);
+    // 0.25 s gasp: 25 frames. 2 frames at 0 dB (gasp "puff"), 23 frames
+    // at -25 dB (quiet post-puff tail). Body mean ≈ -11 dB, max = 0 dB,
+    // estimated peak = 0 + 12 = +12 dB → crest ≈ 23 dB → transient-breath.
+    for (let i = 0; i < 2; i += 1) frameDb.push(0);
+    for (let i = 0; i < 23; i += 1) frameDb.push(-25);
+    // 0.5 s silence
+    for (let i = 0; i < 50; i += 1) frameDb.push(-70);
+
+    const speechRuns = [
+      { startFrame: 100, endFrame: 250 }, // dialogue (1.5 s)
+      { startFrame: 280, endFrame: 305 }, // gasp (250 ms)
+    ];
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: 10,
+      targetDb: -22,
+    });
+
+    assert.equal(plan.runs.length, 2);
+    assert.equal(plan.runs[0].runClass, "body-speech");
+    assert.equal(
+      plan.runs[1].runClass,
+      "transient-breath",
+      `gasp should classify as breath (crest=${plan.runs[1].crestDb.toFixed(1)} dB, len=${(plan.runs[1].endFrame - plan.runs[1].startFrame) * 10} ms)`,
+    );
+    assert.equal(plan.breathRunCount, 1);
+
+    // Breath runs use a tighter ±6 dB clamp AND a lower target (breathTarget
+    // = targetDb - 2.5 = -24.5). Whatever the gasp body RMS came out to,
+    // the planned gain must stay within [-6, 6].
+    const gaspGain = plan.runs[1].plannedGainDb;
+    assert.ok(
+      gaspGain <= 6 && gaspGain >= -6,
+      `gasp gain must stay in tight breath clamp, got ${gaspGain.toFixed(2)} dB`,
+    );
+    // Body-speech dialogue gets the wider ±14 dB clamp, so it can rise or
+    // fall more. This asserts we DIDN'T apply the breath clamp to dialogue.
+    const dialogueGain = plan.runs[0].plannedGainDb;
+    assert.ok(
+      plan.runs[0].runClass === "body-speech" && Math.abs(dialogueGain) <= 14,
+      `dialogue gain must use body-speech clamp (got ${dialogueGain.toFixed(2)} dB)`,
+    );
+  });
+});
+
+describe("localized peak guard", () => {
+  it("dips only around the plosive frame, not the whole sentence body", () => {
+    const sampleRate = 48000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000; // 480
+    const totalFrames = 200;
+
+    // Constant -22 dB body with ONE sample-level spike at frame 100. We
+    // keep `frameDb[100] = -22` so the body RMS over the trim region
+    // remains -22 (target lands at -22, planned gain 0 dB). The spike is
+    // visible to the peak-guard via `framePeakDb` (computed from samples).
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    for (let i = 0; i < samples.length; i += 1) {
+      samples[i] = Math.sin((2 * Math.PI * 300 * i) / sampleRate) * 0.08; // -22 dB RMS
+    }
+    // Inject a single full-scale sample at frame 100. This bumps frame
+    // 100's peak to ≈ 0.99 but barely changes its RMS (479 quiet + 1 loud).
+    samples[100 * samplesPerFrame + 100] = 0.99;
+
+    const frameDb: number[] = [];
+    for (let f = 0; f < totalFrames; f += 1) frameDb.push(-22);
+
+    const speechRuns = [{ startFrame: 0, endFrame: totalFrames }];
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      samples,
+      sampleRate,
+      targetDb: -22,
+      peakCeilingDb: -4,
+    });
+
+    const gainFarA = 20 * Math.log10(plan.gainCurve[10] + 1e-9);
+    const gainFarB = 20 * Math.log10(plan.gainCurve[190] + 1e-9);
+    const gainAtPlosive = 20 * Math.log10(plan.gainCurve[100] + 1e-9);
+    const gainNearPlosive = 20 * Math.log10(plan.gainCurve[105] + 1e-9);
+
+    // 1. Body frames FAR from the plosive are untouched.
+    assert.ok(
+      Math.abs(gainFarA) < 0.3 && Math.abs(gainFarB) < 0.3,
+      `body frames far from the plosive should be at 0 dB: ${gainFarA.toFixed(2)} / ${gainFarB.toFixed(2)}`,
+    );
+
+    // 2. The plosive frame itself is dipped meaningfully (at least 1 dB).
+    assert.ok(
+      gainAtPlosive < gainFarA - 1,
+      `plosive frame should be dipped (got ${gainAtPlosive.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
+    );
+
+    // 3. The dip is LOCALIZED — by 5 frames away we're back near body gain.
+    assert.ok(
+      Math.abs(gainNearPlosive - gainFarA) < 1.5,
+      `dip should be localized — 50 ms away we should be near body gain (got ${gainNearPlosive.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
+    );
+  });
+});
+
+describe("ramp placement", () => {
+  it("keeps the full body of a speech run at body gain, ramps only into surrounding silence", () => {
+    // Simulate 3 s file: 0-1 s silence, 1-2.5 s speech, 2.5-3 s silence.
+    const frameDb: number[] = [];
+    for (let i = 0; i < 100; i += 1) frameDb.push(-70); // 1 s silence
+    for (let i = 0; i < 150; i += 1) frameDb.push(-22); // 1.5 s speech
+    for (let i = 0; i < 50; i += 1) frameDb.push(-70); // 0.5 s silence
+    const speechRuns = [{ startFrame: 100, endFrame: 250 }];
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: 10,
+      targetDb: -22,
+      instabilityHint: 0.05,
+    });
+
+    // Pick 5 frames spread across the body. The first frame of the run
+    // (frame 100) and the last frame (frame 249) BOTH need to be at full
+    // body gain — that's the whole point of moving ramps into silence.
+    const bodyFirstDb = 20 * Math.log10(plan.gainCurve[100] + 1e-9);
+    const bodyLastDb = 20 * Math.log10(plan.gainCurve[249] + 1e-9);
+    const bodyMidDb = 20 * Math.log10(plan.gainCurve[175] + 1e-9);
+    assert.ok(
+      Math.abs(bodyFirstDb - bodyMidDb) < 1.2,
+      `first body frame ${bodyFirstDb.toFixed(2)} dB should be close to mid ${bodyMidDb.toFixed(2)} dB (no attack-duck)`,
+    );
+    assert.ok(
+      Math.abs(bodyLastDb - bodyMidDb) < 1.2,
+      `last body frame ${bodyLastDb.toFixed(2)} dB should be close to mid ${bodyMidDb.toFixed(2)} dB (no release-duck)`,
+    );
+
+    // Just before the run (frame 99 → t = 0.99 s, 10 ms before run start)
+    // should still be mid-attack, not at full body gain. Expander floor is
+    // much lower, so it's between those two.
+    const attackEdgeDb = 20 * Math.log10(plan.gainCurve[99] + 1e-9);
+    assert.ok(
+      attackEdgeDb < bodyFirstDb,
+      `attack edge ${attackEdgeDb.toFixed(2)} dB should be below body first ${bodyFirstDb.toFixed(2)} dB`,
+    );
+
+    // Deep in the post-run silence (frame 299 → 2.99 s, well past 500 ms
+    // release) gain should be at full expander floor.
+    const deepSilenceGainDb = 20 * Math.log10(plan.gainCurve[299] + 1e-9);
+    assert.ok(
+      deepSilenceGainDb <= -9,
+      `deep silence gain ${deepSilenceGainDb.toFixed(2)} dB should be below -9 dB (full expander)`,
+    );
+  });
+});
+
+describe("trimmed-mean target", () => {
+  it("trims loud and quiet outliers so the target tracks the typical sentence level", () => {
+    // 10 sentences: 8 typical at -27 dB, one loud outlier at -10 dB, one
+    // quiet outlier at -42 dB. A median would pick the middle of all 10 and
+    // would sit at -27 too; but the mean without trimming would get dragged
+    // up by the loud outlier. The trimmed mean should return exactly the
+    // typical level.
+    const levels = [-27, -27, -27, -10, -27, -42, -27, -27, -27, -27];
+    const frameDb: number[] = [];
+    const speechRuns: Array<{ startFrame: number; endFrame: number }> = [];
+    for (let s = 0; s < levels.length; s += 1) {
+      const gap = 30;
+      const speechLen = 80;
+      const start = frameDb.length + gap;
+      for (let i = 0; i < gap; i += 1) frameDb.push(-70);
+      for (let i = 0; i < speechLen; i += 1) frameDb.push(levels[s]);
+      speechRuns.push({ startFrame: start, endFrame: start + speechLen });
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs: 10,
+      targetDb: -22,
+    });
+
+    // Trimmed mean of [-42,-27,-27,-27,-27,-27,-27,-27,-27,-10] after
+    // dropping 1 each end = mean([-27]*8) = -27.
+    // Target = 0.55 * -27 + 0.45 * -22 = -24.75.
+    const expectedTarget = 0.55 * -27 + 0.45 * -22;
+    assert.ok(
+      Math.abs(plan.targetDb - expectedTarget) < 0.2,
+      `target ${plan.targetDb.toFixed(2)} dB should track the trimmed mean (${expectedTarget.toFixed(2)} dB)`,
+    );
+
+    // The 8 typical sentences should all be lifted by ≈ +2.25 dB to hit
+    // target. Outliers get clamped at the gain window.
+    const typicalRun = plan.runs.find((r) => Math.abs(r.meanDb - -27) < 0.5);
+    assert.ok(typicalRun, "expected a typical run in the plan");
+    const expectedGain = expectedTarget - -27;
+    assert.ok(
+      Math.abs(typicalRun!.plannedGainDb - expectedGain) < 0.5,
+      `typical sentence should get ≈ ${expectedGain.toFixed(2)} dB, got ${typicalRun!.plannedGainDb.toFixed(2)} dB`,
+    );
+  });
+});
+
 describe("adaptive micro-ride", () => {
   it("tightens the micro-ride on clean sources (low instabilityHint) and widens it on messy sources", () => {
     const frameDb: number[] = [];
