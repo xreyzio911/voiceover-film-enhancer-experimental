@@ -131,6 +131,38 @@
   font-size: 0.9rem;
 }
 
+.reviewModelPanel {
+  margin-top: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(12, 14, 18, 0.6);
+  padding: 12px;
+}
+
+.reviewModelHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.reviewModelBadge {
+  font-size: 0.75rem;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(110, 214, 198, 0.35);
+  background: rgba(110, 214, 198, 0.12);
+}
+
+.reviewModelMeta {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
 .progress {
   font-family: var(--font-mono), ui-monospace, monospace;
   font-size: 0.9rem;

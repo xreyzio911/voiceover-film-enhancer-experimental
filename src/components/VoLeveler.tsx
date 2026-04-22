@@ -13,6 +13,7 @@ import {
 } from "../lib/gainPlanner";
 import {
   buildRenderRiskProfile,
+  compareCandidateScores,
   isHealthySegmentedRender,
   shouldPreferCandidate,
   type CandidateRenderMeta,
@@ -21,6 +22,23 @@ import {
   type RenderPath,
   type RenderRiskProfile,
 } from "../lib/renderRecovery";
+import {
+  DEFAULT_LEARNED_REVIEW_WEIGHTS,
+  REVIEW_BUNDLE_SCHEMA_VERSION,
+  REVIEW_WEIGHT_STORAGE_KEY,
+  buildReviewMetricDelta,
+  estimateAlignmentMetrics,
+  interleavedToMono,
+  parseLearnedReviewWeights,
+  scoreCandidateWithLearnedWeights,
+  toReviewMetricSnapshot,
+  type AlignmentMetrics,
+  type CandidateRankingBreakdown,
+  type LearnedReviewWeights,
+  type ReviewBundleManifest,
+  type ReviewMetricDelta,
+  type ReviewMetricSnapshot,
+} from "../lib/reviewLearning";
 import {
   computeLogBandSpectrumDb,
   computeSibilanceScore,
@@ -201,6 +219,24 @@ type OutputEntry = {
   size: number;
   kind: "mixready" | "loudness";
   variant: "clean" | "blend";
+};
+
+type ReviewBundleAsset = {
+  path: string;
+  blob: Blob;
+};
+
+type ReviewBundleEntry = {
+  bundleId: string;
+  manifest: ReviewBundleManifest;
+  assets: ReviewBundleAsset[];
+};
+
+type DecodedMonoAudio = {
+  sampleRate: number;
+  channels: number;
+  durationSec: number;
+  monoSamples: Float32Array;
 };
 
 type FfmpegAssetUrls = {
@@ -436,10 +472,17 @@ export default function VoLeveler() {
   const [loading, setLoading] = useState(false);
   const [zipBusy, setZipBusy] = useState(false);
   const [zipProgress, setZipProgress] = useState(0);
+  const [reviewZipBusy, setReviewZipBusy] = useState(false);
+  const [reviewZipProgress, setReviewZipProgress] = useState(0);
   const [dragActive, setDragActive] = useState(false);
   const [failedOptimizations, setFailedOptimizations] = useState<FailedOptimization[]>([]);
   const [showFailureWarning, setShowFailureWarning] = useState(false);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
+  const [reviewBundles, setReviewBundles] = useState<ReviewBundleEntry[]>([]);
+  const [learnedReviewWeights, setLearnedReviewWeights] =
+    useState<LearnedReviewWeights>(DEFAULT_LEARNED_REVIEW_WEIGHTS);
+  const [learnedReviewWeightsSource, setLearnedReviewWeightsSource] =
+    useState<"default" | "local-import">("default");
 
   const [loudnessTarget, setLoudnessTarget] = useState<keyof typeof LOUDNESS_PRESETS>(
     "ATSC A/85 (-24 LKFS, -2 dBTP)"
@@ -481,6 +524,68 @@ export default function VoLeveler() {
     setLogs((prev) => [...prev.slice(-300), message]);
   };
 
+  const loadStoredReviewWeights = () => {
+    if (typeof window === "undefined") return;
+    try {
+      const stored = window.localStorage.getItem(REVIEW_WEIGHT_STORAGE_KEY);
+      if (!stored) {
+        setLearnedReviewWeights(DEFAULT_LEARNED_REVIEW_WEIGHTS);
+        setLearnedReviewWeightsSource("default");
+        return;
+      }
+      const parsed = parseLearnedReviewWeights(JSON.parse(stored));
+      if (!parsed) {
+        window.localStorage.removeItem(REVIEW_WEIGHT_STORAGE_KEY);
+        setLearnedReviewWeights(DEFAULT_LEARNED_REVIEW_WEIGHTS);
+        setLearnedReviewWeightsSource("default");
+        return;
+      }
+      setLearnedReviewWeights(parsed);
+      setLearnedReviewWeightsSource("local-import");
+    } catch {
+      window.localStorage.removeItem(REVIEW_WEIGHT_STORAGE_KEY);
+      setLearnedReviewWeights(DEFAULT_LEARNED_REVIEW_WEIGHTS);
+      setLearnedReviewWeightsSource("default");
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const stored = window.localStorage.getItem(REVIEW_WEIGHT_STORAGE_KEY);
+      if (!stored) return;
+      const parsed = parseLearnedReviewWeights(JSON.parse(stored));
+      if (!parsed) {
+        window.localStorage.removeItem(REVIEW_WEIGHT_STORAGE_KEY);
+        return;
+      }
+      setLearnedReviewWeights(parsed);
+      setLearnedReviewWeightsSource("local-import");
+      setLogs((prev) => [
+        ...prev.slice(-300),
+        `[ReviewModel] Loaded local review weights: ${parsed.modelName}.`,
+      ]);
+    } catch {
+      window.localStorage.removeItem(REVIEW_WEIGHT_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== REVIEW_WEIGHT_STORAGE_KEY) return;
+      loadStoredReviewWeights();
+      setLogs((prev) => [
+        ...prev.slice(-300),
+        event.newValue
+          ? "[ReviewModel] Local review weights updated from another tab."
+          : "[ReviewModel] Local review weights reset to built-in default.",
+      ]);
+    };
+    window.addEventListener("storage", handleStorage);
+    return () => window.removeEventListener("storage", handleStorage);
+  }, []);
+
   const initializeQueueItems = (jobs: JobEntry[]) => {
     const now = Date.now();
     setQueueItems(
@@ -508,6 +613,43 @@ export default function VoLeveler() {
     setQueueItems((prev) =>
       prev.map((item) => (item.base === base ? { ...item, ...patch, updatedAtMs: now } : item))
     );
+  };
+
+  const applyReviewWeights = (
+    weights: LearnedReviewWeights,
+    source: "default" | "local-import",
+    shouldPersist: boolean,
+  ) => {
+    setLearnedReviewWeights(weights);
+    setLearnedReviewWeightsSource(source);
+    if (typeof window === "undefined") return;
+    if (shouldPersist) {
+      window.localStorage.setItem(REVIEW_WEIGHT_STORAGE_KEY, JSON.stringify(weights));
+    } else {
+      window.localStorage.removeItem(REVIEW_WEIGHT_STORAGE_KEY);
+    }
+  };
+
+  const resetReviewWeights = () => {
+    applyReviewWeights(DEFAULT_LEARNED_REVIEW_WEIGHTS, "default", false);
+    appendLog("[ReviewModel] Reverted to built-in review weights.");
+  };
+
+  const importReviewWeights = async (file: File | null) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = parseLearnedReviewWeights(JSON.parse(text));
+      if (!parsed) {
+        throw new Error("Unrecognized review-weights.json file.");
+      }
+      applyReviewWeights(parsed, "local-import", true);
+      appendLog(`[ReviewModel] Imported review weights: ${parsed.modelName}.`);
+    } catch (error) {
+      appendLog(
+        `[ReviewModel] Import failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   };
 
   const setActiveQueueStage = (base: string, stageLabel: string, detail?: string | null) => {
@@ -796,6 +938,42 @@ const summarizeFailureReason = (error: unknown) => {
     }
     const aligned = bytes.slice(0, usableLength);
     return new Float32Array(aligned.buffer, aligned.byteOffset, usableLength / 4);
+  };
+
+  const decodeWavToMono = (bytes: Uint8Array): DecodedMonoAudio => {
+    const decoded = decodeWav(bytes);
+    const frameCount = Math.floor(decoded.samples.length / Math.max(decoded.channels, 1));
+    return {
+      sampleRate: decoded.sampleRate,
+      channels: decoded.channels,
+      durationSec: decoded.sampleRate > 0 ? frameCount / decoded.sampleRate : 0,
+      monoSamples: interleavedToMono(decoded.samples, decoded.channels),
+    };
+  };
+
+  const buildFallbackAlignmentMetrics = (
+    sourceAudio: DecodedMonoAudio | null,
+    candidateAudio: DecodedMonoAudio | null,
+  ): AlignmentMetrics => {
+    const durationSourceSec = sourceAudio?.durationSec ?? 0;
+    const durationCandidateSec = candidateAudio?.durationSec ?? durationSourceSec;
+    const durationDeltaSec = durationCandidateSec - durationSourceSec;
+    return {
+      durationSourceSec,
+      durationCandidateSec,
+      durationDeltaSec,
+      durationDeltaPct: durationSourceSec > 1e-6 ? (durationDeltaSec / durationSourceSec) * 100 : 0,
+      estimatedOffsetSec: 0,
+      confidence: 0,
+    };
+  };
+
+  const reviewBlobFromBytes = (bytes: Uint8Array) => {
+    const buffer = new ArrayBuffer(bytes.byteLength);
+    new Uint8Array(buffer).set(bytes);
+    return new Blob([buffer], {
+      type: "audio/wav",
+    });
   };
 
   /**
@@ -3776,6 +3954,21 @@ const summarizeFailureReason = (error: unknown) => {
 
   type CandidateVariant = NonNullable<MixRenderOptions["candidateVariant"]>;
 
+  type CandidateReviewArtifact = {
+    variant: CandidateVariant;
+    label: string;
+    bytes: Uint8Array;
+    analysis: FileAnalysis | null;
+    meta: CandidateRenderMeta;
+    baselineScore: CandidateScore;
+    scoredScore: CandidateScore;
+    qcSnapshot: ReviewMetricSnapshot | null;
+    qcDelta: ReviewMetricDelta | null;
+    alignment: AlignmentMetrics;
+    ranking: CandidateRankingBreakdown;
+    selectionReason: string | null;
+  };
+
   type RenderAttemptResult = {
     ffmpeg: FFmpeg;
     meta: CandidateRenderMeta;
@@ -3857,7 +4050,11 @@ const summarizeFailureReason = (error: unknown) => {
   const summarizeCandidateScore = (score: CandidateScore) =>
     `stability ${(score.stability * 100).toFixed(0)} / pause ${(score.pause * 100).toFixed(0)} / compression ${(
       score.compression * 100
-    ).toFixed(0)} / echo ${(score.echo * 100).toFixed(0)}`;
+    ).toFixed(0)} / echo ${(score.echo * 100).toFixed(0)}${
+      typeof score.rankingScore === "number" && Number.isFinite(score.rankingScore)
+        ? ` / rank ${score.rankingScore.toFixed(1)}`
+        : ""
+    }${score.gateReasons && score.gateReasons.length > 0 ? ` / gates ${score.gateReasons.join("+")}` : ""}`;
 
   const countUsableSpeechPauseBoundaries = (silenceSpans: SilenceSpan[]) => {
     let usableCount = 0;
@@ -4324,6 +4521,7 @@ const summarizeFailureReason = (error: unknown) => {
     if (!files.length) return;
     setLoading(true);
     setOutputs([]);
+    setReviewBundles([]);
     setLogs([]);
     setFailedOptimizations([]);
     setShowFailureWarning(false);
@@ -4332,6 +4530,7 @@ const summarizeFailureReason = (error: unknown) => {
     try {
       let ffmpeg = await ensureFfmpeg();
       const outputEntries: OutputEntry[] = [];
+      const nextReviewBundles: ReviewBundleEntry[] = [];
       const jobs = buildJobs(files);
       initializeQueueItems(jobs);
       const analysisByBase = new Map<string, FileAnalysis>();
@@ -4478,6 +4677,18 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
+          const sourceQcSnapshot = toReviewMetricSnapshot(analysisByBase.get(job.base));
+          let sourceDecodedForReview: DecodedMonoAudio | null = null;
+          try {
+            sourceDecodedForReview = decodeWavToMono(new Uint8Array(await job.file.arrayBuffer()));
+          } catch (error) {
+            appendLog(
+              `[ReviewBundle] ${job.base}: source decode fallback (${
+                error instanceof Error ? error.message : String(error)
+              }).`
+            );
+          }
+
           const fileDurationForVariants = speechRenderPlan?.durationSeconds ?? null;
           const candidateVariants = buildMixCandidateVariants(profile, fileDurationForVariants);
           const isLongFile =
@@ -4496,6 +4707,7 @@ const summarizeFailureReason = (error: unknown) => {
           let attemptedCandidates = 0;
           let degradedCandidates = 0;
           let healthySegmentedCandidates = 0;
+          const candidateArtifacts: CandidateReviewArtifact[] = [];
 
           for (let variantIndex = 0; variantIndex < candidateVariants.length; variantIndex += 1) {
             const candidateVariant = candidateVariants[variantIndex];
@@ -4573,7 +4785,56 @@ const summarizeFailureReason = (error: unknown) => {
                 }
               }
 
-              const candidateScore = buildCandidateScore(candidateAnalysis);
+              const candidateBaselineScore = buildCandidateScore(candidateAnalysis);
+              const candidateQcSnapshot = toReviewMetricSnapshot(candidateAnalysis);
+              let candidateDecodedForReview: DecodedMonoAudio | null = null;
+              try {
+                candidateDecodedForReview = decodeWavToMono(candidateBytes);
+              } catch (error) {
+                appendLog(
+                  `[CandidateQC] ${job.base}/${candidateLabel}: alignment fallback (${
+                    error instanceof Error ? error.message : String(error)
+                  }).`
+                );
+              }
+              const alignment = sourceDecodedForReview && candidateDecodedForReview
+                ? estimateAlignmentMetrics(
+                    sourceDecodedForReview.monoSamples,
+                    sourceDecodedForReview.sampleRate,
+                    candidateDecodedForReview.monoSamples,
+                    candidateDecodedForReview.sampleRate,
+                  )
+                : buildFallbackAlignmentMetrics(sourceDecodedForReview, candidateDecodedForReview);
+              const ranking = scoreCandidateWithLearnedWeights({
+                baselineScore: candidateBaselineScore,
+                candidateQc: candidateQcSnapshot,
+                sourceQc: sourceQcSnapshot,
+                alignment,
+                meta: candidateMeta,
+                weights: learnedReviewWeights,
+              });
+              const candidateQcDelta = buildReviewMetricDelta(sourceQcSnapshot, candidateQcSnapshot);
+              const candidateScore: CandidateScore = {
+                ...candidateBaselineScore,
+                hardGatePenalty: ranking.hardGatePenalty,
+                learnedAdjustment: ranking.learnedAdjustment,
+                rankingScore: ranking.rankingScore,
+                gateReasons: ranking.gateReasons,
+              };
+              candidateArtifacts.push({
+                variant: candidateVariant,
+                label: candidateLabel,
+                bytes: candidateBytes.slice(),
+                analysis: candidateAnalysis,
+                meta: candidateMeta,
+                baselineScore: candidateBaselineScore,
+                scoredScore: candidateScore,
+                qcSnapshot: candidateQcSnapshot,
+                qcDelta: candidateQcDelta,
+                alignment,
+                ranking,
+                selectionReason: null,
+              });
               appendLog(
                 `[CandidateQC] ${job.base}/${candidateLabel}: ${summarizeCandidateScore(candidateScore)}, ${summarizeCandidateMeta(
                   candidateMeta
@@ -4613,6 +4874,16 @@ const summarizeFailureReason = (error: unknown) => {
             throw new Error("No candidate mix-ready render completed.");
           }
 
+          const selectedArtifact =
+            candidateArtifacts.find((artifact) => artifact.variant === selectedVariant) ?? null;
+          if (selectedArtifact) {
+            selectedArtifact.selectionReason = selectedReason;
+          }
+          const challengerArtifact =
+            [...candidateArtifacts]
+              .filter((artifact) => artifact.variant !== selectedVariant)
+              .sort((left, right) => compareCandidateScores(left.scoredScore, right.scoredScore))[0] ?? null;
+
           await ffmpeg.writeFile(job.mixName, selectedBytes);
           appendLog(
             `[CandidateSelect] ${job.base}: kept ${formatCandidateVariant(selectedVariant)} via ${summarizeCandidateMeta(
@@ -4643,6 +4914,82 @@ const summarizeFailureReason = (error: unknown) => {
                     : "best-effort winner"
             }.`
           );
+          if (selectedArtifact) {
+            const bundleId = `${job.base}_review_${String(i + 1).padStart(3, "0")}`;
+            const sourceDurationSec =
+              sourceDecodedForReview?.durationSec ?? speechRenderPlan?.durationSeconds ?? 0;
+            const sourceSampleRate = sourceDecodedForReview?.sampleRate ?? 0;
+            const selectedVariantLabel = formatCandidateVariant(selectedVariant);
+            const selectedReasonText = selectedReason ?? "first completed candidate";
+            const reviewCandidates: Array<{
+              role: "winner" | "challenger";
+              assetName: string;
+              artifact: CandidateReviewArtifact;
+            }> = [{ role: "winner", assetName: "winner.wav", artifact: selectedArtifact }];
+            if (challengerArtifact) {
+              reviewCandidates.push({
+                role: "challenger",
+                assetName: "challenger.wav",
+                artifact: challengerArtifact,
+              });
+            }
+            const manifest: ReviewBundleManifest = {
+              schemaVersion: REVIEW_BUNDLE_SCHEMA_VERSION,
+              bundleId,
+              createdAt: new Date().toISOString(),
+              source: {
+                fileName: job.file.name,
+                audioFile: "source.wav",
+                durationSec: sourceDurationSec,
+                sampleRate: sourceSampleRate,
+                qc: sourceQcSnapshot,
+              },
+              decisionContext: {
+                jobBase: job.base,
+                loudnessTarget,
+                selectedVariant: selectedVariantLabel,
+                selectedReason: selectedReasonText,
+                learnedWeightsName: learnedReviewWeights.modelName,
+                learnedWeightsSource: learnedReviewWeightsSource,
+                reviewModelType: learnedReviewWeights.modelType,
+              },
+              candidates: reviewCandidates.map(({ role, assetName, artifact }) => ({
+                role,
+                audioFile: assetName,
+                variantLabel: artifact.label,
+                renderMeta: artifact.meta,
+                baselineScore: artifact.baselineScore,
+                ranking: artifact.ranking,
+                qc: artifact.qcSnapshot,
+                sourceComparison: {
+                  alignment: artifact.alignment,
+                  qcDelta: artifact.qcDelta,
+                },
+                selectionReason: artifact.selectionReason,
+              })),
+            };
+            nextReviewBundles.push({
+              bundleId,
+              manifest,
+              assets: [
+                { path: "source.wav", blob: job.file },
+                { path: "winner.wav", blob: reviewBlobFromBytes(selectedArtifact.bytes) },
+                ...(challengerArtifact
+                  ? [
+                      {
+                        path: "challenger.wav",
+                        blob: reviewBlobFromBytes(challengerArtifact.bytes),
+                      },
+                    ]
+                  : []),
+              ],
+            });
+            appendLog(
+              `[ReviewBundle] ${job.base}: captured ${selectedVariantLabel} winner${
+                challengerArtifact ? ` vs ${challengerArtifact.label}` : ""
+              } for QC Lab review.`
+            );
+          }
 
           const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean");
           if (keepMixReady || loudnessConfig === null) {
@@ -4722,6 +5069,7 @@ const summarizeFailureReason = (error: unknown) => {
       }
 
       setOutputs(outputEntries);
+      setReviewBundles(nextReviewBundles);
       if (failedRuns.length > 0) {
         setFailedOptimizations(failedRuns);
         setShowFailureWarning(true);
@@ -4822,6 +5170,50 @@ const summarizeFailureReason = (error: unknown) => {
     } finally {
       setZipBusy(false);
       setZipProgress(0);
+    }
+  };
+
+  const downloadReviewBundlesZip = async () => {
+    if (reviewBundles.length === 0 || reviewZipBusy) return;
+
+    setReviewZipBusy(true);
+    setReviewZipProgress(0);
+
+    try {
+      const zip = new JSZip();
+
+      for (let index = 0; index < reviewBundles.length; index += 1) {
+        const bundle = reviewBundles[index];
+        const folder = zip.folder(bundle.bundleId) ?? zip;
+        folder.file("manifest.json", JSON.stringify(bundle.manifest, null, 2));
+        for (const asset of bundle.assets) {
+          folder.file(asset.path, asset.blob);
+        }
+        setReviewZipProgress(Math.round(((index + 1) / reviewBundles.length) * 70));
+      }
+
+      const zipBlob = await zip.generateAsync(
+        {
+          type: "blob",
+          compression: "DEFLATE",
+          compressionOptions: { level: 6 },
+        },
+        ({ percent }) => {
+          setReviewZipProgress(70 + Math.round((percent / 100) * 30));
+        },
+      );
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const archiveName = `vo_leveler_review_bundles_${stamp}.zip`;
+      triggerDownload(zipBlob, archiveName);
+      appendLog(`Review bundle ZIP created: ${archiveName} (${formatBytes(zipBlob.size)})`);
+    } catch (error) {
+      appendLog(
+        `Review bundle export failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setReviewZipBusy(false);
+      setReviewZipProgress(0);
     }
   };
 
@@ -5097,6 +5489,46 @@ const summarizeFailureReason = (error: unknown) => {
                   onChange={(event) => setFloorGuard(event.target.checked)}
                 />
               </div>
+              <div className={styles.reviewModelPanel}>
+                <div className={styles.reviewModelHeader}>
+                  <div>
+                    <strong>Review reranker</strong>
+                    <div className={styles.label}>
+                      Hard gates stay deterministic. The learned layer only reranks valid candidates.
+                    </div>
+                  </div>
+                  <span className={styles.reviewModelBadge}>
+                    {learnedReviewWeightsSource === "local-import" ? "Local import" : "Built-in default"}
+                  </span>
+                </div>
+                <div className={styles.reviewModelMeta}>
+                  <span>{learnedReviewWeights.modelName}</span>
+                  <span>{learnedReviewWeights.modelType}</span>
+                </div>
+                <div className={`${styles.controls} ${styles.sectionTop}`}>
+                  <label className={`${styles.button} ${styles.buttonSecondary}`}>
+                    Import weights
+                    <input
+                      type="file"
+                      accept=".json,application/json"
+                      hidden
+                      onChange={async (event) => {
+                        const file = event.target.files?.[0] ?? null;
+                        await importReviewWeights(file);
+                        event.currentTarget.value = "";
+                      }}
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className={`${styles.button} ${styles.buttonGhost}`}
+                    onClick={resetReviewWeights}
+                    disabled={learnedReviewWeightsSource === "default"}
+                  >
+                    Reset to default
+                  </button>
+                </div>
+              </div>
             </>
           )}
 
@@ -5109,6 +5541,9 @@ const summarizeFailureReason = (error: unknown) => {
               onClick={() => {
                 setFiles([]);
                 setOutputs([]);
+                setReviewBundles([]);
+                setZipProgress(0);
+                setReviewZipProgress(0);
                 setLogs([]);
                 setFailedOptimizations([]);
                 setShowFailureWarning(false);
@@ -5235,15 +5670,28 @@ const summarizeFailureReason = (error: unknown) => {
       <div className={styles.panel}>
         <div className={styles.card}>
           <h3>Outputs</h3>
-          {outputs.length > 0 && (
+          {(outputs.length > 0 || reviewBundles.length > 0) && (
             <div className={`${styles.controls} ${styles.sectionTop}`}>
-              <button
-                className={`${styles.button} ${styles.buttonSecondary}`}
-                onClick={downloadOutputsZip}
-                disabled={zipBusy}
-              >
-                {zipBusy ? `Building ZIP ${zipProgress}%` : `Download ZIP (${outputs.length})`}
-              </button>
+              {outputs.length > 0 && (
+                <button
+                  className={`${styles.button} ${styles.buttonSecondary}`}
+                  onClick={downloadOutputsZip}
+                  disabled={zipBusy}
+                >
+                  {zipBusy ? `Building ZIP ${zipProgress}%` : `Download ZIP (${outputs.length})`}
+                </button>
+              )}
+              {reviewBundles.length > 0 && (
+                <button
+                  className={`${styles.button} ${styles.buttonGhost}`}
+                  onClick={downloadReviewBundlesZip}
+                  disabled={reviewZipBusy}
+                >
+                  {reviewZipBusy
+                    ? `Building Review ZIP ${reviewZipProgress}%`
+                    : `Export Review Bundles (${reviewBundles.length})`}
+                </button>
+              )}
             </div>
           )}
           <div className={`${styles.outputList} ${styles.sectionTop}`}>

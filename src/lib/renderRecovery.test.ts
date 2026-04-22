@@ -116,3 +116,26 @@ test("raw score deltas still choose a winner when rounded summaries look tied", 
   assert.equal(decision.select, true);
   assert.equal(decision.reason, "winner by raw stability delta");
 });
+
+test("rankingScore overrides raw totals when learned reranking is available", () => {
+  const currentScore = buildScore({
+    stability: 0.8404,
+    pause: 0.3104,
+    compression: 0.2004,
+    echo: 0.6404,
+    rankingScore: 320.4,
+  });
+  const challengerScore = buildScore({
+    stability: 0.8404,
+    pause: 0.3104,
+    compression: 0.2004,
+    echo: 0.6404,
+    rankingScore: 210.2,
+  });
+
+  const decision = shouldPreferCandidate(challengerScore, buildMeta(), currentScore, buildMeta());
+
+  assert.equal(compareCandidateScores(challengerScore, currentScore) < 0, true);
+  assert.equal(decision.select, true);
+  assert.equal(decision.reason, "winner by learned ranking");
+});

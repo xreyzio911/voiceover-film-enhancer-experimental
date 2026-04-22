@@ -17,6 +17,35 @@
   box-shadow: var(--shadow);
 }
 
+.card h3 {
+  margin: 0;
+}
+
+.modeSwitch {
+  display: inline-flex;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--stroke);
+}
+
+.modeButton {
+  border-radius: 999px;
+  padding: 9px 14px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.modeButtonActive {
+  background: rgba(110, 214, 198, 0.14);
+  border-color: rgba(110, 214, 198, 0.38);
+  color: var(--text);
+}
+
 .dropzone {
   border: 1.5px dashed rgba(255, 255, 255, 0.2);
   border-radius: 16px;
@@ -77,7 +106,10 @@
 
 .button:disabled,
 .buttonSecondary:disabled,
-.buttonGhost:disabled {
+.buttonGhost:disabled,
+.modeButton:disabled,
+.choiceButton:disabled,
+.tagButton:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
@@ -136,7 +168,7 @@
   color: var(--muted);
   margin-top: 12px;
   font-size: 0.86rem;
-  line-height: 1.4;
+  line-height: 1.45;
 }
 
 .emptyState {
@@ -151,7 +183,8 @@
   gap: 12px;
 }
 
-.reportItem {
+.reportItem,
+.reviewBundleCard {
   border-radius: 14px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(12, 14, 18, 0.6);
@@ -196,7 +229,8 @@
   border-color: rgba(255, 107, 107, 0.5);
 }
 
-.metricGrid {
+.metricGrid,
+.reviewMetaGrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
   gap: 8px;
@@ -242,6 +276,32 @@
   line-height: 1.35;
 }
 
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.label {
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.select,
+.textarea {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  color: var(--text);
+  padding: 10px 12px;
+  font: inherit;
+}
+
+.textarea {
+  min-height: 90px;
+  resize: vertical;
+}
+
 .errorText {
   color: #ff9a9a;
   font-size: 0.85rem;
@@ -255,9 +315,151 @@
   font-size: 0.86rem;
 }
 
+.reviewAudioGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.audioCard,
+.reviewCandidateCard {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.audioPlayer {
+  width: 100%;
+}
+
+.reviewCandidateGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.reviewCandidateHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.reviewDecisionGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.autoReviewPanel {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 12px;
+  display: grid;
+  gap: 10px;
+}
+
+.autoReviewHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.autoReviewGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.autoReviewCard {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(9, 11, 15, 0.55);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.findingList {
+  display: grid;
+  gap: 8px;
+}
+
+.findingItem {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.findingBadge {
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  line-height: 1;
+  border: 1px solid var(--stroke);
+}
+
+.findingPass {
+  background: rgba(110, 214, 198, 0.12);
+  border-color: rgba(110, 214, 198, 0.4);
+}
+
+.findingWarn {
+  background: rgba(245, 199, 90, 0.14);
+  border-color: rgba(245, 199, 90, 0.42);
+}
+
+.findingFail {
+  background: rgba(255, 107, 107, 0.14);
+  border-color: rgba(255, 107, 107, 0.46);
+}
+
+.choiceRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.choiceButton,
+.tagButton {
+  border-radius: 999px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+}
+
+.choiceButtonActive,
+.tagButtonActive {
+  background: rgba(110, 214, 198, 0.16);
+  border-color: rgba(110, 214, 198, 0.42);
+}
+
+.tagGrid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.reviewFootnote {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
 @media (max-width: 900px) {
   .panel {
     grid-template-columns: 1fr;
   }
-}
 
+  .reviewDecisionGrid {
+    grid-template-columns: 1fr;
+  }
+}

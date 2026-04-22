@@ -19,6 +19,10 @@ export type CandidateScore = {
   compression: number;
   echo: number;
   total: number;
+  hardGatePenalty?: number;
+  learnedAdjustment?: number;
+  rankingScore?: number;
+  gateReasons?: string[];
 };
 
 export type CandidateRenderMeta = {
@@ -112,6 +116,15 @@ export const buildRenderRiskProfile = (input: RenderRiskInput): RenderRiskProfil
 };
 
 export const compareCandidateScores = (left: CandidateScore, right: CandidateScore) => {
+  if (
+    typeof left.rankingScore === "number" &&
+    Number.isFinite(left.rankingScore) &&
+    typeof right.rankingScore === "number" &&
+    Number.isFinite(right.rankingScore) &&
+    left.rankingScore !== right.rankingScore
+  ) {
+    return left.rankingScore - right.rankingScore;
+  }
   if (left.stability !== right.stability) return left.stability - right.stability;
   if (left.pause !== right.pause) return left.pause - right.pause;
   if (left.compression !== right.compression) return left.compression - right.compression;
@@ -120,6 +133,13 @@ export const compareCandidateScores = (left: CandidateScore, right: CandidateSco
 };
 
 export const explainCandidateDelta = (winner: CandidateScore, loser: CandidateScore) => {
+  if (
+    typeof winner.rankingScore === "number" &&
+    typeof loser.rankingScore === "number" &&
+    winner.rankingScore !== loser.rankingScore
+  ) {
+    return "winner by learned ranking";
+  }
   if (winner.stability !== loser.stability) return "winner by raw stability delta";
   if (winner.pause !== loser.pause) return "winner by raw pause delta";
   if (winner.compression !== loser.compression) return "winner by raw compression delta";
