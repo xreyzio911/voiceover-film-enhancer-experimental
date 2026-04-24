@@ -177,12 +177,23 @@ export type LearnedReviewWeights = {
     minOffsetConfidence: number;
     maxPeakDb: number;
     maxEndFadeRisk: number;
+    maxOverallRiskDelta: number;
+    maxInstabilityDelta: number;
+    maxSentenceJumpDelta: number;
+    maxPauseNoiseRiskDelta: number;
+    maxCompressionDelta: number;
+    maxEchoDelta: number;
+    maxClickDelta: number;
+    maxSibilanceDelta: number;
+    maxPauseNoiseFloorLiftDb: number;
+    maxNoiseContrastLossDb: number;
   };
   penaltyWeights: {
     durationMismatch: number;
     offsetMismatch: number;
     peakViolation: number;
     endingDamage: number;
+    sourceRegression: number;
   };
   featureWeights: ReviewFeatureMap;
 };
@@ -518,6 +529,22 @@ export const scoreCandidateWithLearnedWeights = (input: {
   if (endingOver > 0) {
     hardGatePenalty += endingOver * weights.penaltyWeights.endingDamage;
     gateReasons.push("ending-damage");
+  }
+
+  const sourceRegression =
+    Math.max(0, safeNumber(qcDelta?.overallRisk) - weights.gateThresholds.maxOverallRiskDelta) / 0.08 +
+    Math.max(0, safeNumber(qcDelta?.instabilityScore) - weights.gateThresholds.maxInstabilityDelta) / 0.06 +
+    Math.max(0, safeNumber(qcDelta?.sentenceJumpScore) - weights.gateThresholds.maxSentenceJumpDelta) / 0.05 +
+    Math.max(0, safeNumber(qcDelta?.pauseNoiseRisk) - weights.gateThresholds.maxPauseNoiseRiskDelta) / 0.05 +
+    Math.max(0, safeNumber(qcDelta?.compressionScore) - weights.gateThresholds.maxCompressionDelta) / 0.06 +
+    Math.max(0, safeNumber(qcDelta?.echoScore) - weights.gateThresholds.maxEchoDelta) / 0.05 +
+    Math.max(0, safeNumber(qcDelta?.clickScore) - weights.gateThresholds.maxClickDelta) / 0.05 +
+    Math.max(0, safeNumber(qcDelta?.sibilanceScore) - weights.gateThresholds.maxSibilanceDelta) / 0.05 +
+    Math.max(0, safeNumber(qcDelta?.pauseNoiseFloorDb) - weights.gateThresholds.maxPauseNoiseFloorLiftDb) / 1.0 +
+    Math.max(0, -safeNumber(qcDelta?.noiseContrastDb) - weights.gateThresholds.maxNoiseContrastLossDb) / 2.0;
+  if (sourceRegression > 0) {
+    hardGatePenalty += sourceRegression * weights.penaltyWeights.sourceRegression;
+    gateReasons.push("source-regression");
   }
 
   let learnedAdjustment = weights.intercept;

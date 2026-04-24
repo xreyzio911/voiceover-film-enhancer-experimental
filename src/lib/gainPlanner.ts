@@ -33,6 +33,11 @@ export type GainPlannerInput = {
   frameMs?: number;
   /** Target integrated RMS dB for speech runs. Defaults to -22 dBFS RMS (maps roughly to -24 LKFS). */
   targetDb?: number;
+  /**
+   * How much the planner may follow the source's typical speech RMS when
+   * choosing its target. 0 = fixed house target, 1 = source target.
+   */
+  sourceTargetBlend?: number;
   /** Max gain applied to a single run, in dB. Defaults to +14. */
   maxGainDb?: number;
   /** Max attenuation applied to a single run, in dB. Defaults to -14. */
@@ -111,6 +116,7 @@ const rmsDbOfSlice = (frameDb: number[], start: number, end: number): number => 
 export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const frameMs = input.frameMs ?? 10;
   const targetDbBase = input.targetDb ?? -22;
+  const sourceTargetBlend = clamp(input.sourceTargetBlend ?? 0.15, 0, 1);
   const maxGainDb = input.maxGainDb ?? 14;
   const minGainDb = input.minGainDb ?? -14;
   // -4 dBFS ceiling gives the downstream `alimiter=limit=-2dB` genuine
@@ -172,7 +178,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
   }
 
-  for (const run of input.speechRuns) {
+  for (let runIndex = 0; runIndex < input.speechRuns.length; runIndex += 1) {
+    const run = input.speechRuns[runIndex];
     const runFrames = run.endFrame - run.startFrame;
     if (runFrames < 6) continue;
     const trim = Math.max(2, Math.floor(runFrames * 0.12));
@@ -196,9 +203,23 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
     const crestDb = peakDb - meanDb;
     const runLenMs = runFrames * frameMs;
+    const previousEndFrame = runIndex > 0 ? input.speechRuns[runIndex - 1].endFrame : 0;
+    const nextStartFrame =
+      runIndex + 1 < input.speechRuns.length ? input.speechRuns[runIndex + 1].startFrame : frameCount;
+    const preGapMs = Math.max(0, run.startFrame - previousEndFrame) * frameMs;
+    const postGapMs = Math.max(0, nextStartFrame - run.endFrame) * frameMs;
+    const isolatedOrLeadIn = preGapMs >= 70 || postGapMs >= 70;
+    const shortHotPerformance =
+      runLenMs < 650 &&
+      isolatedOrLeadIn &&
+      (crestDb >= 13.5 ||
+        peakDb >= targetDbBase + 10.5 ||
+        (runLenMs < 360 && peakDb >= targetDbBase + 8 && meanDb <= targetDbBase + 1.5));
 
     let runClass: SpeechRunClass;
-    if (runLenMs < 100) {
+    if (shortHotPerformance) {
+      runClass = "transient-breath";
+    } else if (runLenMs < 100) {
       runClass = "edge-fragment";
     } else if (runLenMs < 400 && crestDb >= 15) {
       runClass = "transient-breath";
@@ -234,7 +255,11 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       sorted.length >= 7 ? Math.max(1, Math.floor(sorted.length * 0.15)) : 0;
     const trimmed = sorted.slice(trimCount, Math.max(trimCount + 1, sorted.length - trimCount));
     const trimmedMean = trimmed.reduce((sum, v) => sum + v, 0) / trimmed.length;
-    targetDb = clamp(0.55 * trimmedMean + 0.45 * targetDbBase, targetDbBase - 5, targetDbBase + 5);
+    targetDb = clamp(
+      sourceTargetBlend * trimmedMean + (1 - sourceTargetBlend) * targetDbBase,
+      targetDbBase - 3,
+      targetDbBase + 3
+    );
   }
 
   // 3) Per-run planned gain — class-aware.
@@ -246,10 +271,10 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //   quiet gasp can't be lifted to full dialogue level.
   // edge-fragment: target batch level with tight ±4 dB clamp (not enough
   //   body to plan on, but still contribute to continuity).
-  const breathTargetDb = targetDb - 2.5;
+  const breathTargetDb = targetDb - 3.2;
   const plannedRunGainDb: number[] = runMeta.map((m) => {
     if (m.runClass === "transient-breath") {
-      return clamp(breathTargetDb - m.meanDb, -6, 6);
+      return clamp(breathTargetDb - m.meanDb, -5, 4);
     }
     if (m.runClass === "edge-fragment") {
       return clamp(targetDb - m.meanDb, -4, 4);
@@ -398,20 +423,32 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   if (framePeakDb) {
     for (let f = 0; f < frameCount; f += 1) {
       const currentGainDb = slewed[f];
+      const runIdx = runIndexByFrame[f];
+      const runMetaForFrame = runIdx >= 0 ? runMeta[runIdx] : null;
+      const isPerformanceTransient = runMetaForFrame?.runClass === "transient-breath";
+      const localPeakCeilingDb = isPerformanceTransient
+        ? Math.min(peakCeilingDb, targetDb + 12.5)
+        : peakCeilingDb;
       const appliedPeakDb = framePeakDb[f] + currentGainDb;
-      if (appliedPeakDb <= peakCeilingDb) continue;
-      const excessDb = appliedPeakDb - peakCeilingDb; // how much over ceiling
+      if (appliedPeakDb <= localPeakCeilingDb) continue;
+      const excessDb = appliedPeakDb - localPeakCeilingDb; // how much over ceiling
       // Apply cosine dip from -peakDipFrames..+peakDipFrames around f.
       for (let k = -peakDipFrames; k <= peakDipFrames; k += 1) {
         const idx = f + k;
         if (idx < 0 || idx >= frameCount) continue;
+        if (
+          isPerformanceTransient &&
+          runMetaForFrame &&
+          (idx < runMetaForFrame.startFrame || idx >= runMetaForFrame.endFrame)
+        ) {
+          continue;
+        }
         // Cosine weight peaks at k=0 (full reduction) and falls to 0 at edges.
         const t = Math.abs(k) / (peakDipFrames + 1);
         const weight = Math.cos((t * Math.PI) / 2) ** 2;
         slewed[idx] -= excessDb * weight;
       }
       // Track for diagnostics: the worst dip applied within each run.
-      const runIdx = runIndexByFrame[f];
       if (runIdx >= 0) {
         peakReductionDbByRun[runIdx] = Math.min(peakReductionDbByRun[runIdx], -excessDb);
       }

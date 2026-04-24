@@ -1099,6 +1099,7 @@ const summarizeFailureReason = (error: unknown) => {
         samples,
         sampleRate: GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
         targetDb: -22,
+        sourceTargetBlend: 0.1,
         peakCeilingDb: -3,
         instabilityHint,
       });
@@ -2075,21 +2076,35 @@ const summarizeFailureReason = (error: unknown) => {
     const highTilts: number[] = [];
     const lras: number[] = [];
     const perBandSamples: number[][] = Array.from({ length: SPECTRUM_BANDS_HZ.length }, () => []);
+    const referenceWeight = (analysis: FileAnalysis) => {
+      const confidence = clamp(analysis.analysisConfidence ?? 0.35, 0, 1);
+      const roomPenalty = clamp((analysis.roomScore ?? 0) * 0.5 + (analysis.echoScore ?? 0) * 0.35, 0, 0.85);
+      const noisePenalty = clamp((analysis.pauseNoiseRisk ?? 0) * 0.45, 0, 0.45);
+      const compressionPenalty = clamp((analysis.compressionScore ?? 0) * 0.35, 0, 0.35);
+      return clamp(confidence - roomPenalty - noisePenalty - compressionPenalty, 0, 1);
+    };
+    const cleanAnchors = analyses.filter((analysis) => referenceWeight(analysis) >= 0.45);
+    const referenceAnalyses = cleanAnchors.length > 0 ? cleanAnchors : analyses;
 
-    for (const analysis of analyses) {
+    for (const analysis of referenceAnalyses) {
+      const weight = referenceWeight(analysis);
+      if (weight < 0.2) continue;
+      const repeats = weight >= 0.75 ? 3 : weight >= 0.45 ? 2 : 1;
       if (analysis.lowRms !== null && analysis.midRms !== null) {
-        lowTilts.push(analysis.lowRms - analysis.midRms);
+        for (let i = 0; i < repeats; i += 1) lowTilts.push(analysis.lowRms - analysis.midRms);
       }
       if (analysis.highRms !== null && analysis.midRms !== null) {
-        highTilts.push(analysis.highRms - analysis.midRms);
+        for (let i = 0; i < repeats; i += 1) highTilts.push(analysis.highRms - analysis.midRms);
       }
       if (analysis.inputLRA !== null) {
-        lras.push(analysis.inputLRA);
+        for (let i = 0; i < repeats; i += 1) lras.push(analysis.inputLRA);
       }
       if (analysis.bandSpectrumDb && analysis.bandSpectrumDb.length === SPECTRUM_BANDS_HZ.length) {
         for (let b = 0; b < SPECTRUM_BANDS_HZ.length; b += 1) {
           const value = analysis.bandSpectrumDb[b];
-          if (Number.isFinite(value)) perBandSamples[b].push(value);
+          if (Number.isFinite(value)) {
+            for (let i = 0; i < repeats; i += 1) perBandSamples[b].push(value);
+          }
         }
       }
     }
@@ -2135,8 +2150,8 @@ const summarizeFailureReason = (error: unknown) => {
     const lowTiltDiff = lowTilt - referenceLowTilt;
     const highTiltDiff = highTilt - referenceHighTilt;
 
-    const toneFactor = smartToneEnabled ? SMART_MATCH_PRESETS.Gentle.tone : 0;
-    const dynamicsFactor = smartDynamicsEnabled ? SMART_MATCH_PRESETS.Gentle.dynamics : 0;
+    const toneFactor = smartToneEnabled ? smartMatchConfig.tone : 0;
+    const dynamicsFactor = smartDynamicsEnabled ? smartMatchConfig.dynamics : 0;
 
     const highpassHz = Math.round(clamp(80 + lowTiltDiff * 2.2 * toneFactor, 65, 105));
     const lowMidGainDb = clamp(-2 - lowTiltDiff * 0.28 * toneFactor, -3.6, 1.2);
@@ -2300,7 +2315,7 @@ const summarizeFailureReason = (error: unknown) => {
       0,
       1,
     );
-    const useDenoise = noiseGuard && denoiseStrength >= 0.2;
+    const useDenoise = noiseGuard && denoiseStrength >= 0.26;
     const tailGateStrength = !useTailGate
       ? 0
       : roomRisk === "high"
@@ -2328,17 +2343,17 @@ const summarizeFailureReason = (error: unknown) => {
     );
 
     const dryness = analysis.drynessScore ?? clamp(1 - confidenceScaledRoom, 0, 1);
-    const blendRiskDamp = roomRisk === "high" ? 0.03 : roomRisk === "medium" ? 0.2 : 1;
+    const blendRiskDamp = roomRisk === "high" ? 0.012 : roomRisk === "medium" ? 0.12 : 1;
     const blendEchoDamp = clamp(1 - echoScore * 0.85, 0.08, 1);
     const blendNoiseDamp = noiseRisk === "high" ? 0.22 : noiseRisk === "medium" ? 0.55 : 1;
     const blendInstabilityDamp = instabilityScore >= 0.7 ? 0.65 : 1;
     const blendConfidenceScale = clamp(0.35 + analysisConfidence * 0.65, 0.35, 1);
-    const blendBase = clamp(0.022 + dryness * 0.022, 0.016, 0.045);
+    const blendBase = clamp(0.018 + dryness * 0.018, 0.012, 0.036);
     let blendAmount = sceneBlend
       ? blendBase * blendRiskDamp * blendConfidenceScale * blendEchoDamp * blendNoiseDamp * blendInstabilityDamp
       : 0;
     if (roomRisk === "high" || echoScore >= 0.72) {
-      blendAmount = Math.min(blendAmount, 0.0018);
+      blendAmount = Math.min(blendAmount, 0.0012);
     }
     const blendIndoorGain = clamp(blendAmount * 0.62, 0, 0.07);
     const blendOutdoorGain = clamp(blendAmount * 0.42, 0, 0.055);
@@ -2489,28 +2504,28 @@ const summarizeFailureReason = (error: unknown) => {
       1,
     );
 
-    // Under ~0.2 the source is already clean; leaving NR off preserves tone.
-    if (needScore < 0.2) return null;
+    // Under ~0.26 the source is already clean; leaving NR off preserves tone.
+    if (needScore < 0.26) return null;
 
     const estimatedFloor = noiseFloorDb ?? (noiseRisk === "high" ? -49 : -55);
     // `nf` anchored a few dB above the measured pause floor so afftdn knows
     // what to treat as noise.
     const nf = clamp(estimatedFloor + 4, -56, -32);
-    // `nr` (reduction dB) scales 6 → 24 dB with needScore.
-    const nr = Math.round(clamp(6 + needScore * 18, 6, 24));
+    // `nr` (reduction dB) is capped conservatively to avoid metallic VO.
+    const nr = Math.round(clamp(5 + needScore * 12, 5, 17));
     // `ad` (adaptive-decay speed) — stronger needs faster tracking.
-    const ad = clamp(0.25 + needScore * 0.4, 0.25, 0.65);
+    const ad = clamp(0.22 + needScore * 0.32, 0.22, 0.54);
     // `gs` (gain shape) — smoother curve on severe noise.
-    const gs = Math.round(clamp(6 + needScore * 8, 6, 14));
+    const gs = Math.round(clamp(6 + needScore * 6, 6, 12));
     const stages: string[] = [`afftdn=nf=${nf.toFixed(1)}:nr=${nr}:tn=1:ad=${ad.toFixed(2)}:gs=${gs}`];
 
     // Severe-noise second pass — non-local means removes broadband hiss that
     // spectral subtraction leaves behind, without the metallic artifacts of
     // aggressive `afftdn`.
     const severeNoise =
-      (pauseNoiseRisk >= 0.55) ||
-      (noiseContrastDb !== null && noiseContrastDb < 14) ||
-      (noiseRisk === "high" && estimatedFloor > -46);
+      pauseNoiseRisk >= 0.68 ||
+      (noiseContrastDb !== null && noiseContrastDb < 11) ||
+      (noiseRisk === "high" && estimatedFloor > -44);
     if (severeNoise) {
       // Short temporal radius (r=0.006 s) keeps consonants sharp.
       stages.push("anlmdn=s=0.0003:p=0.002:r=0.006");
@@ -2532,7 +2547,8 @@ const summarizeFailureReason = (error: unknown) => {
     maxProcessedSpeechSegments?: number;
     mergePauseThresholdSec?: number;
     segmentMode?: "fixed" | "speech-aligned" | "speech-pause";
-    candidateVariant?: "cinematic-stable" | "continuity-safe" | "pause-safe";
+    candidateVariant?: "cinematic-stable" | "continuity-safe" | "pause-safe" | "source-safe";
+    sourceSafeChain?: boolean;
     skipSpeechSegmentation?: boolean;
     forceEndingProtection?: boolean;
     /**
@@ -2550,7 +2566,7 @@ const summarizeFailureReason = (error: unknown) => {
     options?: MixRenderOptions
   ) => {
     if (!noiseGuard || !profile) return null;
-    if (options?.minimalStabilityChain || options?.disableAdaptiveNoiseReduction) return null;
+    if (options?.minimalStabilityChain || options?.sourceSafeChain || options?.disableAdaptiveNoiseReduction) return null;
     return buildAdaptiveNoiseReductionFilter(
       profile.noiseRisk,
       profile.noiseFloorDb,
@@ -2564,13 +2580,14 @@ const summarizeFailureReason = (error: unknown) => {
     const filters: string[] = [];
     const levelerSettings = LEVELER_PRESETS[leveler];
     const consistency = LEVELER_CONSISTENCY[leveler];
-    const dyn = levelerSettings.dyna;
     const minimalStabilityChain = options?.minimalStabilityChain === true;
     const candidateVariant = options?.candidateVariant ?? "cinematic-stable";
     const continuitySafeMode = candidateVariant === "continuity-safe";
     const pauseSafeMode = candidateVariant === "pause-safe";
+    const sourceSafeMode = options?.sourceSafeChain === true || candidateVariant === "source-safe";
+    const dyn = sourceSafeMode ? null : levelerSettings.dyna;
     const gainPlannerActive = options?.gainPlannerActive === true;
-    const roomCleanupEnabled = roomCleanup && !options?.disableRoomCleanup && !minimalStabilityChain;
+    const roomCleanupEnabled = roomCleanup && !options?.disableRoomCleanup && !minimalStabilityChain && !sourceSafeMode;
     const adaptiveNoiseReductionFilter = resolveAdaptiveNoiseReductionFilter(profile, options);
     const useAdaptiveNoiseReduction = adaptiveNoiseReductionFilter !== null;
     const instabilityScore = profile?.instabilityScore ?? 0;
@@ -2587,18 +2604,21 @@ const summarizeFailureReason = (error: unknown) => {
     const pauseNoiseRisk = profile?.pauseNoiseRisk ?? 0;
     const useClickTamer =
       !minimalStabilityChain &&
+      !sourceSafeMode &&
       clickTameStrength >= (continuitySafeMode ? 0.38 : pauseSafeMode ? 0.42 : 0.46);
     const useOnsetTamer =
       !minimalStabilityChain &&
+      !sourceSafeMode &&
       onsetTameStrength >= (continuitySafeMode ? 0.24 : 0.35);
     const useBreathSpikeTamer =
       !minimalStabilityChain &&
+      !sourceSafeMode &&
       breathControl !== "Off" &&
       breathTameStrength >= (continuitySafeMode ? 0.18 : 0.24);
 
     if (eqCleanup) {
       const highpassHz = profile?.highpassHz ?? 80;
-      const lowMidGainDb = profile?.lowMidGainDb ?? -2;
+      const lowMidGainDb = sourceSafeMode ? clamp(profile?.lowMidGainDb ?? -0.8, -1.2, 0) : (profile?.lowMidGainDb ?? -2);
       filters.push(`highpass=f=${highpassHz}`);
       filters.push(`equalizer=f=250:width_type=q:width=1.0:g=${lowMidGainDb.toFixed(2)}`);
       if (useAdaptiveNoiseReduction && adaptiveNoiseReductionFilter) {
@@ -2634,7 +2654,7 @@ const summarizeFailureReason = (error: unknown) => {
       !minimalStabilityChain &&
       roomCleanupEnabled &&
       !(profile?.strictEndingProtection && inEchoScore >= 0.75) &&
-      (inEchoScore >= 0.32 || roomRiskIsMed || inRoomScore >= 0.3);
+      (inEchoScore >= 0.38 || roomRiskIsMed || inRoomScore >= 0.35);
     if (dereverbAllowed) {
       // Strength 0..1, scales with measured echo. Now uses the ACTUAL
       // `echoScore` as the primary driver (was 0.7×echoScore + bonus) so
@@ -2649,20 +2669,20 @@ const summarizeFailureReason = (error: unknown) => {
       // 0.00065). Stronger settings scrub more reflection smear; the
       // extended range catches the 0.5–0.8 echoScore files that were
       // still landing as `echo_roomy` in auto-review.
-      const nlmS = (0.00025 + roomStrength * 0.0004).toFixed(5);
+      const nlmS = (0.00022 + roomStrength * 0.00028).toFixed(5);
       filters.push(`anlmdn=s=${nlmS}:p=0.002:r=0.004`);
 
       // Boxy-room notch — now fires at a lower strength threshold (0.25)
       // so it reaches files that were flagged echo_roomy but skipped the
       // notch before. Depth still modest.
       if (roomStrength >= 0.25) {
-        const boxyCut = -clamp(0.4 + roomStrength * 1.3, 0.4, 1.7);
+        const boxyCut = -clamp(0.35 + roomStrength * 1.0, 0.35, 1.35);
         filters.push(`equalizer=f=280:width_type=q:width=1.1:g=${boxyCut.toFixed(2)}`);
       }
 
       // Mid-range room notch — 1 kHz "honky" band. Fires on stronger rooms.
       if (roomStrength >= 0.45) {
-        const midCut = -clamp(0.5 + (roomStrength - 0.45) * 1.6, 0.5, 1.3);
+        const midCut = -clamp(0.4 + (roomStrength - 0.45) * 1.15, 0.4, 1.05);
         filters.push(`equalizer=f=1050:width_type=q:width=1.3:g=${midCut.toFixed(2)}`);
       }
 
@@ -2670,7 +2690,7 @@ const summarizeFailureReason = (error: unknown) => {
       // when echoScore is high, because brightness reflection scatter lives
       // in both medium and high room ratings.
       if (roomStrength >= 0.5) {
-        const topShelf = -clamp(0.5 + (roomStrength - 0.5) * 1.4, 0.5, 1.3);
+        const topShelf = -clamp(0.4 + (roomStrength - 0.5) * 1.0, 0.4, 1.0);
         filters.push(`equalizer=f=10500:width_type=q:width=0.7:g=${topShelf.toFixed(2)}`);
       }
     }
@@ -2866,7 +2886,7 @@ const summarizeFailureReason = (error: unknown) => {
         breathSpikeRisk >= 0.38 ||
         continuitySafeMode);
     const breath =
-      breathControl === "Off"
+      sourceSafeMode || breathControl === "Off"
         ? null
         : pauseSafeMode && pauseNoiseRisk >= 0.38
           ? null
@@ -2880,14 +2900,26 @@ const summarizeFailureReason = (error: unknown) => {
         ? buildTailGateFilter(profile?.tailGateStrength ?? 0.12)
         : null;
     const useRoomGate = roomGateFilter !== null;
+    const endingProtectedDialogue = strictEndingProtection || (profile?.preserveEndings ?? false);
     const preferFloorGuard =
+      !sourceSafeMode &&
       floorGuard &&
       (pauseSafeMode ||
         pauseNoiseRisk >= 0.42 ||
         profile?.noiseRisk === "high" ||
         (noiseGuard && profile?.noiseRisk === "medium"));
-    const useFloorGuard = !useRoomGate && floorGuard && (breath === null || preferFloorGuard);
-    const useBreathCompand = !useRoomGate && breath !== null && !useFloorGuard;
+    const useFloorGuard =
+      !sourceSafeMode &&
+      !useRoomGate &&
+      floorGuard &&
+      (breath === null || preferFloorGuard) &&
+      !(endingProtectedDialogue && profile?.noiseRisk === "low" && pauseNoiseRisk < 0.36);
+    const useBreathCompand =
+      !sourceSafeMode &&
+      !useRoomGate &&
+      breath !== null &&
+      !useFloorGuard &&
+      !(endingProtectedDialogue && profile?.noiseRisk === "low" && breathTameStrength < 0.45);
 
     if (!minimalStabilityChain && useRoomGate && roomGateFilter) {
       filters.push(roomGateFilter);
@@ -2912,17 +2944,17 @@ const summarizeFailureReason = (error: unknown) => {
     );
     const netAirGain = clamp(baseAirCut + (profile?.airGainDb ?? 0) - harshAirCut, -2.7, 0.45);
 
-    if (!minimalStabilityChain && Math.abs(netPresenceGain) >= 0.2) {
+    if (!minimalStabilityChain && !sourceSafeMode && Math.abs(netPresenceGain) >= 0.2) {
       filters.push(`equalizer=f=3500:width_type=q:width=1.15:g=${netPresenceGain.toFixed(2)}`);
     }
-    if (!minimalStabilityChain && Math.abs(netAirGain) >= 0.2) {
+    if (!minimalStabilityChain && !sourceSafeMode && Math.abs(netAirGain) >= 0.2) {
       filters.push(`equalizer=f=8000:width_type=q:width=0.75:g=${netAirGain.toFixed(2)}`);
     }
-    if (!minimalStabilityChain && (profile?.topEndHarshnessCutDb ?? 0) >= 0.45) {
+    if (!minimalStabilityChain && !sourceSafeMode && (profile?.topEndHarshnessCutDb ?? 0) >= 0.45) {
       const topShelfCut = clamp(-0.35 - (profile?.topEndHarshnessCutDb ?? 0) * 0.55, -1.1, -0.35);
       filters.push(`equalizer=f=11200:width_type=q:width=0.7:g=${topShelfCut.toFixed(2)}`);
     }
-    if (!minimalStabilityChain && roomCleanupEnabled && (profile?.echoNotchCutDb ?? 0) >= 0.25) {
+    if (!minimalStabilityChain && !sourceSafeMode && roomCleanupEnabled && (profile?.echoNotchCutDb ?? 0) >= 0.25) {
       const echoCut = clamp(profile?.echoNotchCutDb ?? 0, 0.25, 1.25);
       const notch1 = -clamp(echoCut, 0.25, 1.25);
       filters.push(`equalizer=f=2450:width_type=q:width=1.35:g=${notch1.toFixed(2)}`);
@@ -2935,7 +2967,7 @@ const summarizeFailureReason = (error: unknown) => {
         filters.push(`equalizer=f=3620:width_type=q:width=1.6:g=${notch3.toFixed(2)}`);
       }
     }
-    if (!minimalStabilityChain && roomCleanupEnabled && profile?.roomRisk === "high") {
+    if (!minimalStabilityChain && !sourceSafeMode && roomCleanupEnabled && profile?.roomRisk === "high") {
       const roomCutFactor = clamp((profile?.echoNotchCutDb ?? 0.6) / 1.45, 0.25, 1);
       const roomCutLow = -clamp(0.45 + roomCutFactor * 0.55, 0.45, 1.05);
       const roomCutMid = -clamp(0.35 + roomCutFactor * 0.65, 0.35, 1.15);
@@ -2950,7 +2982,7 @@ const summarizeFailureReason = (error: unknown) => {
     // Tone-match EQ: pull this file's long-term spectrum toward the batch median.
     // Only apply the most prominent band deltas so we don't stack many EQs.
     const toneMatchDeltaDb = profile?.toneMatchDeltaDb;
-    if (!minimalStabilityChain && toneMatchDeltaDb && toneMatchDeltaDb.length === SPECTRUM_BANDS_HZ.length) {
+    if (!minimalStabilityChain && !sourceSafeMode && toneMatchDeltaDb && toneMatchDeltaDb.length === SPECTRUM_BANDS_HZ.length) {
       const ranked = toneMatchDeltaDb
         .map((g, i) => ({ g, hz: SPECTRUM_BANDS_HZ[i] }))
         .filter((item) => Math.abs(item.g) >= 0.6)
@@ -2967,6 +2999,7 @@ const summarizeFailureReason = (error: unknown) => {
     // high so dramatic takes aren't processed flat.
     const cinematicColorOn =
       !minimalStabilityChain &&
+      !sourceSafeMode &&
       !!profile?.cinematicColorEnabled &&
       (profile?.emotionProtection ?? 0) < 0.5;
     if (cinematicColorOn) {
@@ -2980,7 +3013,7 @@ const summarizeFailureReason = (error: unknown) => {
     // to stay inside the `-af` / comma-joined filter chain. Depth caps at
     // -4 dB so we never dull a voice that is only lightly bright.
     const sibilanceScore = profile?.sibilanceScore ?? 0;
-    if (!minimalStabilityChain && sibilanceScore >= 0.4) {
+    if (!minimalStabilityChain && !sourceSafeMode && sibilanceScore >= 0.4) {
       const depthNorm = clamp((sibilanceScore - 0.4) / 0.6, 0, 1);
       const mainCut = -clamp(1.2 + depthNorm * 2.8, 1.2, 4);
       const secondaryCut = -clamp(0.6 + depthNorm * 1.8, 0.6, 2.4);
@@ -3137,7 +3170,9 @@ const summarizeFailureReason = (error: unknown) => {
       0.95
     );
 
-    if (gainPlannerActive) {
+    if (sourceSafeMode) {
+      // Source-safe fallback intentionally leaves dynamics to the planner and final limiter.
+    } else if (gainPlannerActive) {
       // Planner already normalized sentence-to-sentence level. Downstream
       // compression is now *adaptive*: on clean takes we bypass entirely
       // (planner + de-esser + alimiter are sufficient), on progressively
@@ -4102,7 +4137,9 @@ const summarizeFailureReason = (error: unknown) => {
       ? "cinematic-stable"
       : variant === "continuity-safe"
         ? "continuity-safe"
-        : "pause-safe";
+        : variant === "pause-safe"
+          ? "pause-safe"
+          : "source-safe";
 
   const buildMixCandidateVariants = (
     profile: AdaptiveProfile | null,
@@ -4128,6 +4165,7 @@ const summarizeFailureReason = (error: unknown) => {
     ) {
       variants.push("pause-safe");
     }
+    variants.push("source-safe");
     return variants;
   };
 
@@ -4849,7 +4887,11 @@ const summarizeFailureReason = (error: unknown) => {
             const candidateOptions: MixRenderOptions = {
               candidateVariant,
               skipSpeechSegmentation:
-                candidateVariant === "continuity-safe" && (profile?.preferSinglePassContinuity ?? false),
+                candidateVariant === "source-safe" ||
+                (candidateVariant === "continuity-safe" && (profile?.preferSinglePassContinuity ?? false)),
+              sourceSafeChain: candidateVariant === "source-safe",
+              disableRoomCleanup: candidateVariant === "source-safe" ? true : undefined,
+              disableAdaptiveNoiseReduction: candidateVariant === "source-safe" ? true : undefined,
             };
             try {
               const renderResult = await renderMixReadyWithFallbacks(
@@ -5488,7 +5530,9 @@ const summarizeFailureReason = (error: unknown) => {
               <strong>Speech-aware leveler</strong>
               <div className={styles.label}>
                 Plans a gain curve from the actual sentences before any compressor runs. This is the core
-                fix for sudden volume spikes. Falls back to the legacy leveler for very long files (&gt;15 min).
+                fix for sudden volume spikes. Classifies breaths and short onomatopoeia runs separately so
+                they sit with the performance instead of spiking above it. Handles batch-episode files up
+                to 80 minutes (longer files fall back to the legacy leveler).
               </div>
             </div>
             <input

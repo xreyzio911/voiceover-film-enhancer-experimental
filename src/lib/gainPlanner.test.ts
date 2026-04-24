@@ -406,8 +406,9 @@ describe("trimmed-mean target", () => {
 
     // Trimmed mean of [-42,-27,-27,-27,-27,-27,-27,-27,-27,-10] after
     // dropping 1 each end = mean([-27]*8) = -27.
-    // Target = 0.55 * -27 + 0.45 * -22 = -24.75.
-    const expectedTarget = 0.55 * -27 + 0.45 * -22;
+    // The planner now follows the source lightly so actors converge toward
+    // the shared house VO target instead of preserving original offsets.
+    const expectedTarget = 0.15 * -27 + 0.85 * -22;
     assert.ok(
       Math.abs(plan.targetDb - expectedTarget) < 0.2,
       `target ${plan.targetDb.toFixed(2)} dB should track the trimmed mean (${expectedTarget.toFixed(2)} dB)`,
@@ -461,6 +462,98 @@ describe("adaptive micro-ride", () => {
     );
     assert.ok(cleanPlan.microRideDb <= 0.6, `clean micro-ride should be tight: ${cleanPlan.microRideDb.toFixed(2)}`);
     assert.ok(messyPlan.microRideDb >= 1.3, `messy micro-ride should stay wide: ${messyPlan.microRideDb.toFixed(2)}`);
+  });
+});
+
+describe("house target and performance transients", () => {
+  it("pulls different actor levels toward the same dialogue target", () => {
+    const buildPlanForLevel = (speechDb: number) => {
+      const frameDb: number[] = [];
+      for (let i = 0; i < 40; i += 1) frameDb.push(-75);
+      for (let i = 0; i < 140; i += 1) frameDb.push(speechDb);
+      for (let i = 0; i < 40; i += 1) frameDb.push(-75);
+      return planGainCurve({
+        frameDb,
+        speechRuns: [{ startFrame: 40, endFrame: 180 }],
+        noiseFloorDb: -75,
+        speechThresholdDb: -60,
+        pauseNoiseRisk: 0.05,
+        frameMs: FRAME_MS,
+        targetDb: -22,
+      });
+    };
+
+    const quietActor = buildPlanForLevel(-30);
+    const loudActor = buildPlanForLevel(-16);
+    const quietBody = quietActor.runs[0].meanDb + quietActor.runs[0].plannedGainDb;
+    const loudBody = loudActor.runs[0].meanDb + loudActor.runs[0].plannedGainDb;
+
+    assert.ok(Math.abs(quietBody - loudBody) < 2.5, `actors should converge: ${quietBody.toFixed(2)} vs ${loudBody.toFixed(2)} dB`);
+    assert.ok(Math.abs(quietActor.targetDb - -22) < 1.4, `quiet actor target should stay near house target: ${quietActor.targetDb.toFixed(2)}`);
+    assert.ok(Math.abs(loudActor.targetDb - -22) < 1.4, `loud actor target should stay near house target: ${loudActor.targetDb.toFixed(2)}`);
+  });
+
+  it("tames short ah/ugh/hm-style spikes without dipping neighboring dialogue", () => {
+    const sampleRate = 16000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 520;
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    const frameDb = new Array<number>(totalFrames).fill(-78);
+
+    const paintTone = (startFrame: number, endFrame: number, rmsDb: number, hz: number) => {
+      const amp = dbToLin(rmsDb) * Math.SQRT2;
+      for (let frame = startFrame; frame < endFrame; frame += 1) {
+        frameDb[frame] = rmsDb;
+        const start = frame * samplesPerFrame;
+        const end = start + samplesPerFrame;
+        for (let i = start; i < end; i += 1) {
+          samples[i] += Math.sin((2 * Math.PI * hz * i) / sampleRate) * amp;
+        }
+      }
+    };
+
+    paintTone(100, 220, -22, 220);
+    paintTone(245, 290, -20, 330);
+    paintTone(320, 440, -22, 220);
+    samples[260 * samplesPerFrame + 30] = 0.86;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [
+        { startFrame: 100, endFrame: 220 },
+        { startFrame: 245, endFrame: 290 },
+        { startFrame: 320, endFrame: 440 },
+      ],
+      noiseFloorDb: -78,
+      speechThresholdDb: -62,
+      pauseNoiseRisk: 0.08,
+      frameMs,
+      samples,
+      sampleRate,
+      targetDb: -22,
+      peakCeilingDb: -3,
+    });
+
+    assert.equal(plan.runs[1].runClass, "transient-breath");
+    assert.ok(plan.runs[1].plannedGainDb <= -4.5, `performance transient should be pulled below dialogue: ${plan.runs[1].plannedGainDb.toFixed(2)} dB`);
+
+    const leveled = applyGainCurveToSamples(samples, plan.gainCurve, sampleRate, 1, frameMs);
+    const transientFrameStart = 260 * samplesPerFrame;
+    let transientPeak = 0;
+    for (let i = transientFrameStart; i < transientFrameStart + samplesPerFrame; i += 1) {
+      transientPeak = Math.max(transientPeak, Math.abs(leveled[i]));
+    }
+    const transientPeakDb = 20 * Math.log10(transientPeak + 1e-9);
+    assert.ok(
+      transientPeakDb <= plan.targetDb + 13,
+      `performance spike should sit under dialogue peak range: ${transientPeakDb.toFixed(2)} dB`,
+    );
+
+    const beforeDialogueGainDb = 20 * Math.log10(plan.gainCurve[180] + 1e-9);
+    const afterDialogueGainDb = 20 * Math.log10(plan.gainCurve[360] + 1e-9);
+    assert.ok(Math.abs(beforeDialogueGainDb) < 0.8, `pre-transient dialogue should not be dipped: ${beforeDialogueGainDb.toFixed(2)} dB`);
+    assert.ok(Math.abs(afterDialogueGainDb) < 0.8, `post-transient dialogue should not be dipped: ${afterDialogueGainDb.toFixed(2)} dB`);
   });
 });
 

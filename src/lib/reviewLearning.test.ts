@@ -249,7 +249,36 @@ test("scoreCandidateWithLearnedWeights applies hard gates for timing, peak, and 
   assert.ok(ranking.gateReasons.includes("timing-offset"));
   assert.ok(ranking.gateReasons.includes("peak-violation"));
   assert.ok(ranking.gateReasons.includes("ending-damage"));
+  assert.ok(ranking.gateReasons.includes("source-regression"));
   assert.ok(ranking.rankingScore > ranking.baselineTotal);
+});
+
+test("scoreCandidateWithLearnedWeights hard-penalizes source regression without timing faults", () => {
+  const ranking = scoreCandidateWithLearnedWeights({
+    baselineScore: buildScore({ stability: 0.16, pause: 0.1, compression: 0.08, echo: 0.06 }),
+    candidateQc: toReviewMetricSnapshot({
+      inputTP: -2.4,
+      overallRisk: 0.34,
+      instabilityScore: 0.27,
+      sentenceJumpScore: 0.22,
+      pauseNoiseRisk: 0.24,
+      compressionScore: 0.19,
+      clickScore: 0.14,
+      echoScore: 0.16,
+      endFadeRiskScore: 0.12,
+      sibilanceScore: 0.18,
+      pauseNoiseFloorDb: -69.5,
+      noiseContrastDb: 24,
+    }),
+    sourceQc,
+    alignment: buildAlignment(),
+    meta: buildMeta(),
+  });
+
+  assert.ok(ranking.gateReasons.includes("source-regression"));
+  assert.ok(!ranking.gateReasons.includes("duration-mismatch"));
+  assert.ok(!ranking.gateReasons.includes("timing-offset"));
+  assert.ok(ranking.hardGatePenalty > 0);
 });
 
 test("review decision JSONL round-trips", () => {

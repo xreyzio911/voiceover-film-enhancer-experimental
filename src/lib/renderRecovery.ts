@@ -42,7 +42,7 @@ export type RenderRiskProfile = {
   longSparseMode: boolean;
   plannedSegmentCount: number;
   speechSpanCount: number;
-  candidateVariant: "cinematic-stable" | "continuity-safe" | "pause-safe";
+  candidateVariant: "cinematic-stable" | "continuity-safe" | "pause-safe" | "source-safe";
   useRoomCleanup: boolean;
   useAdaptiveNoiseReduction: boolean;
   priorFatalRenderError: boolean;
@@ -58,7 +58,7 @@ type RenderRiskInput = {
   longSparseMode: boolean;
   plannedSegmentCount: number;
   speechSpanCount: number;
-  candidateVariant: "cinematic-stable" | "continuity-safe" | "pause-safe";
+  candidateVariant: "cinematic-stable" | "continuity-safe" | "pause-safe" | "source-safe";
   useRoomCleanup: boolean;
   useAdaptiveNoiseReduction: boolean;
   priorFatalRenderError: boolean;
