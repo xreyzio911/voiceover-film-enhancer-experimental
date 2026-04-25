@@ -54,6 +54,13 @@ export type GainPlannerInput = {
    * full ±1.5 dB correction. Defaults to 0.5 (midpoint) when unknown.
    */
   instabilityHint?: number;
+  /**
+   * 0..1 strength for isolated spike control inside normal dialogue runs.
+   * This is separate from breath/transient handling: it catches one-off hot
+   * syllables/plosives that live inside a sentence body without fading the
+   * sentence start/end or flattening sustained loud delivery.
+   */
+  speechSpikeTaming?: number;
 };
 
 /**
@@ -92,6 +99,14 @@ export type GainPlannerOutput = {
   microRideDb: number;
   /** Count of runs classified as transient-breath. Diagnostic. */
   breathRunCount: number;
+  /** Count of isolated body-speech frames locally dipped by the spike guard. */
+  speechSpikeFrameCount: number;
+  /** Largest body-speech spike dip in dB. Diagnostic. */
+  speechSpikeMaxReductionDb: number;
+  /** Count of sustained-loud clusters (onomatopoeia / yells) tamed inside body-speech runs. */
+  sustainedLoudClusterCount: number;
+  /** Largest uniform attenuation applied to a sustained-loud cluster in dB. Diagnostic. */
+  sustainedLoudMaxReductionDb: number;
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -108,6 +123,16 @@ const rmsDbOfSlice = (frameDb: number[], start: number, end: number): number => 
     sumPower += Math.pow(10, frameDb[i] / 10);
   }
   return 10 * Math.log10(sumPower / (b - a) + 1e-30);
+};
+
+const medianDbOfSlice = (frameDb: number[], start: number, end: number): number => {
+  const a = Math.max(0, start);
+  const b = Math.min(frameDb.length, end);
+  if (b <= a) return -120;
+  const values: number[] = [];
+  for (let i = a; i < b; i += 1) values.push(frameDb[i]);
+  values.sort((left, right) => left - right);
+  return values[Math.floor(values.length / 2)] ?? -120;
 };
 
 /**
@@ -137,6 +162,18 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // Scale: ±0.4 dB at instabilityHint=0, ±1.5 dB at instabilityHint=1.
   const instabilityHint = Math.max(0, Math.min(1, input.instabilityHint ?? 0.5));
   const microRideDb = 0.4 + instabilityHint * 1.1;
+  // Speech-spike taming is now ENGAGED much earlier. Even a "moderately
+  // stable" source can still have a single syllable peak 15+ dB above its
+  // body — the kind of spike users actually flag visually in the waveform.
+  // We start at 0.30 (so even instabilityHint=0 gets a baseline of taming)
+  // and ramp to 1.0 as instabilityHint approaches 1. Previously the guard
+  // only kicked in above instabilityHint 0.35, leaving most files with
+  // speechSpikeTaming = 0 and no within-sentence spike protection.
+  const speechSpikeTaming = clamp(
+    input.speechSpikeTaming ?? clamp(0.3 + (instabilityHint - 0.05) * 0.85, 0.3, 1),
+    0,
+    1,
+  );
 
   // 1) Per-run body RMS + classification.
   //
@@ -155,6 +192,13 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     meanDb: number;
     peakDb: number;
     crestDb: number;
+    /**
+     * Fraction of frames within the run whose peak sits more than 6 dB
+     * above the run's body mean. A real screamed/yelled passage has a
+     * high ratio (most frames hot); a single plosive in a calm sentence
+     * has a near-zero ratio.
+     */
+    hotFrameRatio: number;
     runClass: SpeechRunClass;
   };
   const runMeta: RunEntry[] = [];
@@ -203,6 +247,19 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
     const crestDb = peakDb - meanDb;
     const runLenMs = runFrames * frameMs;
+
+    // SUSTAINED-CREST ratio: how many frames inside the run sit > 6 dB
+    // above body. This distinguishes a real screamed/yelled passage
+    // (high ratio — most frames hot) from a single-sample plosive in an
+    // otherwise calm sentence (very low ratio). Used by the high-crest
+    // sub-targeting decision below so we don't psycho-acoustically
+    // duck a sentence just because one consonant has a sharp peak.
+    let hotFrameCount = 0;
+    for (let f = run.startFrame; f < run.endFrame; f += 1) {
+      const framePeakAtF = framePeakDb ? framePeakDb[f] : input.frameDb[f] + 12;
+      if (framePeakAtF > meanDb + 6) hotFrameCount += 1;
+    }
+    const hotFrameRatio = hotFrameCount / runFrames;
     const previousEndFrame = runIndex > 0 ? input.speechRuns[runIndex - 1].endFrame : 0;
     const nextStartFrame =
       runIndex + 1 < input.speechRuns.length ? input.speechRuns[runIndex + 1].startFrame : frameCount;
@@ -233,6 +290,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       meanDb,
       peakDb,
       crestDb,
+      hotFrameRatio,
       runClass,
     });
     // Only body-speech runs drive the batch target — a single loud gasp
@@ -271,23 +329,83 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //   quiet gasp can't be lifted to full dialogue level.
   // edge-fragment: target batch level with tight ±4 dB clamp (not enough
   //   body to plan on, but still contribute to continuity).
+  // Asymmetric clamp for breaths: allow up to -12 dB attenuation but only
+  // +4 dB boost. A very loud yell/scream can now be brought 12 dB DOWN
+  // instead of being clamped at -5 and still poking 7 dB above dialogue.
+  // Quiet breaths stay tight (+4 max) so a silent inhale isn't amplified
+  // into audibility.
+  //
+  // PSYCHO-ACOUSTIC SUB-TARGETING for body-speech runs.
+  //
+  // A long run that classifies as body-speech (≥ 400 ms) but has high
+  // crest factor (≥ 13 dB) is almost always a SCREAM / SHOUT / LAUGH /
+  // sustained vocalization, not normal dialogue. The ear perceives high-
+  // crest content as louder than equal-RMS dialogue because:
+  //   1. peaks integrate above body in the loudness window
+  //   2. screams have richer high-frequency content
+  //   3. tonal vs noisy balance shifts toward "louder"
+  //
+  // We compensate by targeting these runs 1-3 dB BELOW dialogue body.
+  // The exact offset scales with crest excess. We also widen the
+  // attenuation clamp to -18 dB so extremely loud sources (source body
+  // > target + 14 dB) can be brought down further.
   const breathTargetDb = targetDb - 3.2;
   const plannedRunGainDb: number[] = runMeta.map((m) => {
     if (m.runClass === "transient-breath") {
-      return clamp(breathTargetDb - m.meanDb, -5, 4);
+      return clamp(breathTargetDb - m.meanDb, -12, 4);
     }
     if (m.runClass === "edge-fragment") {
       return clamp(targetDb - m.meanDb, -4, 4);
     }
-    return clamp(targetDb - m.meanDb, minGainDb, maxGainDb);
+    // Body-speech: psycho-acoustic adjustment for SUSTAINED high-crest
+    // vocalizations. We require BOTH:
+    //   - crest ≥ 13 dB (peak sits well above body)
+    //   - hotFrameRatio ≥ 0.20 (at least 20 % of frames are loud — this
+    //     filters out single-plosive sentences whose crest is high only
+    //     because of one outlier frame)
+    //   - run length ≥ 600 ms (the perceptual loudness penalty needs
+    //     time to accumulate)
+    // When all three are true, target shifts down 0.6–3.5 dB to
+    // compensate for the extra perceived loudness. Normal dialogue
+    // (lower crest, low hot ratio) is unaffected.
+    const runLenMs = (m.endFrame - m.startFrame) * frameMs;
+    const sustainedHighCrest =
+      m.crestDb >= 13 && m.hotFrameRatio >= 0.2 && runLenMs >= 600;
+    const crestShift = sustainedHighCrest
+      ? Math.max(0, Math.min(3.5, (m.crestDb - 11) * 0.4))
+      : 0;
+    const adjustedTarget = targetDb - crestShift;
+    // High-crest sustained runs get a wider attenuation window so very
+    // loud sources can be brought down further than the standard ±14 dB.
+    const lowerClamp = sustainedHighCrest ? Math.min(minGainDb, -18) : minGainDb;
+    return clamp(adjustedTarget - m.meanDb, lowerClamp, maxGainDb);
   });
-  // Cross-run smoothing on adjacent body-speech pairs only (smoothing into
-  // breaths would defeat the point of their separate targeting). Single
-  // 35 % blend when planned gains differ by > 3 dB.
+  // Cross-run smoothing on adjacent body-speech pairs only.
+  //
+  // Skipped when:
+  //   - either side is NOT body-speech (transient-breath has its own
+  //     intentionally-different target; smoothing would defeat that)
+  //   - either side is a sustained-high-crest body-speech run (a yell or
+  //     scream — its lower target is intentional, we don't want a
+  //     neighbor pulling it back up toward dialogue)
+  //   - the bodies differ by > 8 dB (these aren't "neighboring sentences
+  //     at similar level" — they're dialogue meeting onomatopoeia /
+  //     loud beat / abrupt mood change, where a step is correct)
+  //
+  // For pairs that do qualify, blend 35 % toward midpoint when planned
+  // gains differ by > 3 dB.
+  const isSustainedHighCrest = (idx: number): boolean => {
+    const m = runMeta[idx];
+    if (m.runClass !== "body-speech") return false;
+    const lenMs = (m.endFrame - m.startFrame) * frameMs;
+    return m.crestDb >= 13 && m.hotFrameRatio >= 0.2 && lenMs >= 600;
+  };
   for (let i = 1; i < plannedRunGainDb.length; i += 1) {
     const cur = runMeta[i];
     const prev = runMeta[i - 1];
     if (cur.runClass !== "body-speech" || prev.runClass !== "body-speech") continue;
+    if (isSustainedHighCrest(i) || isSustainedHighCrest(i - 1)) continue;
+    if (Math.abs(cur.meanDb - prev.meanDb) > 8) continue;
     const diff = plannedRunGainDb[i] - plannedRunGainDb[i - 1];
     if (Math.abs(diff) > 3) {
       const mid = (plannedRunGainDb[i] + plannedRunGainDb[i - 1]) / 2;
@@ -397,7 +515,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //    because the slew can't catch up to body gain in 80 ms).
   const slewed = gainDbCurve;
 
-  // 7) LOCALIZED peak guard.
+  // 7) LOCALIZED peak/body-spike guard.
   //
   // Previous approach reduced a WHOLE RUN's gain when any single sample
   // in the run exceeded the ceiling. A single loud plosive therefore cost
@@ -406,13 +524,18 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // but QUIET bodies relative to the rest of the dialogue.
   //
   // New approach: compute the peak per 10 ms frame (we built framePeakDb
-  // above when samples were available). For each frame whose applied peak
-  // would exceed the ceiling, apply a 50 ms cosine DIP centered on that
-  // frame, scaled to the exceedance. This brings that one plosive peak
-  // under the ceiling while leaving 99% of the run's frames at full body
-  // gain. Result: natural peak-to-body crest is preserved AND nothing
-  // clips downstream.
-  const peakDipFrames = Math.max(1, Math.round(25 / frameMs)); // 25 ms half-width, must be integer
+  // above when samples were available). Absolute peaks still get a 50 ms
+  // cosine dip, but body-speech also gets a body-relative spike guard:
+  // isolated 20-140 ms syllable/plosive jumps are tamed even when they sit
+  // below the global -3/-4 dBFS ceiling. Sustained loud delivery is skipped.
+  // Wider dip (40 ms half-width = 80 ms total) — smoother envelope edges,
+  // less audible as a "click" or "pump" while still localized to the spike.
+  const peakDipFrames = Math.max(1, Math.round(40 / frameMs));
+  // Allow the guard to act on longer sustained-loud passages too. A 280 ms
+  // cluster covers a stressed-syllable cluster like "WHAT!" without
+  // touching genuinely sustained loud delivery (which our `clearlyHot`
+  // threshold gates separately).
+  const bodySpikeClusterLimitFrames = Math.max(6, Math.round(280 / frameMs));
   const peakReductionDbByRun = new Array<number>(runMeta.length).fill(0);
   const runIndexByFrame = new Array<number>(frameCount).fill(-1);
   for (let r = 0; r < runMeta.length; r += 1) {
@@ -420,25 +543,117 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       runIndexByFrame[f] = r;
     }
   }
+  const dipDbByFrame = new Float32Array(frameCount);
+  let speechSpikeFrameCount = 0;
+  let speechSpikeMaxReductionDb = 0;
+  let sustainedClusterTamedCount = 0;
+  let sustainedClusterMaxReductionDbOut = 0;
   if (framePeakDb) {
     for (let f = 0; f < frameCount; f += 1) {
       const currentGainDb = slewed[f];
       const runIdx = runIndexByFrame[f];
       const runMetaForFrame = runIdx >= 0 ? runMeta[runIdx] : null;
       const isPerformanceTransient = runMetaForFrame?.runClass === "transient-breath";
+      // Tighter peak ceiling for transient-breath runs. Was targetDb + 12.5
+      // (peaks up to dialogue+12.5 dB allowed), now targetDb + 8 (peaks
+      // capped at ~dialogue body + 8 dB, roughly the natural crest factor
+      // of a normal voiced syllable). An onomatopoeia gasp/scream can no
+      // longer poke significantly above dialogue peaks.
       const localPeakCeilingDb = isPerformanceTransient
-        ? Math.min(peakCeilingDb, targetDb + 12.5)
+        ? Math.min(peakCeilingDb, targetDb + 8)
         : peakCeilingDb;
       const appliedPeakDb = framePeakDb[f] + currentGainDb;
-      if (appliedPeakDb <= localPeakCeilingDb) continue;
-      const excessDb = appliedPeakDb - localPeakCeilingDb; // how much over ceiling
+      let reductionDb = Math.max(0, appliedPeakDb - localPeakCeilingDb);
+
+      if (
+        runIdx >= 0 &&
+        runMetaForFrame?.runClass === "body-speech" &&
+        speechSpikeTaming > 0.08
+      ) {
+        const bodyLevelDb = runMetaForFrame.meanDb + (plannedRunGainDb[runIdx] ?? currentGainDb);
+        // TIGHTER thresholds. Previously allowed 14.8 dB peak / 4.8 dB RMS
+        // above body, which let visible waveform spikes through entirely.
+        // Pro VO crest factor is 8-10 dB; anything above ~10 dB peak / 3 dB
+        // RMS reads as a "spike" to the listener and on the waveform.
+        const allowedRmsSpikeDb = 3.0 - speechSpikeTaming * 1.0; // 3.0 → 2.0 dB
+        const allowedPeakSpikeDb = 9.5 - speechSpikeTaming * 1.5; // 9.5 → 8.0 dB
+        const appliedFrameDb = input.frameDb[f] + currentGainDb;
+        const relativePeakCeilingDb = Math.min(peakCeilingDb, bodyLevelDb + allowedPeakSpikeDb);
+        const rmsExcessDb = appliedFrameDb - (bodyLevelDb + allowedRmsSpikeDb);
+        const relativePeakExcessDb = appliedPeakDb - relativePeakCeilingDb;
+
+        if (rmsExcessDb > 0 || relativePeakExcessDb > 0) {
+          const localMedianDb = medianDbOfSlice(
+            input.frameDb,
+            Math.max(runMetaForFrame.startFrame, f - 5),
+            Math.min(runMetaForFrame.endFrame, f + 6),
+          );
+          const localContrastDb = input.frameDb[f] - localMedianDb;
+          // Lower contrast threshold so even modest local jumps qualify
+          // as spikes worth taming. Previously 1.4 dB minimum kept many
+          // audible peaks unprotected.
+          const localContrastThresholdDb = 0.8 + (1 - speechSpikeTaming) * 0.6;
+          const isHotFrame = (idx: number) => {
+            const gainDb = slewed[idx];
+            return (
+              input.frameDb[idx] + gainDb > bodyLevelDb + allowedRmsSpikeDb - 0.4 ||
+              framePeakDb[idx] + gainDb > relativePeakCeilingDb - 0.5
+            );
+          };
+
+          let hotClusterFrames = 1;
+          for (
+            let idx = f - 1;
+            idx >= runMetaForFrame.startFrame && hotClusterFrames <= bodySpikeClusterLimitFrames;
+            idx -= 1
+          ) {
+            if (!isHotFrame(idx)) break;
+            hotClusterFrames += 1;
+          }
+          for (
+            let idx = f + 1;
+            idx < runMetaForFrame.endFrame && hotClusterFrames <= bodySpikeClusterLimitFrames;
+            idx += 1
+          ) {
+            if (!isHotFrame(idx)) break;
+            hotClusterFrames += 1;
+          }
+
+          const locallyIsolated = hotClusterFrames <= bodySpikeClusterLimitFrames;
+          const locallyContrasty = localContrastDb >= localContrastThresholdDb;
+          // `clearlyHot` triggers the dip even without local-contrast
+          // evidence — useful when a stressed syllable sustains for several
+          // frames at uniformly elevated level. Lowered thresholds so this
+          // catches the actual visually-audible spikes (1.0 dB RMS / 0.8 dB
+          // peak excess instead of 2.0 / 1.6).
+          const clearlyHot = rmsExcessDb >= 1 || relativePeakExcessDb >= 0.8;
+          if (locallyIsolated && (locallyContrasty || clearlyHot)) {
+            // RAISED dip cap so a 17 dB peak above body can be reduced by
+            // 11 dB → 6 dB above body (well within "natural crest").
+            // Previously capped at 5.5 dB so a 17 dB spike came out at
+            // 11.5 dB above body — still spike-y on the waveform.
+            const bodySpikeReductionDb = clamp(
+              Math.max(rmsExcessDb * 0.85, relativePeakExcessDb * 1.0),
+              0,
+              5.5 + speechSpikeTaming * 6,
+            );
+            if (bodySpikeReductionDb > 0.05) {
+              reductionDb = Math.max(reductionDb, bodySpikeReductionDb);
+              speechSpikeFrameCount += 1;
+              speechSpikeMaxReductionDb = Math.max(speechSpikeMaxReductionDb, bodySpikeReductionDb);
+            }
+          }
+        }
+      }
+
+      if (reductionDb <= 0) continue;
       // Apply cosine dip from -peakDipFrames..+peakDipFrames around f.
       for (let k = -peakDipFrames; k <= peakDipFrames; k += 1) {
         const idx = f + k;
         if (idx < 0 || idx >= frameCount) continue;
         if (
-          isPerformanceTransient &&
           runMetaForFrame &&
+          (isPerformanceTransient || runMetaForFrame.runClass === "body-speech") &&
           (idx < runMetaForFrame.startFrame || idx >= runMetaForFrame.endFrame)
         ) {
           continue;
@@ -446,14 +661,82 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         // Cosine weight peaks at k=0 (full reduction) and falls to 0 at edges.
         const t = Math.abs(k) / (peakDipFrames + 1);
         const weight = Math.cos((t * Math.PI) / 2) ** 2;
-        slewed[idx] -= excessDb * weight;
+        dipDbByFrame[idx] = Math.max(dipDbByFrame[idx], reductionDb * weight);
       }
       // Track for diagnostics: the worst dip applied within each run.
       if (runIdx >= 0) {
-        peakReductionDbByRun[runIdx] = Math.min(peakReductionDbByRun[runIdx], -excessDb);
+        peakReductionDbByRun[runIdx] = Math.min(peakReductionDbByRun[runIdx], -reductionDb);
+      }
+    }
+
+  }
+
+  // 7b) POST-CLAMP RESIDUAL pass for body-speech runs.
+  //
+  // Runs OUTSIDE the framePeakDb branch above so it fires whether or not
+  // the caller supplied raw samples — the residual check only needs the
+  // planned gain and frameDb, both of which are always available.
+  //
+  // The high-crest sub-targeting plus the ±18 dB attenuation window
+  // catches MOST loud vocalizations, but for an EXTREMELY loud source
+  // (body > target + 18 dB after sub-target shift) the clamp still
+  // saturates and the run plays back above dialogue. This pass detects
+  // post-clamp residual loudness per-run and applies a uniform
+  // additional attenuation (with cosine fade at run edges).
+  //
+  // Only triggers when:
+  //   - body-speech run (transient-breath has its own asymmetric clamp)
+  //   - applied body exceeds target by ≥ 3 dB after planning
+  //   - speechSpikeTaming ≥ 0.3 (always true under the raised floor)
+  //
+  // Capped at 5 dB to stay subtle. Goal is "sit with dialogue", not
+  // "duck below".
+  let sustainedClusterCount = 0;
+  let sustainedMaxReductionDb = 0;
+  if (speechSpikeTaming >= 0.3) {
+    const fadeFrames = Math.max(2, Math.round(50 / frameMs));
+    for (let r = 0; r < runMeta.length; r += 1) {
+      const meta = runMeta[r];
+      if (meta.runClass !== "body-speech") continue;
+      const plannedGain = plannedRunGainDb[r] ?? 0;
+      const appliedBodyDb = meta.meanDb + plannedGain;
+      const residualOverDb = appliedBodyDb - targetDb;
+      if (residualOverDb < 3) continue;
+      // Scale: residual 3 dB → ~0.7 dB cut, residual 10 dB → ~4.7 dB cut.
+      const reductionDb = clamp(
+        (residualOverDb - 1.5) * (0.55 + speechSpikeTaming * 0.2),
+        0,
+        5,
+      );
+      if (reductionDb < 0.4) continue;
+      for (let f = meta.startFrame; f < meta.endFrame; f += 1) {
+        let weight = 1;
+        const distFromStart = f - meta.startFrame;
+        const distFromEnd = meta.endFrame - 1 - f;
+        const distFromEdge = Math.min(distFromStart, distFromEnd);
+        if (distFromEdge < fadeFrames) {
+          const t = (distFromEdge + 1) / (fadeFrames + 1);
+          weight = Math.sin((t * Math.PI) / 2) ** 2;
+        }
+        dipDbByFrame[f] = Math.max(dipDbByFrame[f], reductionDb * weight);
+      }
+      sustainedClusterCount += 1;
+      sustainedMaxReductionDb = Math.max(sustainedMaxReductionDb, reductionDb);
+      if (peakReductionDbByRun[r] > -reductionDb) {
+        peakReductionDbByRun[r] = -reductionDb;
       }
     }
   }
+
+  // Final dip-application — covers BOTH the framePeak-driven body-spike
+  // guard (when samples were supplied) AND the residual pass.
+  for (let f = 0; f < frameCount; f += 1) {
+    if (dipDbByFrame[f] > 0) slewed[f] -= dipDbByFrame[f];
+  }
+
+  // Stash diagnostics for the caller (logged via PlannedGain output).
+  sustainedClusterTamedCount = sustainedClusterCount;
+  sustainedClusterMaxReductionDbOut = sustainedMaxReductionDb;
 
   // 8) Convert to linear.
   const gainCurve = new Float32Array(frameCount);
@@ -475,6 +758,10 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     targetDb,
     microRideDb,
     breathRunCount,
+    speechSpikeFrameCount,
+    speechSpikeMaxReductionDb,
+    sustainedLoudClusterCount: sustainedClusterTamedCount,
+    sustainedLoudMaxReductionDb: sustainedClusterMaxReductionDbOut,
   };
 };
 

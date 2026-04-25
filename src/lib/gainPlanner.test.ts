@@ -260,6 +260,216 @@ describe("run classification", () => {
   });
 });
 
+describe("loud-vocalization handling (onomatopoeia / yells / screams)", () => {
+  it("targets long high-crest body-speech runs below dialogue and applies post-clamp residual when the source is extremely loud", () => {
+    const frameMs = 10;
+    // 8 dialogue runs at body -22 dB anchor the trimmed-mean target near
+    // -22 dB. One LOUD vocalization run with body +0 dB (extreme — well
+    // above target+14 dB clamp) and a high crest factor (peak ~+6 dB
+    // above body via framePeakDb estimation = max(frameDb) + 12 in
+    // sample-less mode). This run should:
+    //   1. classify as body-speech (1500 ms > 400 ms)
+    //   2. get a high-crest sub-target shift down (because crest >= 13)
+    //   3. trigger the post-clamp residual pass (since source is so loud
+    //      that even the widened -18 dB clamp leaves applied body above
+    //      target by 3+ dB)
+    //   4. NOT touch dialogue runs at all
+    const dialogueRuns: Array<{ startFrame: number; endFrame: number }> = [];
+    let cursor = 50;
+    for (let i = 0; i < 8; i += 1) {
+      dialogueRuns.push({ startFrame: cursor, endFrame: cursor + 80 });
+      cursor += 80 + 30;
+    }
+    const yellStart = cursor + 50;
+    const yellEnd = yellStart + 150;
+    const totalFrames = yellEnd + 100;
+
+    const frameDb: number[] = [];
+    for (let f = 0; f < totalFrames; f += 1) frameDb.push(-70);
+    for (const run of dialogueRuns) {
+      for (let f = run.startFrame; f < run.endFrame; f += 1) frameDb[f] = -22;
+    }
+    // Yell: body +0 dB. The synthesized peak from the frameDb-only path is
+    // max(frameDb) + 12 = +12. crest = +12 - 0 = 12 dB. To trigger the
+    // high-crest sub-target (>= 13), we set ONE frame slightly higher to
+    // bump max-frame-db.
+    for (let f = yellStart; f < yellEnd; f += 1) frameDb[f] = 0;
+    frameDb[yellStart + 50] = 2; // peak frame: peakDb = 2 + 12 = 14 → crest = 14
+
+    const speechRuns = [
+      ...dialogueRuns,
+      { startFrame: yellStart, endFrame: yellEnd },
+    ];
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      targetDb: -22,
+      instabilityHint: 0.7,
+    });
+
+    const yellRun = plan.runs.find((r) => r.startFrame === yellStart);
+    assert.ok(yellRun, "yell run must appear in planner output");
+    assert.equal(yellRun!.runClass, "body-speech");
+    assert.ok(yellRun!.crestDb >= 13, `yell should have crest ≥ 13 dB; got ${yellRun!.crestDb.toFixed(1)}`);
+
+    // Post-clamp residual MUST fire — yell body is +22 dB above target,
+    // even widened ±18 clamp leaves applied body well above target.
+    assert.ok(
+      plan.sustainedLoudClusterCount >= 1,
+      `post-clamp residual must fire on extreme-loud yell; got count ${plan.sustainedLoudClusterCount}`,
+    );
+
+    // The yell's planned gain should reach the widened lower clamp
+    // (-18 dB) for high-crest body-speech runs, NOT the standard -14.
+    assert.ok(
+      yellRun!.plannedGainDb <= -16,
+      `high-crest yell gain should reach the widened clamp; got ${yellRun!.plannedGainDb.toFixed(2)} dB`,
+    );
+
+    // Dialogue frames untouched.
+    const dialogueFrame = dialogueRuns[3].startFrame + 20;
+    const dialogueGainDb = 20 * Math.log10(plan.gainCurve[dialogueFrame] + 1e-9);
+    assert.ok(
+      Math.abs(dialogueGainDb) < 1.5,
+      `dialogue frames must stay near body gain; got ${dialogueGainDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("psycho-acoustically targets normal-body high-crest screams BELOW dialogue (not at it)", () => {
+    // Test the high-crest sub-targeting in isolation. Yell body is
+    // RELATIVELY moderate (-12) but crest is high — typical scream where
+    // the planner could otherwise level body to dialogue and leave the
+    // run perceptually louder.
+    const frameMs = 10;
+    const dialogueRuns: Array<{ startFrame: number; endFrame: number }> = [];
+    let cursor = 50;
+    for (let i = 0; i < 8; i += 1) {
+      dialogueRuns.push({ startFrame: cursor, endFrame: cursor + 80 });
+      cursor += 80 + 30;
+    }
+    const yellStart = cursor + 50;
+    const yellEnd = yellStart + 100;
+    const totalFrames = yellEnd + 50;
+
+    const frameDb: number[] = [];
+    for (let f = 0; f < totalFrames; f += 1) frameDb.push(-70);
+    for (const run of dialogueRuns) {
+      for (let f = run.startFrame; f < run.endFrame; f += 1) frameDb[f] = -22;
+    }
+    // Yell body -12 dB (only 10 dB above dialogue body — within ±14 clamp)
+    // with high crest via a peak frame.
+    for (let f = yellStart; f < yellEnd; f += 1) frameDb[f] = -12;
+    frameDb[yellStart + 30] = 4; // peakDb = 4 + 12 = 16 → crest 16 - (-12) ≈ 18 dB
+
+    const speechRuns = [
+      ...dialogueRuns,
+      { startFrame: yellStart, endFrame: yellEnd },
+    ];
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      targetDb: -22,
+      instabilityHint: 0.7,
+    });
+
+    const yellRun = plan.runs.find((r) => r.startFrame === yellStart)!;
+    assert.equal(yellRun.runClass, "body-speech");
+    // Without sub-targeting, gain would be exactly -22 - (-12) = -10 dB
+    // and applied body would equal dialogue (-22). High-crest sub-target
+    // shifts target by ~(crest - 11) * 0.4. For crest 18 → -2.8 dB shift,
+    // adjusted target -24.8, gain -24.8 - (-12) = -12.8.
+    assert.ok(
+      yellRun.plannedGainDb < -11,
+      `high-crest sub-targeting should shift gain below -11 dB; got ${yellRun.plannedGainDb.toFixed(2)} dB`,
+    );
+    // Applied body is now BELOW dialogue (compensates psycho-acoustic
+    // overload from high-crest content).
+    const yellAppliedBodyDb = -12 + yellRun.plannedGainDb;
+    assert.ok(
+      yellAppliedBodyDb < -22,
+      `high-crest yell should land BELOW dialogue body (-22); got ${yellAppliedBodyDb.toFixed(2)} dB`,
+    );
+  });
+});
+
+describe("body-spike guard (within-sentence syllable peaks)", () => {
+  it("brings a 16 dB peak-above-body syllable down within ~10 dB of body without ducking unrelated frames", () => {
+    const sampleRate = 48000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    // 2 s sentence body at -22 dB, with a 60 ms stressed syllable at frames
+    // 100..105 whose peak sits ~16 dB above body. Inject the elevation in
+    // BOTH the per-frame RMS AND the sample peaks so the body-spike guard's
+    // body-relative branch (rmsExcess + peakExcess) fires the same way it
+    // does on real material.
+    const totalFrames = 200;
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    for (let i = 0; i < samples.length; i += 1) {
+      samples[i] = Math.sin((2 * Math.PI * 300 * i) / sampleRate) * 0.08; // -22 dB body
+    }
+    // 6-frame stressed cluster at amplitude ≈ 0.45 (peak -7 dBFS, ~15 dB above body peak).
+    for (let f = 100; f < 106; f += 1) {
+      for (let i = 0; i < samplesPerFrame; i += 1) {
+        samples[f * samplesPerFrame + i] = Math.sin((2 * Math.PI * 300 * i) / sampleRate) * 0.45;
+      }
+    }
+
+    const frameDb: number[] = [];
+    for (let f = 0; f < totalFrames; f += 1) frameDb.push(-22);
+    for (let f = 100; f < 106; f += 1) frameDb[f] = -7; // matches the boosted samples
+
+    const speechRuns = [{ startFrame: 0, endFrame: totalFrames }];
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -70,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.1,
+      frameMs,
+      samples,
+      sampleRate,
+      targetDb: -22,
+      peakCeilingDb: -4,
+      // Realistic spiky-source instabilityHint — drives the spike guard.
+      instabilityHint: 0.7,
+    });
+
+    // Compute APPLIED frame dB (frame RMS + applied gain) at the spike
+    // center (frame 102) and at a quiet body frame (frame 50).
+    const appliedSpikeDb =
+      frameDb[102] + 20 * Math.log10(plan.gainCurve[102] + 1e-9);
+    const appliedBodyDb =
+      frameDb[50] + 20 * Math.log10(plan.gainCurve[50] + 1e-9);
+    const spikeAboveBodyDb = appliedSpikeDb - appliedBodyDb;
+
+    // Source had ~15 dB syllable above body. With tightened guard
+    // (allowedRmsSpike ~2 dB + dip cap 9.7 dB) we should land below
+    // ~10 dB above body. Previously with cap 4.7 dB, the spike came out
+    // around 11 dB above body — visibly spiky.
+    assert.ok(
+      spikeAboveBodyDb < 10,
+      `spike should be tamed within 10 dB of body — got ${spikeAboveBodyDb.toFixed(2)} dB`,
+    );
+
+    // Frames far from the spike are at body gain (no collateral ducking).
+    const gainFar = 20 * Math.log10(plan.gainCurve[150] + 1e-9);
+    const gainBody = 20 * Math.log10(plan.gainCurve[50] + 1e-9);
+    assert.ok(
+      Math.abs(gainFar - gainBody) < 0.3,
+      `body frames far from the spike must match each other: ${gainFar.toFixed(2)} vs ${gainBody.toFixed(2)}`,
+    );
+  });
+});
+
 describe("localized peak guard", () => {
   it("dips only around the plosive frame, not the whole sentence body", () => {
     const sampleRate = 48000;
@@ -317,6 +527,98 @@ describe("localized peak guard", () => {
     assert.ok(
       Math.abs(gainNearPlosive - gainFarA) < 1.5,
       `dip should be localized — 50 ms away we should be near body gain (got ${gainNearPlosive.toFixed(2)} vs body ${gainFarA.toFixed(2)})`,
+    );
+  });
+
+  it("tames isolated body-speech spikes below the absolute peak ceiling", () => {
+    const sampleRate = 16000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 260;
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    const frameDb = new Array<number>(totalFrames).fill(-22);
+
+    const paintFrame = (frame: number, rmsDb: number) => {
+      frameDb[frame] = rmsDb;
+      const amp = dbToLin(rmsDb) * Math.SQRT2;
+      const start = frame * samplesPerFrame;
+      for (let i = 0; i < samplesPerFrame; i += 1) {
+        const sampleIndex = start + i;
+        samples[sampleIndex] = Math.sin((2 * Math.PI * 260 * sampleIndex) / sampleRate) * amp;
+      }
+    };
+
+    for (let frame = 0; frame < totalFrames; frame += 1) paintFrame(frame, -22);
+    for (let frame = 120; frame < 124; frame += 1) paintFrame(frame, -10);
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 0, endFrame: totalFrames }],
+      noiseFloorDb: -75,
+      speechThresholdDb: -58,
+      pauseNoiseRisk: 0.05,
+      frameMs,
+      samples,
+      sampleRate,
+      targetDb: -22,
+      peakCeilingDb: -3,
+      instabilityHint: 1,
+      speechSpikeTaming: 1,
+    });
+
+    const bodyGainDb = 20 * Math.log10(plan.gainCurve[80] + 1e-9);
+    const spikeGainDb = 20 * Math.log10(plan.gainCurve[121] + 1e-9);
+    const afterGainDb = 20 * Math.log10(plan.gainCurve[138] + 1e-9);
+
+    assert.ok(plan.speechSpikeFrameCount >= 4, `expected body-speech spike frames, got ${plan.speechSpikeFrameCount}`);
+    assert.ok(plan.speechSpikeMaxReductionDb >= 3.5, `expected meaningful local dip, got ${plan.speechSpikeMaxReductionDb.toFixed(2)} dB`);
+    assert.ok(spikeGainDb < bodyGainDb - 3, `spike should be dipped below body gain: ${spikeGainDb.toFixed(2)} vs ${bodyGainDb.toFixed(2)} dB`);
+    assert.ok(Math.abs(afterGainDb - bodyGainDb) < 1, `nearby dialogue body should recover: ${afterGainDb.toFixed(2)} vs ${bodyGainDb.toFixed(2)} dB`);
+  });
+
+  it("does not flatten sustained loud dialogue as a spike cluster", () => {
+    const sampleRate = 16000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 260;
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+    const frameDb = new Array<number>(totalFrames).fill(-22);
+
+    const paintFrame = (frame: number, rmsDb: number) => {
+      frameDb[frame] = rmsDb;
+      const amp = dbToLin(rmsDb) * Math.SQRT2;
+      const start = frame * samplesPerFrame;
+      for (let i = 0; i < samplesPerFrame; i += 1) {
+        const sampleIndex = start + i;
+        samples[sampleIndex] = Math.sin((2 * Math.PI * 260 * sampleIndex) / sampleRate) * amp;
+      }
+    };
+
+    for (let frame = 0; frame < totalFrames; frame += 1) paintFrame(frame, -22);
+    for (let frame = 100; frame < 160; frame += 1) paintFrame(frame, -16);
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 0, endFrame: totalFrames }],
+      noiseFloorDb: -75,
+      speechThresholdDb: -58,
+      pauseNoiseRisk: 0.05,
+      frameMs,
+      samples,
+      sampleRate,
+      targetDb: -22,
+      peakCeilingDb: -3,
+      instabilityHint: 0.65,
+      speechSpikeTaming: 1,
+    });
+
+    const bodyGainDb = 20 * Math.log10(plan.gainCurve[80] + 1e-9);
+    const loudPhraseGainDb = 20 * Math.log10(plan.gainCurve[130] + 1e-9);
+
+    assert.equal(plan.speechSpikeFrameCount, 0);
+    assert.ok(
+      loudPhraseGainDb > bodyGainDb - 3,
+      `sustained loud phrase should keep performance level, got ${loudPhraseGainDb.toFixed(2)} vs body ${bodyGainDb.toFixed(2)} dB`,
     );
   });
 });

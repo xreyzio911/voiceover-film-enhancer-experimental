@@ -125,18 +125,19 @@ const BATCH_MEMORY_GUARD_INTERVAL = 3;
 
 /**
  * Cumulative audio (in seconds) the active ffmpeg worker may process before
- * we proactively recycle it. 60 minutes is generous for short-VO batches and
+ * we proactively recycle it. 40 minutes keeps large VO batches safer and
  * triggers a refresh after roughly every 3-4 long episodes — both safer than
  * the file-count guard alone, which can leave the worker grinding through
  * 45+ minutes of dialogue between recycles on long-file batches.
  */
-const BATCH_AUDIO_RECYCLE_SECONDS = 3600;
+const BATCH_AUDIO_RECYCLE_SECONDS = 2400;
+const ANALYSIS_AUDIO_RECYCLE_SECONDS = 1800;
 /**
- * Auto-retry budget per file. We retry ONCE on recoverable failures
+ * Auto-retry budget per file. We retry twice on recoverable failures
  * (OOM, filter-init errors, watchdog aborts) on a fresh worker. The
- * second failure marks the file permanently failed.
+ * third failure marks the file permanently failed.
  */
-const PER_FILE_MAX_RETRIES = 1;
+const PER_FILE_MAX_RETRIES = 2;
 /**
  * Per-file watchdog budget. We give each file
  *   max(WATCHDOG_BASE_SECONDS, durationSec * WATCHDOG_DURATION_FACTOR + WATCHDOG_BASE_SECONDS)
@@ -146,6 +147,21 @@ const PER_FILE_MAX_RETRIES = 1;
  * slow filter chains.
  */
 const WATCHDOG_BASE_SECONDS = 90;
+
+/**
+ * Auto-load locally-trained review weights from `localStorage` on app start
+ * (and react to cross-tab updates).
+ *
+ * Currently DISABLED: the prior training runs were on small same-direction
+ * datasets (8 reviews / 7 reviews, all winner-preferred, no challenger
+ * preferences), which produced ranker weights that don't generalize. The
+ * built-in defaults are the safer choice until we have ≥ 30–50 reviews
+ * with mixed outcomes.
+ *
+ * Manual training and import in the QC Lab still work — those just won't
+ * auto-apply on the next app load.
+ */
+const AUTO_LOAD_LOCAL_REVIEW_WEIGHTS = false;
 const WATCHDOG_DURATION_FACTOR = 4;
 const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled";
 const FATAL_FFMPEG_PATTERN = /memory access out of bounds|runtimeerror/i;
@@ -162,8 +178,8 @@ const GAIN_PLANNER_ANALYSIS_SAMPLE_RATE = 16000;
 const GAIN_PLANNER_FRAME_MS = 10;
 /**
  * Memory guard. Even at 16 kHz mono Float32 a 2-hour file would be ~460 MB,
- * which will OOM the WASM heap. Beyond this we skip the planner and rely on
- * the downstream `dynaudnorm` fallback.
+ * which will OOM the WASM heap. Beyond this we fail/retry instead of
+ * emitting planner-off legacy output.
  */
 const GAIN_PLANNER_MAX_DURATION_SECONDS = 4800; // 80 minutes — fine at 16 kHz mono
 const sanitizeBase = (name: string) =>
@@ -579,6 +595,11 @@ export default function VoLeveler() {
 
   const loadStoredReviewWeights = () => {
     if (typeof window === "undefined") return;
+    if (!AUTO_LOAD_LOCAL_REVIEW_WEIGHTS) {
+      setLearnedReviewWeights(DEFAULT_LEARNED_REVIEW_WEIGHTS);
+      setLearnedReviewWeightsSource("default");
+      return;
+    }
     try {
       const stored = window.localStorage.getItem(REVIEW_WEIGHT_STORAGE_KEY);
       if (!stored) {
@@ -604,6 +625,11 @@ export default function VoLeveler() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!AUTO_LOAD_LOCAL_REVIEW_WEIGHTS) {
+      // Auto-load disabled — built-in defaults are already in state.
+      // No log line so the Processing Log stays clean.
+      return;
+    }
     try {
       const stored = window.localStorage.getItem(REVIEW_WEIGHT_STORAGE_KEY);
       if (!stored) return;
@@ -625,6 +651,7 @@ export default function VoLeveler() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    if (!AUTO_LOAD_LOCAL_REVIEW_WEIGHTS) return;
     const handleStorage = (event: StorageEvent) => {
       if (event.key !== null && event.key !== REVIEW_WEIGHT_STORAGE_KEY) return;
       loadStoredReviewWeights();
@@ -1049,6 +1076,14 @@ const summarizeFailureReason = (error: unknown) => {
     speechRunCount: number;
     /** Count of runs classified as transient-breath (subset of speechRunCount). */
     breathRunCount: number;
+    /** Count of isolated body-speech spike frames locally tamed. */
+    speechSpikeFrameCount: number;
+    /** Largest localized body-speech spike reduction in dB. */
+    speechSpikeMaxReductionDb: number;
+    /** Sustained-loud (onomatopoeia / yell) clusters tamed inside body-speech runs. */
+    sustainedLoudClusterCount: number;
+    /** Largest uniform attenuation applied to a sustained-loud cluster. */
+    sustainedLoudMaxReductionDb: number;
     /** Effective intra-run micro-ride range in dB. Diagnostic. */
     microRideDb: number;
   };
@@ -1136,6 +1171,14 @@ const summarizeFailureReason = (error: unknown) => {
         0,
         1,
       );
+      const speechSpikeTaming = clamp(
+        instabilityHint * 0.35 +
+          (profile?.lineSwingScore ?? analysis?.lineSwingScore ?? 0) * 0.35 +
+          (analysis?.onsetOvershootScore ?? 0) * 0.18 +
+          (profile?.clickScore ?? analysis?.clickScore ?? 0) * 0.12,
+        0,
+        1,
+      );
 
       const mask = buildSpeechMask(frameDb, noiseFloorDb, { frameMs: GAIN_PLANNER_FRAME_MS });
       const speechRuns: PlannerSpeechRun[] = speechRunsFromMask(mask);
@@ -1154,6 +1197,7 @@ const summarizeFailureReason = (error: unknown) => {
         sourceTargetBlend: 0.1,
         peakCeilingDb: -3,
         instabilityHint,
+        speechSpikeTaming,
       });
 
       const inputDuration = samples.length / GAIN_PLANNER_ANALYSIS_SAMPLE_RATE;
@@ -1166,6 +1210,10 @@ const summarizeFailureReason = (error: unknown) => {
         expanderDepthDb: plan.expanderDepthDb,
         speechRunCount: plan.runs.length,
         breathRunCount: plan.breathRunCount,
+        speechSpikeFrameCount: plan.speechSpikeFrameCount,
+        speechSpikeMaxReductionDb: plan.speechSpikeMaxReductionDb,
+        sustainedLoudClusterCount: plan.sustainedLoudClusterCount,
+        sustainedLoudMaxReductionDb: plan.sustainedLoudMaxReductionDb,
         microRideDb: plan.microRideDb,
       };
     } finally {
@@ -4249,12 +4297,20 @@ const summarizeFailureReason = (error: unknown) => {
       plan.breathRunCount > 0
         ? `, ${plan.breathRunCount} breath/transient run${plan.breathRunCount === 1 ? "" : "s"} tamed`
         : "";
+    const speechSpikeNote =
+      plan.speechSpikeFrameCount > 0
+        ? `, ${plan.speechSpikeFrameCount} speech-spike frame${plan.speechSpikeFrameCount === 1 ? "" : "s"} tamed (max ${plan.speechSpikeMaxReductionDb.toFixed(1)} dB)`
+        : "";
+    const sustainedLoudNote =
+      plan.sustainedLoudClusterCount > 0
+        ? `, ${plan.sustainedLoudClusterCount} sustained-loud cluster${plan.sustainedLoudClusterCount === 1 ? "" : "s"} tamed (max ${plan.sustainedLoudMaxReductionDb.toFixed(1)} dB)`
+        : "";
     appendLog(
       `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(
         1,
       )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
         2,
-      )} dB${breathNote}).`,
+      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}).`,
     );
 
     context.plan = plan;
@@ -4277,15 +4333,16 @@ const summarizeFailureReason = (error: unknown) => {
   ): CandidateVariant[] => {
     const variants: CandidateVariant[] = ["cinematic-stable", "continuity-safe"];
     // On batch-episode-length files (≥ 10 min) we skip the third variant
-    // unless the noise picture is clearly severe. Running three full render
-    // strategies on a 20-min file triples memory pressure and wall time
-    // without usually picking a different winner.
+    // unless pause/noise evidence says it could win; long files recycle
+    // between variants, so the extra quality candidate is still bounded.
     const longFile = durationSeconds !== null && durationSeconds >= LONG_FILE_DURATION_SECONDS;
     const severeNoise =
       (profile?.pauseNoiseRisk ?? 0) >= 0.55 ||
       profile?.noiseRisk === "high" ||
       ((profile?.pauseNoiseRisk ?? 0) >= 0.4 && profile?.noiseRisk === "medium");
-    if (severeNoise) {
+    const longFilePauseCandidate =
+      longFile && ((profile?.pauseNoiseRisk ?? 0) >= 0.4 || profile?.noiseRisk === "medium");
+    if (severeNoise || longFilePauseCandidate) {
       variants.push("pause-safe");
     } else if (
       !longFile &&
@@ -4295,7 +4352,31 @@ const summarizeFailureReason = (error: unknown) => {
     ) {
       variants.push("pause-safe");
     }
-    variants.push("source-safe");
+
+    // SPIKY SOURCES SHOULD NOT GET CORE-SAFE.
+    //
+    // `source-safe` (a.k.a. "core-safe") disables the entire downstream
+    // chain — no acompressor glue, no dynaudnorm safety pass — and relies
+    // on the planner + final alimiter for ALL dynamics control. That's the
+    // wrong choice for a take with visible volume spikes inside sentences,
+    // because any spike the planner's body-relative guard misses then has
+    // no second-line defense before the limiter (which only catches
+    // absolute-ceiling violations, not body-relative ones).
+    //
+    // We drop core-safe from the candidate list when:
+    //   - line swing ≥ 0.55 (within-sentence variation is high), OR
+    //   - the same instabilityBlend the planner uses for its spike taming
+    //     decision is ≥ 0.50 (the planner is already actively dipping
+    //     spikes — meaning the source HAS them).
+    const lineSwing = profile?.lineSwingScore ?? 0;
+    const instabilityBlend =
+      (profile?.instabilityScore ?? 0) * 0.5 +
+      lineSwing * 0.3 +
+      (profile?.sentenceJumpScore ?? 0) * 0.2;
+    const spikySource = lineSwing >= 0.55 || instabilityBlend >= 0.5;
+    if (!spikySource) {
+      variants.push("source-safe");
+    }
     return variants;
   };
 
@@ -4471,8 +4552,16 @@ const summarizeFailureReason = (error: unknown) => {
           const breathNote = plan.breathRunCount > 0
             ? `, ${plan.breathRunCount} breath/transient run${plan.breathRunCount === 1 ? "" : "s"} tamed`
             : "";
+          const speechSpikeNote =
+            plan.speechSpikeFrameCount > 0
+              ? `, ${plan.speechSpikeFrameCount} speech-spike frame${plan.speechSpikeFrameCount === 1 ? "" : "s"} tamed (max ${plan.speechSpikeMaxReductionDb.toFixed(1)} dB)`
+              : "";
+          const sustainedLoudNote =
+            plan.sustainedLoudClusterCount > 0
+              ? `, ${plan.sustainedLoudClusterCount} sustained-loud cluster${plan.sustainedLoudClusterCount === 1 ? "" : "s"} tamed (max ${plan.sustainedLoudMaxReductionDb.toFixed(1)} dB)`
+              : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}).`,
           );
         } else {
           appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);
@@ -4850,8 +4939,10 @@ const summarizeFailureReason = (error: unknown) => {
           `Deep analysis started for ${jobs.length} file(s) (bootstrap up to ${ANALYSIS_SAMPLE_SECONDS}s, distributed coverage on long takes).`
         );
         const analyses: FileAnalysis[] = [];
+        let analysisWorkerCumulativeAudioSec = 0;
         for (let i = 0; i < jobs.length; i += 1) {
           const job = jobs[i];
+          const analysisEstDurationSec = estimateAudioSeconds(job.file);
           setStatus(`Analyze: ${job.base} (${i + 1}/${jobs.length})`);
           setActiveQueueStage(job.base, "Analyze", `Pass ${i + 1} of ${jobs.length}`);
           try {
@@ -4872,13 +4963,21 @@ const summarizeFailureReason = (error: unknown) => {
             markQueuePending(job.base, "Ready for render", "Analysis fallback used");
             if (shouldResetFfmpegForError(error)) {
               ffmpeg = await refreshFfmpeg(`analysis failure on ${job.base}`);
+              analysisWorkerCumulativeAudioSec = 0;
             }
           } finally {
             await safeDeleteFile(ffmpeg, job.inputName);
           }
 
-          if (shouldRecycleFfmpegForBatch(i + 1, jobs.length)) {
+          analysisWorkerCumulativeAudioSec += analysisEstDurationSec;
+          if (analysisWorkerCumulativeAudioSec >= ANALYSIS_AUDIO_RECYCLE_SECONDS) {
+            ffmpeg = await refreshFfmpeg(
+              `analysis audio-volume guard (${(analysisWorkerCumulativeAudioSec / 60).toFixed(0)} min scanned since refresh)`,
+            );
+            analysisWorkerCumulativeAudioSec = 0;
+          } else if (shouldRecycleFfmpegForBatch(i + 1, jobs.length)) {
             ffmpeg = await refreshFfmpeg(`analysis memory guard (${i + 1}/${jobs.length})`);
+            analysisWorkerCumulativeAudioSec = 0;
           }
         }
 
