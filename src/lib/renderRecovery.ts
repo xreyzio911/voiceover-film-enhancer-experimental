@@ -11,6 +11,9 @@ export type DegradeReason =
   | "segment-render-memory-fault"
   | "analysis-window-retry"
   | "analysis-window-drop"
+  | "qc-unavailable"
+  | "planner-required"
+  | "planner-apply-failed"
   | "single-pass-recovery";
 
 export type CandidateScore = {
@@ -90,6 +93,13 @@ const materiallyBetterThanHealthySegmented = (recovered: CandidateScore, healthy
   recovered.pause + HEALTHY_SEGMENTED_PAUSE_DELTA < healthy.pause &&
   recovered.compression + HEALTHY_SEGMENTED_COMPRESSION_DELTA < healthy.compression;
 
+const hasUnselectableGate = (score: CandidateScore) =>
+  (score.gateReasons ?? []).some((reason) =>
+    reason === "qc-unavailable" ||
+    reason === "planner-required" ||
+    reason === "planner-apply-failed"
+  );
+
 export const buildRenderRiskProfile = (input: RenderRiskInput): RenderRiskProfile => {
   const highRisk =
     input.plannedSegmentCount >= 24 ||
@@ -153,6 +163,10 @@ export const shouldPreferCandidate = (
   currentScore: CandidateScore | null,
   currentMeta: CandidateRenderMeta | null
 ) => {
+  if (hasUnselectableGate(challengerScore)) {
+    return { select: false, reason: "candidate unavailable for selection" };
+  }
+
   if (currentScore === null || currentMeta === null) {
     return { select: true, reason: "first completed candidate" };
   }

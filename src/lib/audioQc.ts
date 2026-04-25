@@ -509,7 +509,8 @@ export const analyzeFrameAudio = (
   const nearSpeechPauseFrames: Array<{ db: number; peakDb: number; crestDb: number; sharpnessDb: number }> = [];
   let activeSpeechFrames = 0;
   let nonSpeechFrames = 0;
-  let clickFrames = 0;
+  let speechClickFrames = 0;
+  let pauseClickFrames = 0;
 
   const speechContextFrames = Math.round(0.35 / (frameMs / 1000));
   for (let frame = 0; frame < frameCount; frame += 1) {
@@ -519,16 +520,16 @@ export const analyzeFrameAudio = (
       activeSpeechFrames += 1;
       speechDb.push(frameDb[frame]);
       speechCrest.push(crestDb);
-      if ((crestDb > 20.5 && peakFrameDb > -18) || frameSharpness[frame] > -29) {
-        clickFrames += 0.5;
+      if ((crestDb > 24 && peakFrameDb > -8) || (frameSharpness[frame] > -24 && peakFrameDb > -16)) {
+        speechClickFrames += 1;
       }
       continue;
     }
 
     nonSpeechFrames += 1;
     pauseDb.push(frameDb[frame]);
-    if ((crestDb > 15 && peakFrameDb > -30) || frameSharpness[frame] > -32) {
-      clickFrames += 1;
+    if ((crestDb > 18 && peakFrameDb > -24) || (frameSharpness[frame] > -28 && peakFrameDb > -30)) {
+      pauseClickFrames += 1;
     }
 
     const from = Math.max(0, frame - speechContextFrames);
@@ -780,10 +781,15 @@ export const analyzeFrameAudio = (
     1
   );
 
-  const frameClickDensity = clickFrames / Math.max(nonSpeechFrames, 1);
+  const speechClickDensity = speechClickFrames / Math.max(activeSpeechFrames, 1);
+  const pauseClickDensity = pauseClickFrames / Math.max(nonSpeechFrames, 1);
   const sampleClicksPerMinute =
     ((options.sampleSpikeCount ?? 0) / Math.max(options.durationSec, 1e-6)) * 60;
-  const clickScore = clamp(frameClickDensity * 1.9 + sampleClicksPerMinute / 18, 0, 1);
+  const clickScore = clamp(
+    pauseClickDensity * 1.45 + speechClickDensity * 0.55 + sampleClicksPerMinute / 30,
+    0,
+    1
+  );
 
   const crestSpeechDb = speechCrest.length > 0 ? mean(speechCrest) : 12;
   const compressionScore = clamp(

@@ -281,6 +281,60 @@ test("scoreCandidateWithLearnedWeights hard-penalizes source regression without 
   assert.ok(ranking.hardGatePenalty > 0);
 });
 
+test("scoreCandidateWithLearnedWeights rejects candidates when QC analysis is unavailable", () => {
+  const ranking = scoreCandidateWithLearnedWeights({
+    baselineScore: buildScore({ stability: 0.1, pause: 0.05, compression: 0.04, echo: 0.03 }),
+    candidateQc: null,
+    sourceQc,
+    alignment: buildAlignment(),
+    meta: buildMeta({ degraded: true, degradeReasons: ["qc-unavailable"] }),
+  });
+
+  assert.ok(ranking.gateReasons.includes("qc-unavailable"));
+  assert.ok(ranking.hardGatePenalty >= 100000);
+  assert.ok(ranking.rankingScore > 100000);
+});
+
+test("scoreCandidateWithLearnedWeights does not hard-gate inherited ending risk", () => {
+  const sourceWithWeakEndings = toReviewMetricSnapshot({
+    inputTP: -2.4,
+    endFadeRiskScore: 0.74,
+    overallRisk: 0.24,
+    instabilityScore: 0.16,
+    sentenceJumpScore: 0.12,
+    pauseNoiseRisk: 0.14,
+    compressionScore: 0.1,
+    clickScore: 0.06,
+    echoScore: 0.08,
+    sibilanceScore: 0.09,
+    pauseNoiseFloorDb: -72,
+    noiseContrastDb: 28,
+  });
+  const candidateWithSameWeakEndings = toReviewMetricSnapshot({
+    inputTP: -2.4,
+    overallRisk: 0.25,
+    instabilityScore: 0.17,
+    sentenceJumpScore: 0.12,
+    pauseNoiseRisk: 0.14,
+    compressionScore: 0.1,
+    clickScore: 0.06,
+    echoScore: 0.08,
+    endFadeRiskScore: 0.77,
+    sibilanceScore: 0.09,
+    pauseNoiseFloorDb: -72,
+    noiseContrastDb: 28,
+  });
+  const ranking = scoreCandidateWithLearnedWeights({
+    baselineScore: buildScore(),
+    candidateQc: candidateWithSameWeakEndings,
+    sourceQc: sourceWithWeakEndings,
+    alignment: buildAlignment(),
+    meta: buildMeta(),
+  });
+
+  assert.ok(!ranking.gateReasons.includes("ending-damage"));
+});
+
 test("review decision JSONL round-trips", () => {
   const records: ReviewDecisionRecord[] = [
     {

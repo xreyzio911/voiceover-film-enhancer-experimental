@@ -247,6 +247,29 @@ test("lead-in breath-spike scoring rises for short pre-word transients above fol
   assert.ok(leadBurst.breathSpikeRisk > steady.breathSpikeRisk + 0.18);
 });
 
+test("click scoring ignores normal high-crest speech consonants", () => {
+  const cleanConsonants = analyzeSections([
+    { frames: 120, fromDb: -78 },
+    { frames: 180, fromDb: -29, peakLiftDb: 22, sharpnessDb: -30 },
+    { frames: 100, fromDb: -78 },
+  ]);
+
+  assert.ok(cleanConsonants.clickScore < 0.08);
+});
+
+test("click scoring still rises for repeated isolated non-speech clicks", () => {
+  const clickBursts: Section[] = [{ frames: 60, fromDb: -78 }];
+  for (let index = 0; index < 8; index += 1) {
+    clickBursts.push({ frames: 4, fromDb: -56, peakLiftDb: 35, sharpnessDb: -20 });
+    clickBursts.push({ frames: 8, fromDb: -78 });
+  }
+  clickBursts.push({ frames: 120, fromDb: -29 });
+
+  const clicky = analyzeSections(clickBursts);
+
+  assert.ok(clicky.clickScore > 0.12);
+});
+
 test("line swing scoring rises for high-low-high speech contours", () => {
   const protectedTail = analyzeSections([
     { frames: 120, fromDb: -75 },

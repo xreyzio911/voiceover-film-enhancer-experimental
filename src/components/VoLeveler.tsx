@@ -1014,10 +1014,9 @@ const summarizeFailureReason = (error: unknown) => {
   ): Promise<PlannedGain | null> => {
     if (!gainPlannerEnabled) return null;
     if (durationSeconds !== null && durationSeconds > GAIN_PLANNER_MAX_DURATION_SECONDS) {
-      appendLog(
-        `[Planner] ${sanitizeBase(inputName)}: skipped (duration ${durationSeconds.toFixed(0)}s exceeds ${GAIN_PLANNER_MAX_DURATION_SECONDS}s budget).`,
+      throw new Error(
+        `duration ${durationSeconds.toFixed(0)}s exceeds planner budget ${GAIN_PLANNER_MAX_DURATION_SECONDS}s`,
       );
-      return null;
     }
 
     const wavName = `${sanitizeBase(inputName)}_planner_env.wav`;
@@ -1133,6 +1132,7 @@ const summarizeFailureReason = (error: unknown) => {
    */
   const PLANNER_APPLY_CHUNK_SECONDS_DEFAULT = 90;
   const PLANNER_APPLY_CHUNK_SECONDS_LONG = 60;
+  const PLANNER_APPLY_RETRY_CHUNK_SECONDS: Array<number | null> = [null, 60, 30, 15];
   const LONG_FILE_DURATION_SECONDS = 600; // 10 min
 
   /**
@@ -1238,12 +1238,14 @@ const summarizeFailureReason = (error: unknown) => {
     inputName: string,
     outputName: string,
     plan: PlannedGain,
+    chunkSecondsOverride?: number | null,
   ) => {
     const total = plan.durationSec;
     const chunkSeconds =
-      total >= LONG_FILE_DURATION_SECONDS
+      chunkSecondsOverride ??
+      (total >= LONG_FILE_DURATION_SECONDS
         ? PLANNER_APPLY_CHUNK_SECONDS_LONG
-        : PLANNER_APPLY_CHUNK_SECONDS_DEFAULT;
+        : PLANNER_APPLY_CHUNK_SECONDS_DEFAULT);
     if (total <= chunkSeconds) {
       await levelInputRange(ffmpeg, inputName, outputName, plan, 0, total);
       return;
@@ -2127,6 +2129,17 @@ const summarizeFailureReason = (error: unknown) => {
     };
   };
 
+  const hasMeasuredNoiseProblem = (
+    noiseRisk: NoiseRisk,
+    noiseFloorDb: number | null,
+    noiseContrastDb: number | null,
+    pauseNoiseRisk: number,
+  ) =>
+    pauseNoiseRisk >= 0.28 ||
+    (noiseContrastDb !== null && noiseContrastDb < 18) ||
+    (noiseFloorDb !== null && noiseFloorDb > -58) ||
+    (noiseRisk === "high" && ((noiseFloorDb ?? -70) > -62 || pauseNoiseRisk >= 0.18));
+
   const buildAdaptiveProfile = (analysis: FileAnalysis | undefined, reference: BatchReference | null) => {
     const needsAdaptiveProfile =
       smartMatchConfig.tone > 0 || smartMatchConfig.dynamics > 0 || roomCleanup || sceneBlend;
@@ -2306,16 +2319,23 @@ const summarizeFailureReason = (error: unknown) => {
     // the NR filter uses, so logs and QC see a meaningful value. The actual
     // filter chain is built in `buildAdaptiveNoiseReductionFilter`.
     const measuredNoiseContrast = analysis.noiseContrastDb ?? null;
+    const measuredNoiseNeedsNr = hasMeasuredNoiseProblem(
+      noiseRisk,
+      measuredNoiseFloor,
+      measuredNoiseContrast,
+      pauseNoiseRisk,
+    );
     const nrContrastPenalty =
-      measuredNoiseContrast !== null ? clamp((22 - measuredNoiseContrast) / 14, 0, 1) : 0.35;
-    const nrBandFactor = noiseRisk === "high" ? 1 : noiseRisk === "medium" ? 0.55 : 0.15;
-    const nrRoomFactor = roomRisk === "high" ? 0.35 : roomRisk === "medium" ? 0.18 : 0;
+      measuredNoiseContrast !== null ? clamp((20 - measuredNoiseContrast) / 12, 0, 1) : 0;
+    const nrBandFactor =
+      measuredNoiseNeedsNr ? (noiseRisk === "high" ? 1 : noiseRisk === "medium" ? 0.55 : 0.1) : 0;
+    const nrRoomFactor = measuredNoiseNeedsNr ? (roomRisk === "high" ? 0.18 : roomRisk === "medium" ? 0.08 : 0) : 0;
     const denoiseStrength = clamp(
       pauseNoiseRisk * 0.45 + nrContrastPenalty * 0.3 + nrBandFactor * 0.2 + nrRoomFactor,
       0,
       1,
     );
-    const useDenoise = noiseGuard && denoiseStrength >= 0.26;
+    const useDenoise = noiseGuard && measuredNoiseNeedsNr && denoiseStrength >= 0.26;
     const tailGateStrength = !useTailGate
       ? 0
       : roomRisk === "high"
@@ -2493,11 +2513,14 @@ const summarizeFailureReason = (error: unknown) => {
     // Composite "need" score drives how aggressive NR should be.
     // - pauseNoiseRisk: how noisy the pauses are (0..1).
     // - noiseContrastDb: SNR between speech and pauses. <14 dB = poor.
-    // - roomRisk: reverb/echo bed. Higher = more NR helps clean it up.
+    // - roomRisk: reverb/echo bed. Used only after real noise evidence exists.
     // - noiseRisk band: coarse backup if metrics missing.
-    const contrastPenalty = noiseContrastDb !== null ? clamp((22 - noiseContrastDb) / 14, 0, 1) : 0.35;
-    const bandFactor = noiseRisk === "high" ? 1 : noiseRisk === "medium" ? 0.55 : 0.15;
-    const roomFactor = roomRisk === "high" ? 0.35 : roomRisk === "medium" ? 0.18 : 0;
+    const measuredNoiseNeedsNr = hasMeasuredNoiseProblem(noiseRisk, noiseFloorDb, noiseContrastDb, pauseNoiseRisk);
+    if (!measuredNoiseNeedsNr) return null;
+
+    const contrastPenalty = noiseContrastDb !== null ? clamp((20 - noiseContrastDb) / 12, 0, 1) : 0;
+    const bandFactor = noiseRisk === "high" ? 1 : noiseRisk === "medium" ? 0.55 : 0.1;
+    const roomFactor = roomRisk === "high" ? 0.18 : roomRisk === "medium" ? 0.08 : 0;
     const needScore = clamp(
       pauseNoiseRisk * 0.45 + contrastPenalty * 0.3 + bandFactor * 0.2 + roomFactor,
       0,
@@ -3171,7 +3194,7 @@ const summarizeFailureReason = (error: unknown) => {
     );
 
     if (sourceSafeMode) {
-      // Source-safe fallback intentionally leaves dynamics to the planner and final limiter.
+      // Core-safe candidate intentionally leaves dynamics to the planner and final limiter.
     } else if (gainPlannerActive) {
       // Planner already normalized sentence-to-sentence level. Downstream
       // compression is now *adaptive*: on clean takes we bypass entirely
@@ -4132,6 +4155,60 @@ const summarizeFailureReason = (error: unknown) => {
     speechAlignedSegmentCountUsed: number | null;
   };
 
+  type PlannerRenderContext = {
+    plan: PlannedGain | null;
+    leveledInputName: string | null;
+    leveledReady: boolean;
+    applyChunkSeconds: number | null;
+  };
+
+  const analysisLooksSpeechBearing = (analysis: FileAnalysis | undefined, durationSeconds: number | null) => {
+    if ((analysis?.speechSegmentCount ?? 0) > 0) return true;
+    if ((analysis?.speechDutyCyclePct ?? 0) >= 0.8) return true;
+    return durationSeconds !== null && durationSeconds >= 8 && (analysis?.analysisConfidence ?? 0) >= 0.3;
+  };
+
+  const preparePlannerRenderContext = async (
+    ffmpeg: FFmpeg,
+    job: JobEntry,
+    profile: AdaptiveProfile | null,
+    analysis: FileAnalysis | undefined,
+    durationSeconds: number | null,
+  ): Promise<PlannerRenderContext> => {
+    const context: PlannerRenderContext = {
+      plan: null,
+      leveledInputName: null,
+      leveledReady: false,
+      applyChunkSeconds: null,
+    };
+    if (!gainPlannerEnabled) return context;
+
+    const plan = await planGainForInput(ffmpeg, job.inputName, profile, analysis, durationSeconds);
+    if (!plan) {
+      if (analysisLooksSpeechBearing(analysis, durationSeconds)) {
+        throw new Error("speech-aware planner produced no plan on speech-bearing input");
+      }
+      appendLog(`[Planner] ${job.base}: bypassed (no-op; short or silent input).`);
+      return context;
+    }
+
+    const breathNote =
+      plan.breathRunCount > 0
+        ? `, ${plan.breathRunCount} breath/transient run${plan.breathRunCount === 1 ? "" : "s"} tamed`
+        : "";
+    appendLog(
+      `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(
+        1,
+      )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
+        2,
+      )} dB${breathNote}).`,
+    );
+
+    context.plan = plan;
+    context.leveledInputName = `${job.base}_planner_leveled.wav`;
+    return context;
+  };
+
   const formatCandidateVariant = (variant: CandidateVariant) =>
     variant === "cinematic-stable"
       ? "cinematic-stable"
@@ -4139,7 +4216,7 @@ const summarizeFailureReason = (error: unknown) => {
         ? "continuity-safe"
         : variant === "pause-safe"
           ? "pause-safe"
-          : "source-safe";
+          : "core-safe";
 
   const buildMixCandidateVariants = (
     profile: AdaptiveProfile | null,
@@ -4281,9 +4358,10 @@ const summarizeFailureReason = (error: unknown) => {
     options?: MixRenderOptions,
     speechRenderPlan?: SpeechRenderPlan | null,
     analysis?: FileAnalysis | undefined,
+    plannerContext?: PlannerRenderContext | null,
   ): Promise<RenderAttemptResult> => {
     const hasRoomFilters = roomCleanup && !!profile && (profile.useTailGate || profile.echoNotchCutDb >= 0.25);
-    const hasAdaptiveNoiseReduction = noiseGuard && !!profile && profile.noiseRisk !== "low";
+    const hasAdaptiveNoiseReduction = resolveAdaptiveNoiseReductionFilter(profile, options) !== null;
     const fallbackStrategies: Array<{ label: string; options?: MixRenderOptions }> = [{ label: "primary chain" }];
     if (hasRoomFilters) {
       fallbackStrategies.push({
@@ -4328,12 +4406,11 @@ const summarizeFailureReason = (error: unknown) => {
       return inputDurationSeconds;
     };
 
-    // Plan the gain curve ONCE, before trying any strategy. The curve is
-    // cheap (per-frame linear gain array). The rendering stages consume the
-    // result as a pre-leveled WAV, produced by applying the curve via
-    // `applyPlannerToFullInput` (chunked in JS to stay memory-safe).
-    let plan: PlannedGain | null = null;
-    if (gainPlannerEnabled) {
+    // Candidate renders normally receive a file-level planner context so all
+    // variants share the same gain curve. The direct-planning branch is kept
+    // defensive for any future caller that has not prepared the context.
+    let plan: PlannedGain | null = plannerContext?.plan ?? null;
+    if (!plannerContext && gainPlannerEnabled) {
       try {
         const dur = await ensureInputDuration();
         plan = await planGainForInput(ffmpeg, job.inputName, profile, analysis, dur);
@@ -4349,21 +4426,21 @@ const summarizeFailureReason = (error: unknown) => {
         }
       } catch (error) {
         appendLog(
-          `[Planner] ${job.base}: bypassed (${error instanceof Error ? error.message : String(error)}). Falling back to legacy leveler.`,
+          `[Planner] ${job.base}: failed (${error instanceof Error ? error.message : String(error)}). No legacy fallback emitted.`,
         );
         if (shouldResetFfmpegForError(error)) {
           ffmpeg = await refreshFfmpeg(`planner failure on ${job.base}`);
           await writeJobInput(ffmpeg, job);
         }
-        plan = null;
+        throw error;
       }
     }
 
-    // Pre-level the full file ONCE when a plan exists. Cache the result for
-    // every candidate variant + strategy. Auto-recreate after an ffmpeg
-    // worker refresh (worker refresh wipes the virtual FS).
-    const leveledInputName = plan ? `${job.base}_planner_leveled.wav` : null;
-    let leveledReady = false;
+    // Pre-level the full file when a plan exists. Cache the rendered planner
+    // WAV across candidate variants, and recreate it after an ffmpeg worker
+    // refresh because refresh wipes the virtual FS.
+    const leveledInputName = plan ? (plannerContext?.leveledInputName ?? `${job.base}_planner_leveled.wav`) : null;
+    let leveledReady = plannerContext?.leveledReady ?? false;
     const ensureLeveledInput = async (): Promise<string | null> => {
       if (!plan || !leveledInputName) return null;
       if (leveledReady) {
@@ -4371,25 +4448,39 @@ const summarizeFailureReason = (error: unknown) => {
           await ffmpeg.readFile(leveledInputName);
           return leveledInputName;
         } catch {
-          leveledReady = false; // virtual FS reset — re-apply below
+          leveledReady = false;
+          if (plannerContext) plannerContext.leveledReady = false;
         }
       }
-      try {
-        await applyPlannerToFullInput(ffmpeg, job.inputName, leveledInputName, plan);
-        leveledReady = true;
-        return leveledInputName;
-      } catch (error) {
-        appendLog(
-          `[Planner] ${job.base}: apply failed (${error instanceof Error ? error.message : String(error)}). Falling back to original input.`,
-        );
-        if (shouldResetFfmpegForError(error)) {
-          ffmpeg = await refreshFfmpeg(`planner apply on ${job.base}`);
-          await writeJobInput(ffmpeg, job);
+      let lastApplyError: unknown = null;
+      for (const retryChunkSeconds of PLANNER_APPLY_RETRY_CHUNK_SECONDS) {
+        try {
+          if (retryChunkSeconds !== null) {
+            appendLog(`[Planner] ${job.base}: retrying apply with ${retryChunkSeconds}s chunks.`);
+          }
+          await applyPlannerToFullInput(ffmpeg, job.inputName, leveledInputName, plan, retryChunkSeconds);
+          leveledReady = true;
+          if (plannerContext) {
+            plannerContext.leveledReady = true;
+            plannerContext.applyChunkSeconds = retryChunkSeconds;
+          }
+          return leveledInputName;
+        } catch (error) {
+          lastApplyError = error;
+          leveledReady = false;
+          if (plannerContext) plannerContext.leveledReady = false;
+          if (shouldResetFfmpegForError(error)) {
+            ffmpeg = await refreshFfmpeg(`planner apply on ${job.base}`);
+            await writeJobInput(ffmpeg, job);
+          }
         }
-        plan = null;
-        leveledReady = false;
-        return null;
       }
+
+      throw new Error(
+        `Planner apply failed after chunk retries (${
+          lastApplyError instanceof Error ? lastApplyError.message : String(lastApplyError)
+        }); skipped to avoid planner-off legacy output.`,
+      );
     };
 
     const buildMeta = (
@@ -4760,8 +4851,9 @@ const summarizeFailureReason = (error: unknown) => {
 
         try {
           await writeJobInput(ffmpeg, job);
-          const profile = buildAdaptiveProfile(analysisByBase.get(job.base), batchReference);
-          const roomScore = profile ? (analysisByBase.get(job.base)?.roomScore ?? 0) : null;
+          const fileAnalysis = analysisByBase.get(job.base);
+          const profile = buildAdaptiveProfile(fileAnalysis, batchReference);
+          const roomScore = profile ? (fileAnalysis?.roomScore ?? 0) : null;
           const adaptiveNoiseReductionFilter = profile ? resolveAdaptiveNoiseReductionFilter(profile) : null;
           const primaryMixFilterPreview = profile ? buildMixFilter(profile) : "";
           const dynaPreviewMatch = primaryMixFilterPreview.match(/dynaudnorm=([^,]+)/i);
@@ -4787,13 +4879,13 @@ const summarizeFailureReason = (error: unknown) => {
                 profile.sentenceJumpScore * 100
               ).toFixed(0)}%, breath spike ${(profile.breathSpikeRisk * 100).toFixed(0)}%, pause risk ${(
                 profile.pauseNoiseRisk * 100
-              ).toFixed(0)}%, onset/sag/end ${((analysisByBase.get(job.base)?.onsetOvershootScore ?? 0) * 100).toFixed(
+              ).toFixed(0)}%, onset/sag/end ${((fileAnalysis?.onsetOvershootScore ?? 0) * 100).toFixed(
                 0
-              )}/${((analysisByBase.get(job.base)?.midLineSagScore ?? 0) * 100).toFixed(0)}/${(
-                (analysisByBase.get(job.base)?.endFadeRiskScore ?? 0) * 100
-              ).toFixed(0)}%, speech-duty ${(analysisByBase.get(job.base)?.speechDutyCyclePct ?? 0).toFixed(
+              )}/${((fileAnalysis?.midLineSagScore ?? 0) * 100).toFixed(0)}/${(
+                (fileAnalysis?.endFadeRiskScore ?? 0) * 100
+              ).toFixed(0)}%, speech-duty ${(fileAnalysis?.speechDutyCyclePct ?? 0).toFixed(
                 1
-              )}%, median-run ${(((analysisByBase.get(job.base)?.medianSpeechRunMs ?? 0) as number) / 1000).toFixed(
+              )}%, median-run ${(((fileAnalysis?.medianSpeechRunMs ?? 0) as number) / 1000).toFixed(
                 1
               )}s, segmentation ${
                 profile.preferSinglePassContinuity
@@ -4806,11 +4898,11 @@ const summarizeFailureReason = (error: unknown) => {
               }, clicks ${(
                 profile.clickScore * 100
               ).toFixed(0)}%, conf ${(
-                analysisByBase.get(job.base)?.analysisConfidence ?? 0
+                fileAnalysis?.analysisConfidence ?? 0
               ).toFixed(2)}, tail-gate ${profile.useTailGate ? "on" : "off"}${
                 profile.preserveEndings ? " (endings protect)" : ""
               }${profile.strictEndingProtection ? " [strict]" : ""}, dyna ${dynaPreview}, echo ${
-                analysisByBase.get(job.base)?.echoDelayMs ?? 0
+                fileAnalysis?.echoDelayMs ?? 0
               } ms, blend ${
                 (profile.blendIndoorGain * 100).toFixed(1)
               }/${(profile.blendOutdoorGain * 100).toFixed(1)}%.`
@@ -4840,7 +4932,7 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          const sourceQcSnapshot = toReviewMetricSnapshot(analysisByBase.get(job.base));
+          const sourceQcSnapshot = toReviewMetricSnapshot(fileAnalysis);
           let sourceDecodedForReview: DecodedMonoAudio | null = null;
           try {
             sourceDecodedForReview = decodeWavToMono(new Uint8Array(await job.file.arrayBuffer()));
@@ -4852,7 +4944,21 @@ const summarizeFailureReason = (error: unknown) => {
             );
           }
 
-          const fileDurationForVariants = speechRenderPlan?.durationSeconds ?? null;
+          let fileDurationForVariants = speechRenderPlan?.durationSeconds ?? sourceDecodedForReview?.durationSec ?? null;
+          if (fileDurationForVariants === null) {
+            try {
+              fileDurationForVariants = await probeInputDurationSeconds(ffmpeg, job.inputName);
+            } catch {
+              fileDurationForVariants = null;
+            }
+          }
+          const plannerContext = await preparePlannerRenderContext(
+            ffmpeg,
+            job,
+            profile,
+            fileAnalysis,
+            fileDurationForVariants,
+          );
           const candidateVariants = buildMixCandidateVariants(profile, fileDurationForVariants);
           const isLongFile =
             fileDurationForVariants !== null && fileDurationForVariants >= LONG_FILE_DURATION_SECONDS;
@@ -4869,7 +4975,6 @@ const summarizeFailureReason = (error: unknown) => {
           let selectedReason: string | null = null;
           let attemptedCandidates = 0;
           let degradedCandidates = 0;
-          let healthySegmentedCandidates = 0;
           const candidateArtifacts: CandidateReviewArtifact[] = [];
 
           for (let variantIndex = 0; variantIndex < candidateVariants.length; variantIndex += 1) {
@@ -4904,7 +5009,8 @@ const summarizeFailureReason = (error: unknown) => {
                 `Mix-ready (${candidateLabel})`,
                 candidateOptions,
                 speechRenderPlan,
-                analysisByBase.get(job.base),
+                fileAnalysis,
+                plannerContext,
               );
               ffmpeg = renderResult.ffmpeg;
               attemptedCandidates += 1;
@@ -4944,7 +5050,9 @@ const summarizeFailureReason = (error: unknown) => {
                 candidateMeta = {
                   ...candidateMeta,
                   degraded: true,
-                  degradeReasons: Array.from(new Set([...candidateMeta.degradeReasons, "analysis-window-drop"])),
+                  degradeReasons: Array.from(
+                    new Set([...candidateMeta.degradeReasons, "analysis-window-drop", "qc-unavailable"]),
+                  ),
                 };
                 if (shouldResetFfmpegForError(error)) {
                   ffmpeg = await refreshFfmpeg(`candidate QC on ${job.base}`);
@@ -5010,9 +5118,6 @@ const summarizeFailureReason = (error: unknown) => {
               if (candidateMeta.degraded) {
                 degradedCandidates += 1;
               }
-              if (isHealthySegmentedRender(candidateMeta)) {
-                healthySegmentedCandidates += 1;
-              }
               const decision = shouldPreferCandidate(candidateScore, candidateMeta, selectedScore, selectedMeta);
               if (decision.select) {
                 selectedVariant = candidateVariant;
@@ -5049,7 +5154,18 @@ const summarizeFailureReason = (error: unknown) => {
           const challengerArtifact =
             [...candidateArtifacts]
               .filter((artifact) => artifact.variant !== selectedVariant)
+              .filter((artifact) => !(artifact.scoredScore.gateReasons ?? []).includes("qc-unavailable"))
               .sort((left, right) => compareCandidateScores(left.scoredScore, right.scoredScore))[0] ?? null;
+          const selectedSummary =
+            attemptedCandidates > 0 && degradedCandidates === attemptedCandidates
+              ? "all candidates degraded"
+              : selectedMeta?.renderPath === "single-pass-recovered"
+                ? "degraded recovered winner"
+                : selectedMeta && isHealthySegmentedRender(selectedMeta)
+                  ? "healthy segmented winner"
+                  : selectedMeta?.renderPath === "single-pass"
+                    ? `${formatCandidateVariant(selectedVariant)} single-pass winner`
+                    : "best-effort winner";
 
           await ffmpeg.writeFile(job.mixName, selectedBytes);
           appendLog(
@@ -5070,17 +5186,7 @@ const summarizeFailureReason = (error: unknown) => {
                 : ""
             }.`
           );
-          appendLog(
-            `[CandidateSummary] ${job.base}: ${
-              attemptedCandidates > 0 && degradedCandidates === attemptedCandidates
-                ? "all candidates degraded"
-                : selectedMeta?.renderPath === "single-pass-recovered"
-                  ? "degraded recovered winner"
-                  : healthySegmentedCandidates > 0 && !selectedMeta?.degraded
-                    ? "healthy segmented winner"
-                    : "best-effort winner"
-            }.`
-          );
+          appendLog(`[CandidateSummary] ${job.base}: ${selectedSummary}.`);
           if (selectedArtifact) {
             const bundleId = `${job.base}_review_${String(i + 1).padStart(3, "0")}`;
             const sourceDurationSec =

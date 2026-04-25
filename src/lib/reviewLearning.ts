@@ -252,6 +252,7 @@ const safeNumber = (value: number | null | undefined, fallback = 0) =>
   typeof value === "number" && Number.isFinite(value) ? value : fallback;
 const hasFiniteNumber = (value: number | null | undefined): value is number =>
   typeof value === "number" && Number.isFinite(value);
+const QC_UNAVAILABLE_HARD_GATE_PENALTY = 100000;
 const diffNullable = (next: number | null | undefined, previous: number | null | undefined) =>
   typeof next === "number" && Number.isFinite(next) && typeof previous === "number" && Number.isFinite(previous)
     ? next - previous
@@ -498,6 +499,11 @@ export const scoreCandidateWithLearnedWeights = (input: {
 
   let hardGatePenalty = 0;
   const gateReasons: string[] = [];
+  if (!input.candidateQc) {
+    hardGatePenalty += QC_UNAVAILABLE_HARD_GATE_PENALTY;
+    gateReasons.push("qc-unavailable");
+  }
+
   const absDurationDelta = Math.abs(input.alignment.durationDeltaSec);
   if (absDurationDelta > weights.gateThresholds.maxDurationDeltaSec) {
     hardGatePenalty +=
@@ -524,9 +530,14 @@ export const scoreCandidateWithLearnedWeights = (input: {
     gateReasons.push("peak-violation");
   }
 
-  const endingOver =
-    safeNumber(input.candidateQc?.endFadeRiskScore) - weights.gateThresholds.maxEndFadeRisk;
-  if (endingOver > 0) {
+  const candidateEndFadeRisk = safeNumber(input.candidateQc?.endFadeRiskScore);
+  const sourceEndFadeRisk = safeNumber(input.sourceQc?.endFadeRiskScore);
+  const endingDelta = safeNumber(qcDelta?.endFadeRiskScore);
+  const endingOver = candidateEndFadeRisk - weights.gateThresholds.maxEndFadeRisk;
+  const createdEndingDamage =
+    endingOver > 0 &&
+    (sourceEndFadeRisk <= weights.gateThresholds.maxEndFadeRisk - 0.08 || endingDelta >= 0.05);
+  if (createdEndingDamage) {
     hardGatePenalty += endingOver * weights.penaltyWeights.endingDamage;
     gateReasons.push("ending-damage");
   }

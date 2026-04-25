@@ -139,3 +139,24 @@ test("rankingScore overrides raw totals when learned reranking is available", ()
   assert.equal(decision.select, true);
   assert.equal(decision.reason, "winner by learned ranking");
 });
+
+test("unavailable QC candidate cannot become the first winner", () => {
+  const challengerScore = buildScore({
+    stability: 0.1,
+    pause: 0.1,
+    compression: 0.1,
+    echo: 0.1,
+    rankingScore: 1,
+    gateReasons: ["qc-unavailable"],
+  });
+
+  const decision = shouldPreferCandidate(
+    challengerScore,
+    buildMeta({ degraded: true, degradeReasons: ["qc-unavailable"] }),
+    null,
+    null,
+  );
+
+  assert.equal(decision.select, false);
+  assert.equal(decision.reason, "candidate unavailable for selection");
+});
