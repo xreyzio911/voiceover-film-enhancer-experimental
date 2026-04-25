@@ -122,6 +122,31 @@ const SEGMENT_GAIN_MATCH_MIN_DELTA_DB = 0.35;
 const SEGMENT_GAIN_MATCH_MAX_DB = 1.8;
 const BATCH_MEMORY_GUARD_FILE_THRESHOLD = 8;
 const BATCH_MEMORY_GUARD_INTERVAL = 3;
+
+/**
+ * Cumulative audio (in seconds) the active ffmpeg worker may process before
+ * we proactively recycle it. 60 minutes is generous for short-VO batches and
+ * triggers a refresh after roughly every 3-4 long episodes — both safer than
+ * the file-count guard alone, which can leave the worker grinding through
+ * 45+ minutes of dialogue between recycles on long-file batches.
+ */
+const BATCH_AUDIO_RECYCLE_SECONDS = 3600;
+/**
+ * Auto-retry budget per file. We retry ONCE on recoverable failures
+ * (OOM, filter-init errors, watchdog aborts) on a fresh worker. The
+ * second failure marks the file permanently failed.
+ */
+const PER_FILE_MAX_RETRIES = 1;
+/**
+ * Per-file watchdog budget. We give each file
+ *   max(WATCHDOG_BASE_SECONDS, durationSec * WATCHDOG_DURATION_FACTOR + WATCHDOG_BASE_SECONDS)
+ * seconds before we terminate the active worker and trigger the retry path.
+ * For a 3-min short take that's ~12.9 min budget; for a 15-min long take
+ * that's ~62.5 min. Catches genuine hangs, never fires on legitimately
+ * slow filter chains.
+ */
+const WATCHDOG_BASE_SECONDS = 90;
+const WATCHDOG_DURATION_FACTOR = 4;
 const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled";
 const FATAL_FFMPEG_PATTERN = /memory access out of bounds|runtimeerror/i;
 const IMPORTANT_LOG_PATTERN = /error|failed|invalid|aborted|out of bounds/i;
@@ -212,6 +237,34 @@ const shouldRecycleFfmpegForBatch = (completedCount: number, totalCount: number)
   totalCount >= BATCH_MEMORY_GUARD_FILE_THRESHOLD &&
   completedCount < totalCount &&
   completedCount % BATCH_MEMORY_GUARD_INTERVAL === 0;
+
+/**
+ * Estimate audio duration in seconds from a WAV file's raw byte size.
+ * Worst-case (tightest) guess: 16-bit / 48 kHz / mono ≈ 96 KB per second.
+ * Real WAVs are usually larger per second (24-bit, stereo), so this
+ * over-estimates duration which is the SAFE direction for memory budgeting:
+ * we recycle the worker a little earlier than strictly required.
+ *
+ * Used pre-analysis to size watchdog timers and recycle decisions without
+ * having to call ffmpeg just to probe duration.
+ */
+const estimateAudioSeconds = (file: File): number => {
+  if (!file?.size) return 0;
+  return file.size / 96000;
+};
+
+/**
+ * A failure is "recoverable" if a fresh ffmpeg worker would plausibly
+ * succeed on the same input. WASM out-of-bounds, filter-init failures,
+ * watchdog timeouts all qualify. Format/parse errors don't (the input
+ * itself is the issue).
+ */
+const isRecoverableFailure = (error: unknown): boolean => {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /memory access out of bounds|RuntimeError|Watchdog timeout|Failed to inject frame|Error initializing filter|terminated|aborted/i.test(
+    msg,
+  );
+};
 
 type OutputEntry = {
   name: string;
@@ -4843,15 +4896,62 @@ const summarizeFailureReason = (error: unknown) => {
 
       let hadErrors = false;
       const failedRuns: FailedOptimization[] = [];
-      for (let i = 0; i < jobs.length; i += 1) {
+      // Retry tracking: each file gets PER_FILE_MAX_RETRIES attempts on a
+      // fresh worker before being marked permanently failed.
+      const retryCounts = new Map<string, number>();
+      // Cumulative audio (sec) processed by the current ffmpeg worker.
+      // Reset on every refresh; drives the duration-aware recycling.
+      let workerCumulativeAudioSec = 0;
+      let i = 0;
+      while (i < jobs.length) {
         const job = jobs[i];
+        const retryAttempt = retryCounts.get(job.base) ?? 0;
         let cleanLoudName: string | null = null;
         let blendLoudName: string | null = null;
         let blendRendered = false;
 
+        // Per-file watchdog. Budget is sized from the file size estimate
+        // (post-analysis we have a better number; pre-analysis we use the
+        // raw byte count). On budget overrun we terminate the worker —
+        // the active exec() rejects, the catch block runs, and the retry
+        // path picks up the file with a fresh worker.
+        const fileAnalysis = analysisByBase.get(job.base);
+        const estDurationSec = Math.max(
+          estimateAudioSeconds(job.file),
+          fileAnalysis?.medianSpeechRunMs
+            ? (fileAnalysis.medianSpeechRunMs / 1000) * Math.max(1, fileAnalysis.speechSegmentCount ?? 1)
+            : 0,
+        );
+        const watchdogBudgetMs =
+          (Math.max(WATCHDOG_BASE_SECONDS, estDurationSec * WATCHDOG_DURATION_FACTOR) +
+            WATCHDOG_BASE_SECONDS) *
+          1000;
+        let watchdogFired = false;
+        const watchdog = setTimeout(() => {
+          watchdogFired = true;
+          appendLog(
+            `[Watchdog] ${job.base}: aborting after ${(watchdogBudgetMs / 1000).toFixed(0)}s budget exceeded.`,
+          );
+          try {
+            ffmpegRef.current?.terminate();
+          } catch {
+            // terminate failures are OK — worker may already be dead
+          }
+        }, watchdogBudgetMs);
+
         try {
+          if (retryAttempt > 0) {
+            appendLog(
+              `[Retry] ${job.base}: attempt ${retryAttempt + 1}/${PER_FILE_MAX_RETRIES + 1} on fresh worker.`,
+            );
+            updateQueueItem(job.base, {
+              status: "working",
+              stageLabel: `Retrying (${retryAttempt + 1}/${PER_FILE_MAX_RETRIES + 1})`,
+              progress: 0,
+              detail: "Fresh worker, re-running pipeline",
+            });
+          }
           await writeJobInput(ffmpeg, job);
-          const fileAnalysis = analysisByBase.get(job.base);
           const profile = buildAdaptiveProfile(fileAnalysis, batchReference);
           const roomScore = profile ? (fileAnalysis?.roomScore ?? 0) : null;
           const adaptiveNoiseReductionFilter = profile ? resolveAdaptiveNoiseReductionFilter(profile) : null;
@@ -5311,20 +5411,52 @@ const summarizeFailureReason = (error: unknown) => {
           }
 
           markQueueDone(job.base, "Outputs ready");
+          // Live update: push the in-progress outputs to React state so
+          // users can see and download completed files even if a later
+          // file fails or the browser crashes mid-batch.
+          setOutputs([...outputEntries]);
         } catch (error) {
-          hadErrors = true;
           const reason = summarizeFailureReason(error);
+          appendLog(`Error (${job.base}): ${reason}`);
+
+          // Recoverable failure on a file that hasn't exhausted retries:
+          // refresh the worker, clean up its virtual FS for this file,
+          // and re-process the SAME job (don't increment `i`).
+          if (retryAttempt < PER_FILE_MAX_RETRIES && (isRecoverableFailure(error) || watchdogFired)) {
+            retryCounts.set(job.base, retryAttempt + 1);
+            try {
+              await safeDeleteFile(ffmpeg, job.inputName);
+              await safeDeleteFile(ffmpeg, job.mixName);
+              await safeDeleteFile(ffmpeg, job.blendMixName);
+              if (cleanLoudName) await safeDeleteFile(ffmpeg, cleanLoudName);
+              if (blendLoudName) await safeDeleteFile(ffmpeg, blendLoudName);
+            } catch {
+              // best-effort cleanup before refresh; safe to ignore
+            }
+            ffmpeg = await refreshFfmpeg(`retry-induced refresh on ${job.base}`);
+            workerCumulativeAudioSec = 0;
+            clearTimeout(watchdog);
+            // Skip the recycle check below — we just refreshed.
+            continue;
+          }
+
+          // Permanent failure (non-recoverable, or out of retries).
+          hadErrors = true;
           failedRuns.push({
             base: job.base,
             fileName: job.file.name,
-            reason,
+            reason: retryAttempt > 0 ? `${reason} (after ${retryAttempt} retry)` : reason,
           });
-          appendLog(`Error (${job.base}): ${reason}`);
           markQueueError(job.base, reason);
+          // Live update: also push current outputs after a permanent
+          // failure so users can see what made it through up to this point.
+          setOutputs([...outputEntries]);
           if (shouldResetFfmpegForError(error)) {
             ffmpeg = await refreshFfmpeg(`processing failure on ${job.base}`);
+            workerCumulativeAudioSec = 0;
           }
         } finally {
+          clearTimeout(watchdog);
           await safeDeleteFile(ffmpeg, job.inputName);
           await safeDeleteFile(ffmpeg, job.mixName);
           await safeDeleteFile(ffmpeg, job.blendMixName);
@@ -5336,12 +5468,30 @@ const summarizeFailureReason = (error: unknown) => {
           }
         }
 
-        if (shouldRecycleFfmpegForBatch(i + 1, jobs.length)) {
-          ffmpeg = await refreshFfmpeg(`processing memory guard (${i + 1}/${jobs.length})`);
+        // File is fully done (success or permanent failure). Track its
+        // audio for the duration-aware memory guard, advance the cursor.
+        workerCumulativeAudioSec += estDurationSec;
+        i += 1;
+
+        // Recycle decisions, in priority order:
+        //   1. duration-aware: > 60 min of audio on this worker → refresh
+        //   2. file-count-aware (existing): every Nth file in long batches
+        if (workerCumulativeAudioSec >= BATCH_AUDIO_RECYCLE_SECONDS) {
+          ffmpeg = await refreshFfmpeg(
+            `audio-volume guard (${(workerCumulativeAudioSec / 60).toFixed(0)} min processed since refresh)`,
+          );
+          workerCumulativeAudioSec = 0;
+        } else if (shouldRecycleFfmpegForBatch(i, jobs.length)) {
+          ffmpeg = await refreshFfmpeg(`processing memory guard (${i}/${jobs.length})`);
+          workerCumulativeAudioSec = 0;
         }
       }
 
-      setOutputs(outputEntries);
+      // Final reconciliation. Live updates inside the loop already pushed
+      // outputs as files completed, so this is mostly a no-op now —
+      // kept so the array reference matches `outputEntries.length` even
+      // if no files succeeded.
+      setOutputs([...outputEntries]);
       setReviewBundles(nextReviewBundles);
       if (failedRuns.length > 0) {
         setFailedOptimizations(failedRuns);
