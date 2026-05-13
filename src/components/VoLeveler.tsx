@@ -46,7 +46,8 @@ import {
   SPECTRUM_BANDS_HZ,
 } from "../lib/spectrum";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
-import { triggerBrowserDownload } from "../lib/downloadBlob";
+import { queueBrowserDownload, triggerBrowserDownload } from "../lib/downloadBlob";
+import { estimateVoZipBytes, planVoZipExportParts } from "../lib/downloadPolicy";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -544,6 +545,8 @@ export default function VoLeveler() {
   const [loading, setLoading] = useState(false);
   const [zipBusy, setZipBusy] = useState(false);
   const [zipProgress, setZipProgress] = useState(0);
+  const [downloadQueueBusy, setDownloadQueueBusy] = useState(false);
+  const [downloadStatus, setDownloadStatus] = useState<string | null>(null);
   const [reviewZipBusy, setReviewZipBusy] = useState(false);
   const [reviewZipProgress, setReviewZipProgress] = useState(0);
   const [dragActive, setDragActive] = useState(false);
@@ -5662,21 +5665,41 @@ const summarizeFailureReason = (error: unknown) => {
     handleFiles(event.dataTransfer.files);
   };
 
-  const downloadOutputFile = (output: OutputEntry) => {
+  const downloadOutputFile = async (output: OutputEntry) => {
     try {
       if (!(output.blob instanceof Blob)) {
         throw new Error("Output blob missing. Refresh the page and re-run the batch.");
       }
-      triggerBrowserDownload(output.blob, output.name);
+      setDownloadStatus(`Starting ${output.name}`);
+      const started = await queueBrowserDownload(output.blob, output.name);
+      appendLog(
+        `[Download] ${started.fileName}: started (${formatBytes(
+          started.size,
+        )}); browser link retained for ${Math.round(started.retainMs / 60000)} min.`,
+      );
     } catch (error) {
       appendLog(`Download failed (${output.name}): ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setDownloadStatus(null);
     }
   };
 
-  const buildDeliveryManifest = (generatedAt: string) => ({
+  const buildDeliveryManifest = (
+    generatedAt: string,
+    manifestOutputs = outputs,
+    exportPart?: {
+      estimatedBytes: number;
+      partNumber: number;
+      totalParts: number;
+    },
+  ) => ({
     app: "Shorts Projektt Internal VO Optimizer",
     generatedAt,
     totalFiles: outputs.length,
+    exportedFiles: manifestOutputs.length,
+    totalOutputBytes,
+    estimatedZipBytes,
+    exportPart: exportPart ?? null,
     settings: {
       loudnessTarget,
       leveler,
@@ -5693,13 +5716,49 @@ const summarizeFailureReason = (error: unknown) => {
       gainPlannerEnabled,
       reviewReranker: learnedReviewWeights.modelName,
     },
-    files: outputs.map((output) => ({
+    files: manifestOutputs.map((output) => ({
       name: output.name,
       kind: output.kind,
       variant: output.variant,
       sizeBytes: output.size,
     })),
   });
+
+  const downloadOutputsSequentially = async () => {
+    if (outputs.length === 0 || downloadQueueBusy) return;
+
+    setDownloadQueueBusy(true);
+    setDownloadStatus(`Queueing ${outputs.length} file downloads`);
+    appendLog(
+      `[Download] Safe queue started for ${outputs.length} file(s), ${formatBytes(
+        totalOutputBytes,
+      )} total. Keep this tab open until Chrome finishes saving.`,
+    );
+
+    try {
+      for (let index = 0; index < outputs.length; index += 1) {
+        const output = outputs[index];
+        if (!(output.blob instanceof Blob)) {
+          throw new Error("Output blob missing. Refresh the page and re-run the batch.");
+        }
+        setDownloadStatus(`Starting ${index + 1}/${outputs.length}: ${output.name}`);
+        const started = await queueBrowserDownload(output.blob, output.name);
+        appendLog(
+          `[Download] ${index + 1}/${outputs.length} ${started.fileName}: started (${formatBytes(
+            started.size,
+          )}); retained ${Math.round(started.retainMs / 60000)} min.`,
+        );
+      }
+      appendLog(
+        `[Download] Safe queue finished starting ${outputs.length} file(s). If Chrome asks to allow multiple downloads, choose Allow.`,
+      );
+    } catch (error) {
+      appendLog(`Safe download queue failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setDownloadQueueBusy(false);
+      setDownloadStatus(null);
+    }
+  };
 
   const downloadOutputsZip = async () => {
     if (outputs.length === 0 || zipBusy) return;
@@ -5708,35 +5767,80 @@ const summarizeFailureReason = (error: unknown) => {
     setZipProgress(0);
 
     try {
-      const zip = new JSZip();
+      const generatedAt = new Date().toISOString();
+      const stamp = generatedAt.replace(/[:.]/g, "-");
+      const parts = planVoZipExportParts(outputs);
+      const chunked = parts.length > 1;
 
-      for (let i = 0; i < outputs.length; i += 1) {
-        const output = outputs[i];
-        if (!(output.blob instanceof Blob)) {
-          throw new Error("Output blob missing. Refresh the page and re-run the batch.");
-        }
-        zip.file(output.name, output.blob);
-        setZipProgress(Math.round(((i + 1) / outputs.length) * 70));
+      if (chunked) {
+        appendLog(
+          `[ZIP Policy] Large batch detected (${outputs.length} file(s), ${formatBytes(
+            totalOutputBytes,
+          )} output). Exporting ${parts.length} smaller ZIP parts instead of one fragile ${formatBytes(
+            estimatedZipBytes,
+          )} archive.`,
+        );
       }
 
-      const generatedAt = new Date().toISOString();
-      zip.file("delivery_manifest.json", JSON.stringify(buildDeliveryManifest(generatedAt), null, 2));
+      for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+        const part = parts[partIndex];
+        const zip = new JSZip();
 
-      const zipBlob = await zip.generateAsync(
-        {
-          type: "blob",
-          compression: "DEFLATE",
-          compressionOptions: { level: 6 },
-        },
-        ({ percent }) => {
-          setZipProgress(70 + Math.round((percent / 100) * 30));
+        for (let i = 0; i < part.outputs.length; i += 1) {
+          const output = part.outputs[i];
+          if (!(output.blob instanceof Blob)) {
+            throw new Error("Output blob missing. Refresh the page and re-run the batch.");
+          }
+          zip.file(output.name, output.blob);
+          setZipProgress(
+            Math.min(
+              95,
+              Math.round(((partIndex + (i + 1) / part.outputs.length) / parts.length) * 70),
+            ),
+          );
         }
-      );
 
-      const stamp = generatedAt.replace(/[:.]/g, "-");
-      const archiveName = `vo_leveler_outputs_${stamp}.zip`;
-      triggerBrowserDownload(zipBlob, archiveName);
-      appendLog(`ZIP created: ${archiveName} (${formatBytes(zipBlob.size)})`);
+        zip.file(
+          "delivery_manifest.json",
+          JSON.stringify(
+            buildDeliveryManifest(generatedAt, part.outputs, {
+              estimatedBytes: part.estimatedBytes,
+              partNumber: part.partNumber,
+              totalParts: part.totalParts,
+            }),
+            null,
+            2,
+          ),
+        );
+
+        const zipBlob = await zip.generateAsync(
+          chunked
+            ? {
+                type: "blob",
+                compression: "STORE",
+              }
+            : {
+                type: "blob",
+                compression: "DEFLATE",
+                compressionOptions: { level: 6 },
+              },
+          ({ percent }) => {
+            const partProgress = (partIndex + percent / 100) / parts.length;
+            setZipProgress(70 + Math.round(partProgress * 30));
+          },
+        );
+
+        const archiveName =
+          parts.length === 1
+            ? `vo_leveler_outputs_${stamp}.zip`
+            : `vo_leveler_outputs_${stamp}_part-${part.partNumber}-of-${part.totalParts}.zip`;
+        const started = await queueBrowserDownload(zipBlob, archiveName);
+        appendLog(
+          `ZIP created: ${archiveName} (${formatBytes(zipBlob.size)}; retained ${Math.round(
+            started.retainMs / 60000,
+          )} min)`,
+        );
+      }
     } catch (error) {
       appendLog(`ZIP export failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -5803,6 +5907,12 @@ const summarizeFailureReason = (error: unknown) => {
     }),
     [queueItems]
   );
+  const totalOutputBytes = useMemo(
+    () => outputs.reduce((total, output) => total + output.size, 0),
+    [outputs],
+  );
+  const estimatedZipBytes = useMemo(() => estimateVoZipBytes(outputs), [outputs]);
+  const zipExportParts = useMemo(() => planVoZipExportParts(outputs), [outputs]);
 
   return (
     <div className={styles.layout}>
@@ -6250,9 +6360,23 @@ const summarizeFailureReason = (error: unknown) => {
                 <button
                   className={`${styles.button} ${styles.buttonSecondary}`}
                   onClick={downloadOutputsZip}
-                  disabled={zipBusy}
+                  disabled={zipBusy || downloadQueueBusy}
                 >
-                  {zipBusy ? `Building ZIP ${zipProgress}%` : `Download ZIP (${outputs.length})`}
+                  {zipBusy
+                    ? `Building ZIP ${zipProgress}%`
+                    : zipExportParts.length > 1
+                      ? `Download ZIP Parts (${zipExportParts.length})`
+                      : `Download ZIP (${outputs.length})`}
+                </button>
+              )}
+              {outputs.length > 1 && (
+                <button
+                  className={`${styles.button} ${styles.buttonGhost}`}
+                  onClick={downloadOutputsSequentially}
+                  disabled={zipBusy || downloadQueueBusy}
+                  type="button"
+                >
+                  {downloadQueueBusy ? "Starting Downloads..." : `Download Files Safely (${outputs.length})`}
                 </button>
               )}
               {reviewBundles.length > 0 && (
@@ -6265,6 +6389,16 @@ const summarizeFailureReason = (error: unknown) => {
                     ? `Building Review ZIP ${reviewZipProgress}%`
                     : `Export Review Bundles (${reviewBundles.length})`}
                 </button>
+              )}
+              {outputs.length > 0 && (
+                <div className={styles.downloadStatus}>
+                  {downloadStatus ??
+                    `${formatBytes(totalOutputBytes)} ready${
+                      zipExportParts.length > 1
+                        ? `; ZIP will export as ${zipExportParts.length} safer parts`
+                        : ""
+                    }`}
+                </div>
               )}
             </div>
           )}
@@ -6314,6 +6448,7 @@ const summarizeFailureReason = (error: unknown) => {
                   type="button"
                   className={styles.outputDownload}
                   onClick={() => downloadOutputFile(output)}
+                  disabled={zipBusy || downloadQueueBusy}
                 >
                   Download
                 </button>
