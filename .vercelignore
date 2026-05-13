@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+.venv-audio-splitter
+.audio-separator-models
+.playwright-mcp
+VO example
+Audio split example
+*.tsbuildinfo
+.env*
+!.env.example
