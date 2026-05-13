@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Local Python ML runtime and model cache.
+    ".venv-audio-splitter/**",
+    ".audio-separator-models/**",
     // FFmpeg core bundles are third-party generated artifacts.
     "public/ffmpeg/**",
   ]),

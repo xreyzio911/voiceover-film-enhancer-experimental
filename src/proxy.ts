@@ -10,11 +10,19 @@ export default withAuth(
   (request) => {
     const { nextUrl } = request;
     const path = nextUrl.pathname;
+    const localMode = isLocalHost(nextUrl.hostname);
     const email =
       typeof request.nextauth.token?.email === "string"
         ? request.nextauth.token.email.toLowerCase()
         : undefined;
     const allowed = isAllowedEmail(email);
+
+    if (localMode) {
+      if (path === LOGIN_PATH) {
+        return NextResponse.redirect(new URL("/", nextUrl));
+      }
+      return NextResponse.next();
+    }
 
     if (path === LOGIN_PATH) {
       if (allowed) {
@@ -23,7 +31,7 @@ export default withAuth(
       return NextResponse.next();
     }
 
-    if (path.startsWith(QC_LAB_PATH) && !isLocalHost(nextUrl.hostname)) {
+    if (path.startsWith(QC_LAB_PATH)) {
       return NextResponse.redirect(new URL("/", nextUrl));
     }
 

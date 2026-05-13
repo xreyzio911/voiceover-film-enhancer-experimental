@@ -13,7 +13,6 @@ import {
   serializeReviewDecisionJsonl,
   toReviewMetricSnapshot,
   type AlignmentMetrics,
-  type LearnedReviewWeights,
   type ReviewBundleManifest,
   type ReviewDecisionRecord,
 } from "./reviewLearning.ts";
@@ -189,7 +188,7 @@ test("parseLearnedReviewWeights merges valid input and rejects invalid payloads"
       ...DEFAULT_LEARNED_REVIEW_WEIGHTS.featureWeights,
       candidate_echoScore: 99,
     },
-  } satisfies Partial<LearnedReviewWeights>);
+  });
 
   assert.ok(parsed);
   assert.equal(parsed.modelName, "custom-review");

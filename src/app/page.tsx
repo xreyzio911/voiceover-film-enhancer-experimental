@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { headers } from "next/headers";
-import VoLeveler from "@/components/VoLeveler";
+import AppTools from "@/components/AppTools";
 import SignOutButton from "@/components/SignOutButton";
 import { getServerAuthSession } from "@/auth";
 import { isAllowedEmail } from "@/lib/authAllowlist";
@@ -9,13 +9,13 @@ import { redirect } from "next/navigation";
 import styles from "./page.module.css";
 
 export default async function Home() {
-  const session = await getServerAuthSession();
-  const email = session?.user?.email?.toLowerCase();
   const headerStore = await headers();
   const host = headerStore.get("x-forwarded-host") ?? headerStore.get("host");
   const localMode = isLocalHost(host);
+  const session = localMode ? null : await getServerAuthSession();
+  const email = localMode ? "local developer" : session?.user?.email?.toLowerCase();
 
-  if (!isAllowedEmail(email)) {
+  if (!localMode && !isAllowedEmail(email)) {
     redirect("/login");
   }
 
@@ -25,7 +25,7 @@ export default async function Home() {
         <header className={styles.hero}>
           <div className={styles.heroTop}>
             <div className={styles.account}>{email}</div>
-            <SignOutButton className={styles.logoutButton} />
+            {!localMode && <SignOutButton className={styles.logoutButton} />}
           </div>
           <h1 className={styles.title}>Shorts Projektt Internal VO Optimizer</h1>
           <p className={styles.subtitle}>Internal tool for VO leveling and delivery exports.</p>
@@ -40,7 +40,7 @@ export default async function Home() {
             )}
           </div>
         </header>
-        <VoLeveler />
+        <AppTools />
       </div>
     </div>
   );

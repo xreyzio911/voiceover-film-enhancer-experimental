@@ -107,6 +107,10 @@ export type GainPlannerOutput = {
   sustainedLoudClusterCount: number;
   /** Largest uniform attenuation applied to a sustained-loud cluster in dB. Diagnostic. */
   sustainedLoudMaxReductionDb: number;
+  /** Count of early dialogue runs capped against later dialogue body. */
+  earlyRunCapCount: number;
+  /** Largest early-dialogue cap in dB. Diagnostic. */
+  earlyRunMaxReductionDb: number;
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -133,6 +137,13 @@ const medianDbOfSlice = (frameDb: number[], start: number, end: number): number 
   for (let i = a; i < b; i += 1) values.push(frameDb[i]);
   values.sort((left, right) => left - right);
   return values[Math.floor(values.length / 2)] ?? -120;
+};
+
+const stdDev = (values: number[]) => {
+  if (values.length === 0) return null;
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const variance = values.reduce((sum, value) => sum + (value - avg) * (value - avg), 0) / values.length;
+  return Math.sqrt(variance);
 };
 
 /**
@@ -169,7 +180,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // and ramp to 1.0 as instabilityHint approaches 1. Previously the guard
   // only kicked in above instabilityHint 0.35, leaving most files with
   // speechSpikeTaming = 0 and no within-sentence spike protection.
-  const speechSpikeTaming = clamp(
+  let speechSpikeTaming = clamp(
     input.speechSpikeTaming ?? clamp(0.3 + (instabilityHint - 0.05) * 0.85, 0.3, 1),
     0,
     1,
@@ -349,6 +360,22 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // The exact offset scales with crest excess. We also widen the
   // attenuation clamp to -18 dB so extremely loud sources (source body
   // > target + 14 dB) can be brought down further.
+  const bodyRunSigmaDb = stdDev(runRmsDb);
+  if (
+    runRmsDb.length >= 3 &&
+    runRmsDb.length <= 8 &&
+    bodyRunSigmaDb !== null &&
+    bodyRunSigmaDb <= 1.25 &&
+    input.pauseNoiseRisk <= 0.25
+  ) {
+    // Sparse takes that are already line-consistent should not get their
+    // dialogue bodies re-shaped by the body-relative spike guard. The global
+    // peak ceiling below still catches real clipping/overs, but consonants in
+    // clean short takes keep their natural tone and do not create new level
+    // variance.
+    speechSpikeTaming = Math.min(speechSpikeTaming, 0.05);
+  }
+
   const breathTargetDb = targetDb - 3.2;
   const plannedRunGainDb: number[] = runMeta.map((m) => {
     if (m.runClass === "transient-breath") {
@@ -411,6 +438,40 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       const mid = (plannedRunGainDb[i] + plannedRunGainDb[i - 1]) / 2;
       plannedRunGainDb[i - 1] = plannedRunGainDb[i - 1] + (mid - plannedRunGainDb[i - 1]) * 0.35;
       plannedRunGainDb[i] = plannedRunGainDb[i] + (mid - plannedRunGainDb[i]) * 0.35;
+    }
+  }
+
+  // Conservative opener guard. It only acts when the first few body-speech
+  // runs are materially hotter than the later dialogue anchor. Normal actor
+  // emphasis of ~1-2 dB is preserved; severe openers are capped so the file
+  // does not start loud and then settle down.
+  let earlyRunCapCount = 0;
+  let earlyRunMaxReductionDb = 0;
+  const bodyRunIndexes = runMeta
+    .map((meta, index) => (meta.runClass === "body-speech" ? index : -1))
+    .filter((index) => index >= 0);
+  if (bodyRunIndexes.length >= 5) {
+    const earlyRunIndexes = bodyRunIndexes.slice(0, Math.min(3, bodyRunIndexes.length - 2));
+    const earlySet = new Set(earlyRunIndexes);
+    const laterAppliedBodies = bodyRunIndexes
+      .filter((index) => !earlySet.has(index))
+      .map((index) => runMeta[index].meanDb + (plannedRunGainDb[index] ?? 0))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    const laterAnchorDb = laterAppliedBodies[Math.floor(laterAppliedBodies.length / 2)];
+    if (Number.isFinite(laterAnchorDb)) {
+      const toleranceDb = 1.5;
+      const triggerDb = 2.75;
+      for (const index of earlyRunIndexes) {
+        const appliedBodyDb = runMeta[index].meanDb + (plannedRunGainDb[index] ?? 0);
+        const overLaterDb = appliedBodyDb - laterAnchorDb;
+        if (overLaterDb < triggerDb) continue;
+        const reductionDb = clamp(overLaterDb - toleranceDb, 0, 5);
+        if (reductionDb <= 0) continue;
+        plannedRunGainDb[index] -= reductionDb;
+        earlyRunCapCount += 1;
+        earlyRunMaxReductionDb = Math.max(earlyRunMaxReductionDb, reductionDb);
+      }
     }
   }
 
@@ -762,6 +823,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     speechSpikeMaxReductionDb,
     sustainedLoudClusterCount: sustainedClusterTamedCount,
     sustainedLoudMaxReductionDb: sustainedClusterMaxReductionDbOut,
+    earlyRunCapCount,
+    earlyRunMaxReductionDb,
   };
 };
 

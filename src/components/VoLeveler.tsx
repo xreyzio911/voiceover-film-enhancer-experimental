@@ -46,6 +46,7 @@ import {
   SPECTRUM_BANDS_HZ,
 } from "../lib/spectrum";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
+import { triggerBrowserDownload } from "../lib/downloadBlob";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -384,6 +385,8 @@ type BatchReference = {
   lra: number;
   /** Median long-term band spectrum across the batch, one entry per SPECTRUM_BANDS_HZ band. */
   bandSpectrumDb: number[] | null;
+  /** Number of clean-enough files that anchored the reference. */
+  anchorCount: number;
 };
 
 type NoiseRisk = "low" | "medium" | "high";
@@ -1084,6 +1087,10 @@ const summarizeFailureReason = (error: unknown) => {
     sustainedLoudClusterCount: number;
     /** Largest uniform attenuation applied to a sustained-loud cluster. */
     sustainedLoudMaxReductionDb: number;
+    /** Early dialogue runs capped against later dialogue body. */
+    earlyRunCapCount: number;
+    /** Largest early-dialogue cap in dB. */
+    earlyRunMaxReductionDb: number;
     /** Effective intra-run micro-ride range in dB. Diagnostic. */
     microRideDb: number;
   };
@@ -1179,6 +1186,18 @@ const summarizeFailureReason = (error: unknown) => {
         0,
         1,
       );
+      const measuredNoiseContrast = profile?.noiseContrastDb ?? analysis?.noiseContrastDb ?? null;
+      const measuredNoiseFloor = profile?.noiseFloorDb ?? analysis?.noiseFloorDb ?? null;
+      const measuredPauseNoiseRisk = profile?.pauseNoiseRisk ?? analysis?.pauseNoiseRisk ?? pauseNoiseRisk;
+      const cleanBoostHeadroom = clamp(
+        clamp(((measuredNoiseContrast ?? 18) - 26) / 14, 0, 1) *
+          clamp((-58 - (measuredNoiseFloor ?? -58)) / 18, 0, 1) *
+          clamp((0.28 - measuredPauseNoiseRisk) / 0.28, 0, 1),
+        0,
+        1,
+      );
+      const sparseSpeech = (analysis?.speechDutyCyclePct ?? 100) < 10 || (analysis?.speechSegmentCount ?? 999) <= 6;
+      const plannerMaxGainDb = 14 + cleanBoostHeadroom * (sparseSpeech ? 4 : 2);
 
       const mask = buildSpeechMask(frameDb, noiseFloorDb, { frameMs: GAIN_PLANNER_FRAME_MS });
       const speechRuns: PlannerSpeechRun[] = speechRunsFromMask(mask);
@@ -1195,6 +1214,7 @@ const summarizeFailureReason = (error: unknown) => {
         sampleRate: GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
         targetDb: -22,
         sourceTargetBlend: 0.1,
+        maxGainDb: plannerMaxGainDb,
         peakCeilingDb: -3,
         instabilityHint,
         speechSpikeTaming,
@@ -1214,6 +1234,8 @@ const summarizeFailureReason = (error: unknown) => {
         speechSpikeMaxReductionDb: plan.speechSpikeMaxReductionDb,
         sustainedLoudClusterCount: plan.sustainedLoudClusterCount,
         sustainedLoudMaxReductionDb: plan.sustainedLoudMaxReductionDb,
+        earlyRunCapCount: plan.earlyRunCapCount,
+        earlyRunMaxReductionDb: plan.earlyRunMaxReductionDb,
         microRideDb: plan.microRideDb,
       };
     } finally {
@@ -2227,6 +2249,7 @@ const summarizeFailureReason = (error: unknown) => {
       highTilt: highTilt ?? -13,
       lra: lra ?? 6,
       bandSpectrumDb: bandMedians,
+      anchorCount: referenceAnalyses.length,
     };
   };
 
@@ -2483,7 +2506,7 @@ const summarizeFailureReason = (error: unknown) => {
 
     // Compute per-band tone delta vs the batch reference (if we have both).
     const toneMatchDeltaDb =
-      reference?.bandSpectrumDb && analysis.bandSpectrumDb
+      reference?.bandSpectrumDb && reference.anchorCount >= 3 && analysis.bandSpectrumDb
         ? computeToneMatchDeltaDb(analysis.bandSpectrumDb, reference.bandSpectrumDb, 2.5)
         : null;
 
@@ -4305,12 +4328,16 @@ const summarizeFailureReason = (error: unknown) => {
       plan.sustainedLoudClusterCount > 0
         ? `, ${plan.sustainedLoudClusterCount} sustained-loud cluster${plan.sustainedLoudClusterCount === 1 ? "" : "s"} tamed (max ${plan.sustainedLoudMaxReductionDb.toFixed(1)} dB)`
         : "";
+    const earlyRunCapNote =
+      plan.earlyRunCapCount > 0
+        ? `, ${plan.earlyRunCapCount} hot opener${plan.earlyRunCapCount === 1 ? "" : "s"} capped (max ${plan.earlyRunMaxReductionDb.toFixed(1)} dB)`
+        : "";
     appendLog(
       `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(
         1,
       )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
         2,
-      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}).`,
+      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}).`,
     );
 
     context.plan = plan;
@@ -4560,8 +4587,12 @@ const summarizeFailureReason = (error: unknown) => {
             plan.sustainedLoudClusterCount > 0
               ? `, ${plan.sustainedLoudClusterCount} sustained-loud cluster${plan.sustainedLoudClusterCount === 1 ? "" : "s"} tamed (max ${plan.sustainedLoudMaxReductionDb.toFixed(1)} dB)`
               : "";
+          const earlyRunCapNote =
+            plan.earlyRunCapCount > 0
+              ? `, ${plan.earlyRunCapCount} hot opener${plan.earlyRunCapCount === 1 ? "" : "s"} capped (max ${plan.earlyRunMaxReductionDb.toFixed(1)} dB)`
+              : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}).`,
           );
         } else {
           appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);
@@ -5631,28 +5662,44 @@ const summarizeFailureReason = (error: unknown) => {
     handleFiles(event.dataTransfer.files);
   };
 
-  const triggerDownload = (blob: Blob, fileName: string) => {
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = fileName;
-    link.rel = "noopener";
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 30_000);
-  };
-
   const downloadOutputFile = (output: OutputEntry) => {
     try {
       if (!(output.blob instanceof Blob)) {
         throw new Error("Output blob missing. Refresh the page and re-run the batch.");
       }
-      triggerDownload(output.blob, output.name);
+      triggerBrowserDownload(output.blob, output.name);
     } catch (error) {
       appendLog(`Download failed (${output.name}): ${error instanceof Error ? error.message : String(error)}`);
     }
   };
+
+  const buildDeliveryManifest = (generatedAt: string) => ({
+    app: "Shorts Projektt Internal VO Optimizer",
+    generatedAt,
+    totalFiles: outputs.length,
+    settings: {
+      loudnessTarget,
+      leveler,
+      smartMatchMode,
+      eqCleanup,
+      softenHarshness,
+      cinematicColor,
+      breathControl,
+      roomCleanup,
+      noiseGuard,
+      floorGuard,
+      sceneBlend,
+      keepMixReady,
+      gainPlannerEnabled,
+      reviewReranker: learnedReviewWeights.modelName,
+    },
+    files: outputs.map((output) => ({
+      name: output.name,
+      kind: output.kind,
+      variant: output.variant,
+      sizeBytes: output.size,
+    })),
+  });
 
   const downloadOutputsZip = async () => {
     if (outputs.length === 0 || zipBusy) return;
@@ -5672,6 +5719,9 @@ const summarizeFailureReason = (error: unknown) => {
         setZipProgress(Math.round(((i + 1) / outputs.length) * 70));
       }
 
+      const generatedAt = new Date().toISOString();
+      zip.file("delivery_manifest.json", JSON.stringify(buildDeliveryManifest(generatedAt), null, 2));
+
       const zipBlob = await zip.generateAsync(
         {
           type: "blob",
@@ -5683,9 +5733,9 @@ const summarizeFailureReason = (error: unknown) => {
         }
       );
 
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const stamp = generatedAt.replace(/[:.]/g, "-");
       const archiveName = `vo_leveler_outputs_${stamp}.zip`;
-      triggerDownload(zipBlob, archiveName);
+      triggerBrowserDownload(zipBlob, archiveName);
       appendLog(`ZIP created: ${archiveName} (${formatBytes(zipBlob.size)})`);
     } catch (error) {
       appendLog(`ZIP export failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -5727,7 +5777,7 @@ const summarizeFailureReason = (error: unknown) => {
 
       const stamp = new Date().toISOString().replace(/[:.]/g, "-");
       const archiveName = `vo_leveler_review_bundles_${stamp}.zip`;
-      triggerDownload(zipBlob, archiveName);
+      triggerBrowserDownload(zipBlob, archiveName);
       appendLog(`Review bundle ZIP created: ${archiveName} (${formatBytes(zipBlob.size)})`);
     } catch (error) {
       appendLog(

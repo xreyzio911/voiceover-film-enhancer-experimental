@@ -53,7 +53,134 @@ const stdDev = (values: number[]) => {
   return Math.sqrt(variance);
 };
 
+const frameDbForSamples = (samples: Float32Array) => {
+  const frameDb: number[] = [];
+  const frameCount = Math.floor(samples.length / FRAME_SAMPLES);
+  for (let f = 0; f < frameCount; f += 1) {
+    let sum = 0;
+    for (let i = 0; i < FRAME_SAMPLES; i += 1) {
+      const v = samples[f * FRAME_SAMPLES + i] ?? 0;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / FRAME_SAMPLES);
+    frameDb.push(rms <= 0 ? -120 : 20 * Math.log10(rms));
+  }
+  return frameDb;
+};
+
 describe("gainPlanner", () => {
+  it("caps severe hot openers against later dialogue while preserving normal emphasis", () => {
+    const speechRuns = [
+      { startFrame: 20, endFrame: 120 },
+      { startFrame: 150, endFrame: 250 },
+      { startFrame: 280, endFrame: 380 },
+      { startFrame: 410, endFrame: 510 },
+      { startFrame: 540, endFrame: 640 },
+      { startFrame: 670, endFrame: 770 },
+    ];
+    const frameDb = new Array(800).fill(-78);
+    for (const [index, run] of speechRuns.entries()) {
+      const bodyDb = index < 2 ? -2 : -24;
+      for (let frame = run.startFrame; frame < run.endFrame; frame += 1) frameDb[frame] = bodyDb;
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      minGainDb: -14,
+      maxGainDb: 14,
+      instabilityHint: 0.4,
+    });
+
+    assert.ok(plan.earlyRunCapCount >= 2, `expected early caps, got ${plan.earlyRunCapCount}`);
+    const appliedBodies = plan.runs.map((run) => run.meanDb + run.plannedGainDb);
+    const laterBodies = appliedBodies.slice(3).sort((a, b) => a - b);
+    const laterMedian = laterBodies[Math.floor(laterBodies.length / 2)];
+    assert.ok(
+      Math.max(appliedBodies[0], appliedBodies[1]) <= laterMedian + 1.55,
+      `hot openers should be capped near later body: ${appliedBodies.map((v) => v.toFixed(1)).join(", ")}`,
+    );
+
+    const naturalFrameDb = new Array(800).fill(-78);
+    for (const [index, run] of speechRuns.entries()) {
+      const bodyDb = index < 2 ? -20.4 : -22;
+      for (let frame = run.startFrame; frame < run.endFrame; frame += 1) naturalFrameDb[frame] = bodyDb;
+    }
+    const naturalPlan = planGainCurve({
+      frameDb: naturalFrameDb,
+      speechRuns,
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      minGainDb: -14,
+      maxGainDb: 14,
+      instabilityHint: 0.4,
+    });
+    assert.equal(naturalPlan.earlyRunCapCount, 0, "normal 1-2 dB opener emphasis must stay intact");
+  });
+
+  it("does not over-dip sparse dialogue that is already line-consistent", () => {
+    const spans = [
+      { startSec: 0.6, endSec: 1.7, rmsDb: -36 },
+      { startSec: 2.4, endSec: 3.4, rmsDb: -35.5 },
+      { startSec: 4.2, endSec: 5.2, rmsDb: -35.7 },
+      { startSec: 6.0, endSec: 7.2, rmsDb: -36.2 },
+    ];
+    const samples = synthesizeTake(spans, 8, -78);
+
+    // A sharp consonant-like peak inside the last line should not cause the
+    // whole sparse take to re-shape around it when the line bodies are already
+    // consistent and the absolute peak remains safe.
+    const spikeStart = Math.round(6.35 * SAMPLE_RATE);
+    for (let i = 0; i < Math.round(0.02 * SAMPLE_RATE); i += 1) {
+      samples[spikeStart + i] += i % 2 === 0 ? 0.08 : -0.08;
+    }
+
+    const metrics = analyzeFloatSamples(samples, SAMPLE_RATE, FRAME_MS);
+    const frameDb = frameDbForSamples(samples);
+    const runs = speechRunsFromMask(buildSpeechMask(frameDb, metrics.noiseFloorDb));
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: runs,
+      noiseFloorDb: metrics.noiseFloorDb,
+      speechThresholdDb: metrics.speechThresholdDb,
+      pauseNoiseRisk: metrics.pauseNoiseRisk,
+      frameMs: FRAME_MS,
+      samples,
+      sampleRate: SAMPLE_RATE,
+      targetDb: -22,
+      sourceTargetBlend: 0.1,
+      maxGainDb: 16,
+      peakCeilingDb: -3,
+      instabilityHint: 0.6,
+      speechSpikeTaming: 0.85,
+    });
+
+    const leveled = applyGainCurveToSamples(samples, plan.gainCurve, SAMPLE_RATE, 1, FRAME_MS);
+    const leveledBodies = spans.map((span) =>
+      measureRmsDb(
+        leveled,
+        Math.round((span.startSec + 0.2) * SAMPLE_RATE),
+        Math.round((span.endSec - 0.2) * SAMPLE_RATE),
+      ),
+    );
+
+    assert.ok(
+      stdDev(leveledBodies) < 0.9,
+      `already-consistent sparse dialogue should remain consistent: ${leveledBodies.map((v) => v.toFixed(1)).join(", ")}`,
+    );
+    assert.equal(plan.speechSpikeFrameCount, 0, "body-relative spike guard should stand down on this sparse clean take");
+  });
+
   it("normalizes uneven sentences to within +/- 2 dB", () => {
     // Three sentences at -30, -12, -26 dB RMS.
     const spans = [

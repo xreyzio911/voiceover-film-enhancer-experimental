@@ -1,0 +1,1084 @@
+{
+  "generatedAt": "2026-05-08T07:13:26.289Z",
+  "environment": {
+    "node": "v24.5.0",
+    "audioSplitterDevice": "cpu",
+    "audioSplitterAutocast": "0",
+    "audioSplitterCommand": ".venv-audio-splitter\\Scripts\\python.exe"
+  },
+  "voSummary": {
+    "files": 14,
+    "improvedRunSigmaFiles": 14,
+    "medianOutputRunSigmaDb": 1.553,
+    "averageRiskDelta": -0.031,
+    "maxOutputClipPct": 0
+  },
+  "voRows": [
+    {
+      "name": "1-10-Vanessa +preview.wav",
+      "durationSeconds": 934.042,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 36,
+      "plannerMaxGainDb": 16.09,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.736,
+      "outputOverallRisk": 0.658,
+      "inputSentenceJumpScore": 0.828,
+      "outputSentenceJumpScore": 0.566,
+      "inputPauseNoiseRisk": 0.119,
+      "outputPauseNoiseRisk": 0.108,
+      "inputRunSigmaDb": 1.621,
+      "outputRunSigmaDb": 1.615,
+      "inputOpenerOverLaterDb": -0.368,
+      "outputOpenerOverLaterDb": -0.491,
+      "outputPeakDb": -12.46,
+      "outputClipPct": 0
+    },
+    {
+      "name": "7 YOLA.wav",
+      "durationSeconds": 111.804,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 34,
+      "plannerMaxGainDb": 14.2,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.712,
+      "outputOverallRisk": 0.666,
+      "inputSentenceJumpScore": 0.84,
+      "outputSentenceJumpScore": 0.758,
+      "inputPauseNoiseRisk": 0.125,
+      "outputPauseNoiseRisk": 0.12,
+      "inputRunSigmaDb": 3.449,
+      "outputRunSigmaDb": 1.491,
+      "inputOpenerOverLaterDb": -2.539,
+      "outputOpenerOverLaterDb": 1.511,
+      "outputPeakDb": -14.17,
+      "outputClipPct": 0
+    },
+    {
+      "name": "8 YOLA.wav",
+      "durationSeconds": 104.536,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 19,
+      "plannerMaxGainDb": 14.19,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.705,
+      "outputOverallRisk": 0.635,
+      "inputSentenceJumpScore": 0.953,
+      "outputSentenceJumpScore": 0.479,
+      "inputPauseNoiseRisk": 0.122,
+      "outputPauseNoiseRisk": 0.12,
+      "inputRunSigmaDb": 4.634,
+      "outputRunSigmaDb": 1.139,
+      "inputOpenerOverLaterDb": -11.088,
+      "outputOpenerOverLaterDb": -1.543,
+      "outputPeakDb": -14.74,
+      "outputClipPct": 0
+    },
+    {
+      "name": "141 8 chika ass.wav",
+      "durationSeconds": 104.536,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 4,
+      "plannerMaxGainDb": 15.63,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.719,
+      "outputOverallRisk": 0.64,
+      "inputSentenceJumpScore": 0.626,
+      "outputSentenceJumpScore": 0.099,
+      "inputPauseNoiseRisk": 0.134,
+      "outputPauseNoiseRisk": 0.134,
+      "inputRunSigmaDb": 0.939,
+      "outputRunSigmaDb": 0.439,
+      "inputOpenerOverLaterDb": null,
+      "outputOpenerOverLaterDb": null,
+      "outputPeakDb": -7.47,
+      "outputClipPct": 0
+    },
+    {
+      "name": "141 9 chika ass.wav",
+      "durationSeconds": 53.267,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 3,
+      "plannerMaxGainDb": 14.85,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.411,
+      "outputOverallRisk": 0.541,
+      "inputSentenceJumpScore": 0,
+      "outputSentenceJumpScore": 0.982,
+      "inputPauseNoiseRisk": 0.127,
+      "outputPauseNoiseRisk": 0.112,
+      "inputRunSigmaDb": 6.292,
+      "outputRunSigmaDb": 2.517,
+      "inputOpenerOverLaterDb": null,
+      "outputOpenerOverLaterDb": null,
+      "outputPeakDb": -14.98,
+      "outputClipPct": 0
+    },
+    {
+      "name": "Barry Wallace Batch N. 0-10.wav",
+      "durationSeconds": 1266.067,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 43,
+      "plannerMaxGainDb": 16.11,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.729,
+      "outputOverallRisk": 0.679,
+      "inputSentenceJumpScore": 1,
+      "outputSentenceJumpScore": 0.875,
+      "inputPauseNoiseRisk": 0.132,
+      "outputPauseNoiseRisk": 0.116,
+      "inputRunSigmaDb": 5.962,
+      "outputRunSigmaDb": 2.519,
+      "inputOpenerOverLaterDb": 6.21,
+      "outputOpenerOverLaterDb": 0.362,
+      "outputPeakDb": -7.78,
+      "outputClipPct": 0
+    },
+    {
+      "name": "EP0-10_Danny_Math.wav",
+      "durationSeconds": 897.299,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 24,
+      "plannerMaxGainDb": 15.99,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.687,
+      "outputOverallRisk": 0.583,
+      "inputSentenceJumpScore": 1,
+      "outputSentenceJumpScore": 1,
+      "inputPauseNoiseRisk": 0.14,
+      "outputPauseNoiseRisk": 0.105,
+      "inputRunSigmaDb": 1.873,
+      "outputRunSigmaDb": 1.437,
+      "inputOpenerOverLaterDb": 1.441,
+      "outputOpenerOverLaterDb": 0.278,
+      "outputPeakDb": -12.27,
+      "outputClipPct": 0
+    },
+    {
+      "name": "ID 58-PART 1-MARIA-CHIKA.wav",
+      "durationSeconds": 124.76,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 7,
+      "plannerMaxGainDb": 16.31,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.503,
+      "outputOverallRisk": 0.621,
+      "inputSentenceJumpScore": 0.817,
+      "outputSentenceJumpScore": 1,
+      "inputPauseNoiseRisk": 0.119,
+      "outputPauseNoiseRisk": 0.12,
+      "inputRunSigmaDb": 0.807,
+      "outputRunSigmaDb": 0.575,
+      "inputOpenerOverLaterDb": null,
+      "outputOpenerOverLaterDb": null,
+      "outputPeakDb": -9.68,
+      "outputClipPct": 0
+    },
+    {
+      "name": "ID 58-PART 2-MARIA-CHIKA.wav",
+      "durationSeconds": 122.76,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 24,
+      "plannerMaxGainDb": 14.95,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.634,
+      "outputOverallRisk": 0.604,
+      "inputSentenceJumpScore": 0.981,
+      "outputSentenceJumpScore": 0.984,
+      "inputPauseNoiseRisk": 0.141,
+      "outputPauseNoiseRisk": 0.117,
+      "inputRunSigmaDb": 8.591,
+      "outputRunSigmaDb": 5.286,
+      "inputOpenerOverLaterDb": -0.309,
+      "outputOpenerOverLaterDb": 1.973,
+      "outputPeakDb": -13.68,
+      "outputClipPct": 0
+    },
+    {
+      "name": "Joey- batch 0-10- Francesco.wav",
+      "durationSeconds": 1147.085,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 2,
+      "plannerMaxGainDb": 15.89,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.519,
+      "outputOverallRisk": 0.456,
+      "inputSentenceJumpScore": 0.646,
+      "outputSentenceJumpScore": 0.142,
+      "inputPauseNoiseRisk": 0.112,
+      "outputPauseNoiseRisk": 0.108,
+      "inputRunSigmaDb": 0.126,
+      "outputRunSigmaDb": 0.008,
+      "inputOpenerOverLaterDb": null,
+      "outputOpenerOverLaterDb": null,
+      "outputPeakDb": -17.07,
+      "outputClipPct": 0
+    },
+    {
+      "name": "Preview, 1-11_Mason Cain.wav",
+      "durationSeconds": 995.067,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 88,
+      "plannerMaxGainDb": 15.11,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.65,
+      "outputOverallRisk": 0.624,
+      "inputSentenceJumpScore": 0.682,
+      "outputSentenceJumpScore": 0.654,
+      "inputPauseNoiseRisk": 0.124,
+      "outputPauseNoiseRisk": 0.137,
+      "inputRunSigmaDb": 2.728,
+      "outputRunSigmaDb": 1.463,
+      "inputOpenerOverLaterDb": 3.798,
+      "outputOpenerOverLaterDb": -0.644,
+      "outputPeakDb": -7.99,
+      "outputClipPct": 0
+    },
+    {
+      "name": "Serarose_EP0-10_edit.wav",
+      "durationSeconds": 1004.885,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 18,
+      "plannerMaxGainDb": 16.09,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.679,
+      "outputOverallRisk": 0.655,
+      "inputSentenceJumpScore": 0.674,
+      "outputSentenceJumpScore": 0.954,
+      "inputPauseNoiseRisk": 0.134,
+      "outputPauseNoiseRisk": 0.125,
+      "inputRunSigmaDb": 2.502,
+      "outputRunSigmaDb": 2.362,
+      "inputOpenerOverLaterDb": -0.256,
+      "outputOpenerOverLaterDb": 0.019,
+      "outputPeakDb": -8.17,
+      "outputClipPct": 0
+    },
+    {
+      "name": "TiffanyLockhart_Ivolo_Ep10.wav",
+      "durationSeconds": 1265.12,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 155,
+      "plannerMaxGainDb": 15.18,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.717,
+      "outputOverallRisk": 0.67,
+      "inputSentenceJumpScore": 0.839,
+      "outputSentenceJumpScore": 0.57,
+      "inputPauseNoiseRisk": 0.115,
+      "outputPauseNoiseRisk": 0.112,
+      "inputRunSigmaDb": 6.627,
+      "outputRunSigmaDb": 2.9,
+      "inputOpenerOverLaterDb": -2.679,
+      "outputOpenerOverLaterDb": -0.19,
+      "outputPeakDb": -10.7,
+      "outputClipPct": 0
+    },
+    {
+      "name": "Vincent Wyndham BATCH 1 - 10 -.wav",
+      "durationSeconds": 1265.131,
+      "sampleRate": 48000,
+      "channels": 1,
+      "speechRuns": 21,
+      "plannerMaxGainDb": 14.96,
+      "earlyRunCapCount": 0,
+      "earlyRunMaxReductionDb": 0,
+      "inputOverallRisk": 0.652,
+      "outputOverallRisk": 0.587,
+      "inputSentenceJumpScore": 1,
+      "outputSentenceJumpScore": 0.623,
+      "inputPauseNoiseRisk": 0.127,
+      "outputPauseNoiseRisk": 0.112,
+      "inputRunSigmaDb": 7.146,
+      "outputRunSigmaDb": 3.894,
+      "inputOpenerOverLaterDb": -1.275,
+      "outputOpenerOverLaterDb": -0.392,
+      "outputPeakDb": -7.55,
+      "outputClipPct": 0
+    }
+  ],
+  "split": {
+    "preflight": [
+      {
+        "name": "800001200000002541_0000_001_preview.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 84.126,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0001_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 89.84,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0002_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 65.816,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0003_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 66.567,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0004_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 98.348,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0005_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 90.924,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0006_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 75.158,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0007_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 54.554,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0008_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 89.548,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0009_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 89.673,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0010_001.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 33.992,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0010_002A.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 30.447,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0010_002B.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 17.226,
+        "bitsPerSample": 16
+      },
+      {
+        "name": "800001200000002541_0010_003.wav",
+        "sampleRate": 48000,
+        "channels": 2,
+        "durationSeconds": 26.026,
+        "bitsPerSample": 16
+      }
+    ],
+    "zipName": "audio_track_splitter_2026-05-08T06-36-20-464Z.zip",
+    "zipSizeBytes": 237531027,
+    "elapsedSeconds": 2225.8,
+    "report": {
+      "generatedAt": "2026-05-08T06:36:20.464Z",
+      "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+      "totalFiles": 14,
+      "succeeded": 14,
+      "failed": 0,
+      "files": [
+        {
+          "inputIndex": 0,
+          "originalName": "800001200000002541_0000_001_preview.wav",
+          "sanitizedBase": "800001200000002541_0000_001_preview",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0000_001_preview_BGM.wav",
+            "800001200000002541_0000_001_preview_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 84.12571428571428,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0000_001_preview_BGM.wav",
+              "sizeBytes": 14839820,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 84.12571428571428,
+              "peakDbfs": -7.48,
+              "rmsDbfs": -26.82,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0000_001_preview_VOCAL.wav",
+              "sizeBytes": 14839820,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 84.12571428571428,
+              "peakDbfs": -0.83,
+              "rmsDbfs": -18.74,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 1,
+          "originalName": "800001200000002541_0001_001.wav",
+          "sanitizedBase": "800001200000002541_0001_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0001_001_BGM.wav",
+            "800001200000002541_0001_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 89.83975056689343,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0001_001_BGM.wav",
+              "sizeBytes": 15847776,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 89.83975056689343,
+              "peakDbfs": -0.18,
+              "rmsDbfs": -24.54,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0001_001_VOCAL.wav",
+              "sizeBytes": 15847776,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 89.83975056689343,
+              "peakDbfs": -1,
+              "rmsDbfs": -22.22,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 2,
+          "originalName": "800001200000002541_0002_001.wav",
+          "sanitizedBase": "800001200000002541_0002_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0002_001_BGM.wav",
+            "800001200000002541_0002_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 65.81575963718821,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0002_001_BGM.wav",
+              "sizeBytes": 11609944,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 65.81575963718821,
+              "peakDbfs": -0.53,
+              "rmsDbfs": -28.25,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0002_001_VOCAL.wav",
+              "sizeBytes": 11609944,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 65.81575963718821,
+              "peakDbfs": -0.76,
+              "rmsDbfs": -22.45,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 3,
+          "originalName": "800001200000002541_0003_001.wav",
+          "sanitizedBase": "800001200000002541_0003_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0003_001_BGM.wav",
+            "800001200000002541_0003_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 66.56650793650793,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0003_001_BGM.wav",
+              "sizeBytes": 11742376,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 66.56650793650793,
+              "peakDbfs": -1.11,
+              "rmsDbfs": -29.89,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0003_001_VOCAL.wav",
+              "sizeBytes": 11742376,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 66.56650793650793,
+              "peakDbfs": -2.15,
+              "rmsDbfs": -26.1,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 4,
+          "originalName": "800001200000002541_0004_001.wav",
+          "sanitizedBase": "800001200000002541_0004_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0004_001_BGM.wav",
+            "800001200000002541_0004_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 98.34825396825397,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0004_001_BGM.wav",
+              "sizeBytes": 17348676,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 98.34825396825397,
+              "peakDbfs": -0.2,
+              "rmsDbfs": -31.02,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0004_001_VOCAL.wav",
+              "sizeBytes": 17348676,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 98.34825396825397,
+              "peakDbfs": -0.18,
+              "rmsDbfs": -22.72,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 5,
+          "originalName": "800001200000002541_0005_001.wav",
+          "sanitizedBase": "800001200000002541_0005_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0005_001_BGM.wav",
+            "800001200000002541_0005_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 90.9241723356009,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0005_001_BGM.wav",
+              "sizeBytes": 16039068,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 90.9241723356009,
+              "peakDbfs": -0.53,
+              "rmsDbfs": -29.81,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0005_001_VOCAL.wav",
+              "sizeBytes": 16039068,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 90.9241723356009,
+              "peakDbfs": -0.18,
+              "rmsDbfs": -22.71,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 6,
+          "originalName": "800001200000002541_0006_001.wav",
+          "sanitizedBase": "800001200000002541_0006_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0006_001_BGM.wav",
+            "800001200000002541_0006_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 75.15843537414966,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0006_001_BGM.wav",
+              "sizeBytes": 13257992,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 75.15843537414966,
+              "peakDbfs": -2.08,
+              "rmsDbfs": -25.33,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0006_001_VOCAL.wav",
+              "sizeBytes": 13257992,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 75.15843537414966,
+              "peakDbfs": -0.96,
+              "rmsDbfs": -21.69,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 7,
+          "originalName": "800001200000002541_0007_001.wav",
+          "sanitizedBase": "800001200000002541_0007_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0007_001_BGM.wav",
+            "800001200000002541_0007_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 54.55451247165533,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0007_001_BGM.wav",
+              "sizeBytes": 9623460,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 54.55451247165533,
+              "peakDbfs": -2.19,
+              "rmsDbfs": -26.02,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0007_001_VOCAL.wav",
+              "sizeBytes": 9623460,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 54.55451247165533,
+              "peakDbfs": -0.54,
+              "rmsDbfs": -18.46,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 8,
+          "originalName": "800001200000002541_0008_001.wav",
+          "sanitizedBase": "800001200000002541_0008_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0008_001_BGM.wav",
+            "800001200000002541_0008_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 89.54780045351474,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0008_001_BGM.wav",
+              "sizeBytes": 15796276,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 89.54780045351474,
+              "peakDbfs": -1.29,
+              "rmsDbfs": -25.08,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0008_001_VOCAL.wav",
+              "sizeBytes": 15796276,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 89.54780045351474,
+              "peakDbfs": -0.69,
+              "rmsDbfs": -24.27,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 9,
+          "originalName": "800001200000002541_0009_001.wav",
+          "sanitizedBase": "800001200000002541_0009_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0009_001_BGM.wav",
+            "800001200000002541_0009_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 89.67292517006803,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0009_001_BGM.wav",
+              "sizeBytes": 15818348,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 89.67292517006803,
+              "peakDbfs": -1.57,
+              "rmsDbfs": -24.68,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0009_001_VOCAL.wav",
+              "sizeBytes": 15818348,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 89.67292517006803,
+              "peakDbfs": -1.74,
+              "rmsDbfs": -25.6,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 10,
+          "originalName": "800001200000002541_0010_001.wav",
+          "sanitizedBase": "800001200000002541_0010_001",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0010_001_BGM.wav",
+            "800001200000002541_0010_001_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 33.99231292517007,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0010_001_BGM.wav",
+              "sizeBytes": 5996288,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 33.99231292517007,
+              "peakDbfs": -8.9,
+              "rmsDbfs": -29.84,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0010_001_VOCAL.wav",
+              "sizeBytes": 5996288,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 33.99231292517007,
+              "peakDbfs": -1.97,
+              "rmsDbfs": -24.02,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 11,
+          "originalName": "800001200000002541_0010_002A.wav",
+          "sanitizedBase": "800001200000002541_0010_002A",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0010_002A_BGM.wav",
+            "800001200000002541_0010_002A_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 30.447097505668935,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0010_002A_BGM.wav",
+              "sizeBytes": 5370912,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 30.447097505668935,
+              "peakDbfs": -2.69,
+              "rmsDbfs": -23.3,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0010_002A_VOCAL.wav",
+              "sizeBytes": 5370912,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 30.447097505668935,
+              "peakDbfs": -3.4,
+              "rmsDbfs": -25.91,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 12,
+          "originalName": "800001200000002541_0010_002B.wav",
+          "sanitizedBase": "800001200000002541_0010_002B",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0010_002B_BGM.wav",
+            "800001200000002541_0010_002B_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 17.225555555555555,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0010_002B_BGM.wav",
+              "sizeBytes": 3038632,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 17.225555555555555,
+              "peakDbfs": -10.94,
+              "rmsDbfs": -29.18,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0010_002B_VOCAL.wav",
+              "sizeBytes": 3038632,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 17.225555555555555,
+              "peakDbfs": -3.96,
+              "rmsDbfs": -26.72,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        },
+        {
+          "inputIndex": 13,
+          "originalName": "800001200000002541_0010_003.wav",
+          "sanitizedBase": "800001200000002541_0010_003",
+          "status": "success",
+          "message": "Split complete.",
+          "outputs": [
+            "800001200000002541_0010_003_BGM.wav",
+            "800001200000002541_0010_003_VOCAL.wav"
+          ],
+          "engine": "audio-separator:model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+          "sampleRate": 44100,
+          "channels": 2,
+          "durationSeconds": 26.026009070294783,
+          "stems": [
+            {
+              "stem": "BGM",
+              "fileName": "800001200000002541_0010_003_BGM.wav",
+              "sizeBytes": 4591032,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 26.026009070294783,
+              "peakDbfs": -3.29,
+              "rmsDbfs": -27.35,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            },
+            {
+              "stem": "VOCAL",
+              "fileName": "800001200000002541_0010_003_VOCAL.wav",
+              "sizeBytes": 4591032,
+              "sampleRate": 44100,
+              "channels": 2,
+              "durationSeconds": 26.026009070294783,
+              "peakDbfs": -3.21,
+              "rmsDbfs": -26.26,
+              "clippedSampleCount": 0,
+              "clippedSamplePct": 0,
+              "silent": false
+            }
+          ],
+          "warnings": [
+            "Output sample rate is 44100 Hz because the separation engine produced that rate; original was 48000 Hz."
+          ]
+        }
+      ]
+    }
+  }
+}

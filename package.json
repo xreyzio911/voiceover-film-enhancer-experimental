@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:audio-qc": "node --test --experimental-strip-types src/lib/audioQc.test.ts src/lib/gainPlanner.test.ts src/lib/renderRecovery.test.ts src/lib/reviewLearning.test.ts",
+    "test:audio-qc": "node --test --experimental-strip-types src/lib/audioQc.test.ts src/lib/gainPlanner.test.ts src/lib/renderRecovery.test.ts src/lib/reviewLearning.test.ts src/lib/audioSplitterService.test.ts",
     "train:review-model": "node --experimental-strip-types scripts/trainReviewModel.ts",
     "promote:review-model": "node --experimental-strip-types scripts/promoteReviewModel.ts",
     "postinstall": "node scripts/copy-ffmpeg-core.mjs"

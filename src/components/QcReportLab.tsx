@@ -24,6 +24,7 @@ import {
   type ReviewIssueTag,
   type ReviewVerdict,
 } from "../lib/reviewLearning";
+import { triggerBrowserDownload } from "../lib/downloadBlob";
 import styles from "./QcReportLab.module.css";
 
 const QC_STREAMING_WAV_THRESHOLD_BYTES = 64 * 1024 * 1024;
@@ -581,18 +582,6 @@ const analyzePcmWavStreaming = async (file: File): Promise<QcReport> => {
   );
 };
 
-const triggerDownload = (blob: Blob, fileName: string) => {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = fileName;
-  link.rel = "noopener";
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
-};
-
 const createEmptyReviewDraft = (): ReviewDecisionDraft => ({
   finalVerdict: null,
   issueTags: [],
@@ -793,7 +782,7 @@ export default function QcReportLab() {
       status,
       reports,
     };
-    triggerDownload(
+    triggerBrowserDownload(
       new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
       `qc_report_${new Date().toISOString().replace(/[:.]/g, "-")}.json`,
     );
@@ -855,7 +844,7 @@ export default function QcReportLab() {
   const exportReviewDataset = () => {
     if (completedReviewRecords.length === 0) return;
     const jsonl = serializeReviewDecisionJsonl(completedReviewRecords);
-    triggerDownload(
+    triggerBrowserDownload(
       new Blob([jsonl], { type: "application/x-ndjson" }),
       `review_labels_${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`,
     );
@@ -910,7 +899,7 @@ export default function QcReportLab() {
         compressionOptions: { level: 6 },
       });
 
-      triggerDownload(
+      triggerBrowserDownload(
         zipBlob,
         `review_model_${new Date().toISOString().replace(/[:.]/g, "-")}.zip`,
       );

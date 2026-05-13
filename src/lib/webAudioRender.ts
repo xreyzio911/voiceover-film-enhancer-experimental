@@ -27,8 +27,10 @@ const readString = (view: DataView, offset: number, length: number) => {
  * Parse a RIFF/WAVE byte buffer into interleaved Float32 samples.
  */
 export const decodeWav = (buffer: ArrayBufferLike | Uint8Array): DecodedWav => {
-  const ab = buffer instanceof Uint8Array ? buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) : buffer;
-  const view = new DataView(ab as ArrayBuffer);
+  const ab = buffer instanceof Uint8Array ? buffer.buffer : buffer;
+  const byteOffset = buffer instanceof Uint8Array ? buffer.byteOffset : 0;
+  const byteLength = buffer instanceof Uint8Array ? buffer.byteLength : (buffer as ArrayBuffer).byteLength;
+  const view = new DataView(ab as ArrayBuffer, byteOffset, byteLength);
 
   if (view.byteLength < 44) throw new Error("WAV too small");
   if (readString(view, 0, 4) !== "RIFF") throw new Error("Not a RIFF file");
