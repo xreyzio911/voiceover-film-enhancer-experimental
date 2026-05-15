@@ -4102,6 +4102,41 @@ const summarizeFailureReason = (error: unknown) => {
     );
   };
 
+  const runStaticLoudnessFallback = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    outputName: string,
+    cfg: NonNullable<(typeof LOUDNESS_PRESETS)[keyof typeof LOUDNESS_PRESETS]>,
+    measuredOffset: number,
+  ) => {
+    const safeOffset = clamp(measuredOffset, -12, 12);
+    resetLogBuffer();
+    await execOrThrow(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-filter_threads",
+        "1",
+        "-y",
+        "-i",
+        inputName,
+        "-af",
+        `volume=${safeOffset.toFixed(3)}dB,alimiter=limit=${cfg.TP}dB:level=disabled`,
+        "-ar",
+        "48000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_f32le",
+        outputName,
+      ],
+      "Static loudness fallback",
+    );
+  };
+
   const runLoudnorm = async (
     ffmpeg: FFmpeg,
     inputName: string,
@@ -4164,30 +4199,41 @@ const summarizeFailureReason = (error: unknown) => {
     }
 
     resetLogBuffer();
-    await execOrThrow(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-filter_threads",
-        "1",
-        "-y",
-        "-i",
-        inputName,
-        "-af",
-        `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:measured_I=${measuredI}:measured_TP=${measuredTP}:measured_LRA=${measuredLRA}:measured_thresh=${measuredThresh}:offset=${offset}:linear=${linearMode ? "true" : "false"}:print_format=summary`,
-        "-ar",
-        "48000",
-        "-ac",
-        "1",
-        "-c:a",
-        "pcm_f32le",
-        outputName,
-      ],
-      "Loudnorm render"
-    );
+    try {
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-filter_threads",
+          "1",
+          "-y",
+          "-i",
+          inputName,
+          "-af",
+          `loudnorm=I=${cfg.I}:TP=${cfg.TP}:LRA=${cfg.LRA}:measured_I=${measuredI}:measured_TP=${measuredTP}:measured_LRA=${measuredLRA}:measured_thresh=${measuredThresh}:offset=${offset}:linear=${linearMode ? "true" : "false"}:print_format=summary`,
+          "-ar",
+          "48000",
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_f32le",
+          outputName,
+        ],
+        "Loudnorm render"
+      );
+    } catch (error) {
+      appendLog(
+        `[Loudnorm] ${sanitizeBase(
+          inputName,
+        )}: render fallback (${error instanceof Error ? error.message : String(error)}); applying measured static gain ${offset.toFixed(
+          2,
+        )} dB with true-peak limiter.`,
+      );
+      await runStaticLoudnessFallback(ffmpeg, inputName, outputName, cfg, offset);
+    }
   };
 
   const renderLongFormSafeMode = async (
