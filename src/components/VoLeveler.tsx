@@ -799,14 +799,6 @@ export default function VoLeveler() {
     });
   };
 
-  const toBlobURLSafe = async (url: string, mime: string) => {
-    try {
-      return await toBlobURL(url, mime);
-    } catch {
-      return undefined;
-    }
-  };
-
   const resolveFfmpegAssetUrl = (name: string) =>
     typeof window === "undefined" ? `/ffmpeg/${name}` : new URL(`/ffmpeg/${name}`, window.location.origin).toString();
 
@@ -820,7 +812,6 @@ export default function VoLeveler() {
     try {
       coreURL = await toBlobURL(resolveFfmpegAssetUrl("ffmpeg-core.js"), "text/javascript");
       wasmURL = await toBlobURL(resolveFfmpegAssetUrl("ffmpeg-core.wasm"), "application/wasm");
-      workerURL = await toBlobURLSafe(resolveFfmpegAssetUrl("ffmpeg-core.worker.js"), "text/javascript");
 
       const assetUrls = {
         coreURL,
@@ -1018,9 +1009,18 @@ const summarizeFailureReason = (error: unknown) => {
     }
   };
 
+  const cloneBytes = (bytes: Uint8Array) => {
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return copy;
+  };
+
   const readVirtualFileBytes = async (ffmpeg: FFmpeg, name: string) => {
     const data = await ffmpeg.readFile(name);
-    return typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data);
+    if (typeof data === "string") {
+      return new TextEncoder().encode(data);
+    }
+    return cloneBytes(data instanceof Uint8Array ? data : new Uint8Array(data));
   };
 
   const toFloatSamples = (bytes: Uint8Array) => {
@@ -1074,9 +1074,7 @@ const summarizeFailureReason = (error: unknown) => {
   };
 
   const reviewBlobFromBytes = (bytes: Uint8Array) => {
-    const buffer = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(buffer).set(bytes);
-    return new Blob([buffer], {
+    return new Blob([cloneBytes(bytes)], {
       type: "audio/wav",
     });
   };
@@ -5732,7 +5730,7 @@ const summarizeFailureReason = (error: unknown) => {
                     ? `${formatCandidateVariant(selectedVariant)} single-pass winner`
                     : "best-effort winner";
 
-          await ffmpeg.writeFile(job.mixName, selectedBytes);
+          await ffmpeg.writeFile(job.mixName, cloneBytes(selectedBytes));
           appendLog(
             `[CandidateSelect] ${job.base}: kept ${formatCandidateVariant(selectedVariant)} via ${summarizeCandidateMeta(
               selectedMeta ?? {
@@ -5752,87 +5750,96 @@ const summarizeFailureReason = (error: unknown) => {
             }.`
           );
           appendLog(`[CandidateSummary] ${job.base}: ${selectedSummary}.`);
-          if (selectedArtifact && useLongCandidateMemoryPolicy) {
+          const skipReviewBundleForMemory = candidateQcSafeDurationSeconds >= LONG_FILE_DURATION_SECONDS;
+          if (selectedArtifact && skipReviewBundleForMemory) {
             appendLog(
               `[ReviewBundle] ${job.base}: skipped QC Lab review bundle for ${candidateQcSafeDurationSeconds.toFixed(
                 0,
               )}s long file to avoid duplicating large audio blobs in browser memory.`,
             );
           } else if (selectedArtifact) {
-            const bundleId = `${job.base}_review_${String(i + 1).padStart(3, "0")}`;
-            const sourceDurationSec =
-              sourceDecodedForReview?.durationSec ?? speechRenderPlan?.durationSeconds ?? 0;
-            const sourceSampleRate = sourceDecodedForReview?.sampleRate ?? 0;
-            const selectedVariantLabel = formatCandidateVariant(selectedVariant);
-            const selectedReasonText = selectedReason ?? "first completed candidate";
-            const reviewCandidates: Array<{
-              role: "winner" | "challenger";
-              assetName: string;
-              artifact: CandidateReviewArtifact;
-            }> = [{ role: "winner", assetName: "winner.wav", artifact: selectedArtifact }];
-            if (challengerArtifact) {
-              reviewCandidates.push({
-                role: "challenger",
-                assetName: "challenger.wav",
-                artifact: challengerArtifact,
-              });
-            }
-            const manifest: ReviewBundleManifest = {
-              schemaVersion: REVIEW_BUNDLE_SCHEMA_VERSION,
-              bundleId,
-              createdAt: new Date().toISOString(),
-              source: {
-                fileName: job.file.name,
-                audioFile: "source.wav",
-                durationSec: sourceDurationSec,
-                sampleRate: sourceSampleRate,
-                qc: sourceQcSnapshot,
-              },
-              decisionContext: {
-                jobBase: job.base,
-                loudnessTarget,
-                selectedVariant: selectedVariantLabel,
-                selectedReason: selectedReasonText,
-                learnedWeightsName: learnedReviewWeights.modelName,
-                learnedWeightsSource: learnedReviewWeightsSource,
-                reviewModelType: learnedReviewWeights.modelType,
-              },
-              candidates: reviewCandidates.map(({ role, assetName, artifact }) => ({
-                role,
-                audioFile: assetName,
-                variantLabel: artifact.label,
-                renderMeta: artifact.meta,
-                baselineScore: artifact.baselineScore,
-                ranking: artifact.ranking,
-                qc: artifact.qcSnapshot,
-                sourceComparison: {
-                  alignment: artifact.alignment,
-                  qcDelta: artifact.qcDelta,
+            try {
+              const bundleId = `${job.base}_review_${String(i + 1).padStart(3, "0")}`;
+              const sourceDurationSec =
+                sourceDecodedForReview?.durationSec ?? speechRenderPlan?.durationSeconds ?? 0;
+              const sourceSampleRate = sourceDecodedForReview?.sampleRate ?? 0;
+              const selectedVariantLabel = formatCandidateVariant(selectedVariant);
+              const selectedReasonText = selectedReason ?? "first completed candidate";
+              const reviewCandidates: Array<{
+                role: "winner" | "challenger";
+                assetName: string;
+                artifact: CandidateReviewArtifact;
+              }> = [{ role: "winner", assetName: "winner.wav", artifact: selectedArtifact }];
+              if (challengerArtifact) {
+                reviewCandidates.push({
+                  role: "challenger",
+                  assetName: "challenger.wav",
+                  artifact: challengerArtifact,
+                });
+              }
+              const manifest: ReviewBundleManifest = {
+                schemaVersion: REVIEW_BUNDLE_SCHEMA_VERSION,
+                bundleId,
+                createdAt: new Date().toISOString(),
+                source: {
+                  fileName: job.file.name,
+                  audioFile: "source.wav",
+                  durationSec: sourceDurationSec,
+                  sampleRate: sourceSampleRate,
+                  qc: sourceQcSnapshot,
                 },
-                selectionReason: artifact.selectionReason,
-              })),
-            };
-            nextReviewBundles.push({
-              bundleId,
-              manifest,
-              assets: [
-                { path: "source.wav", blob: job.file },
-                { path: "winner.wav", blob: reviewBlobFromBytes(selectedArtifact.bytes) },
-                ...(challengerArtifact
-                  ? [
-                      {
-                        path: "challenger.wav",
-                        blob: reviewBlobFromBytes(challengerArtifact.bytes),
-                      },
-                    ]
-                  : []),
-              ],
-            });
-            appendLog(
-              `[ReviewBundle] ${job.base}: captured ${selectedVariantLabel} winner${
-                challengerArtifact ? ` vs ${challengerArtifact.label}` : ""
-              } for QC Lab review.`
-            );
+                decisionContext: {
+                  jobBase: job.base,
+                  loudnessTarget,
+                  selectedVariant: selectedVariantLabel,
+                  selectedReason: selectedReasonText,
+                  learnedWeightsName: learnedReviewWeights.modelName,
+                  learnedWeightsSource: learnedReviewWeightsSource,
+                  reviewModelType: learnedReviewWeights.modelType,
+                },
+                candidates: reviewCandidates.map(({ role, assetName, artifact }) => ({
+                  role,
+                  audioFile: assetName,
+                  variantLabel: artifact.label,
+                  renderMeta: artifact.meta,
+                  baselineScore: artifact.baselineScore,
+                  ranking: artifact.ranking,
+                  qc: artifact.qcSnapshot,
+                  sourceComparison: {
+                    alignment: artifact.alignment,
+                    qcDelta: artifact.qcDelta,
+                  },
+                  selectionReason: artifact.selectionReason,
+                })),
+              };
+              nextReviewBundles.push({
+                bundleId,
+                manifest,
+                assets: [
+                  { path: "source.wav", blob: job.file },
+                  { path: "winner.wav", blob: reviewBlobFromBytes(selectedArtifact.bytes) },
+                  ...(challengerArtifact
+                    ? [
+                        {
+                          path: "challenger.wav",
+                          blob: reviewBlobFromBytes(challengerArtifact.bytes),
+                        },
+                      ]
+                    : []),
+                ],
+              });
+              appendLog(
+                `[ReviewBundle] ${job.base}: captured ${selectedVariantLabel} winner${
+                  challengerArtifact ? ` vs ${challengerArtifact.label}` : ""
+                } for QC Lab review.`
+              );
+            } catch (error) {
+              appendLog(
+                `[ReviewBundle] ${job.base}: skipped after bundle build failed (${
+                  error instanceof Error ? error.message : String(error)
+                }); audio outputs continue.`,
+              );
+            }
           }
 
           const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean");
