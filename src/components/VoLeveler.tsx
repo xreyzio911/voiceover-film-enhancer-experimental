@@ -15,6 +15,7 @@ import {
   buildRenderRiskProfile,
   compareCandidateScores,
   isHealthySegmentedRender,
+  selectQcUnavailableFallbackCandidate,
   shouldPreferCandidate,
   type CandidateRenderMeta,
   type CandidateScore,
@@ -48,6 +49,11 @@ import {
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import { queueBrowserDownload, triggerBrowserDownload } from "../lib/downloadBlob";
 import { estimateVoZipBytes, planVoZipExportParts } from "../lib/downloadPolicy";
+import {
+  formatLongFormPartTag,
+  planLongFormChunks,
+  shouldUseLongFormSafeMode,
+} from "../lib/longFormExportPolicy";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -134,6 +140,7 @@ const BATCH_MEMORY_GUARD_INTERVAL = 3;
  */
 const BATCH_AUDIO_RECYCLE_SECONDS = 2400;
 const ANALYSIS_AUDIO_RECYCLE_SECONDS = 1800;
+const LONG_FORM_WORKER_REFRESH_INTERVAL = 3;
 /**
  * Auto-retry budget per file. We retry twice on recoverable failures
  * (OOM, filter-init errors, watchdog aborts) on a fresh worker. The
@@ -1054,6 +1061,18 @@ const summarizeFailureReason = (error: unknown) => {
     };
   };
 
+  const buildDurationOnlyAlignmentMetrics = (durationSec: number | null): AlignmentMetrics => {
+    const safeDurationSec = durationSec && Number.isFinite(durationSec) ? durationSec : 0;
+    return {
+      durationSourceSec: safeDurationSec,
+      durationCandidateSec: safeDurationSec,
+      durationDeltaSec: 0,
+      durationDeltaPct: 0,
+      estimatedOffsetSec: 0,
+      confidence: 0,
+    };
+  };
+
   const reviewBlobFromBytes = (bytes: Uint8Array) => {
     const buffer = new ArrayBuffer(bytes.byteLength);
     new Uint8Array(buffer).set(bytes);
@@ -1260,6 +1279,7 @@ const summarizeFailureReason = (error: unknown) => {
   const PLANNER_APPLY_CHUNK_SECONDS_LONG = 60;
   const PLANNER_APPLY_RETRY_CHUNK_SECONDS: Array<number | null> = [null, 60, 30, 15];
   const LONG_FILE_DURATION_SECONDS = 600; // 10 min
+  const LONG_CANDIDATE_QC_SAFE_SECONDS = 1200; // 20 min
 
   /**
    * Overlap between consecutive render chunks/segments, consumed by a
@@ -3538,6 +3558,50 @@ const summarizeFailureReason = (error: unknown) => {
     );
   };
 
+  const runMixReadyRange = async (
+    ffmpeg: FFmpeg,
+    inputName: string,
+    outputName: string,
+    profile: AdaptiveProfile | null,
+    startSec: number,
+    durationSec: number,
+    options?: MixRenderOptions,
+  ) => {
+    const filterChain = buildMixFilter(profile, {
+      ...options,
+      gainPlannerActive: false,
+    });
+    resetLogBuffer();
+    await execOrThrow(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-filter_threads",
+        "1",
+        "-y",
+        "-ss",
+        startSec.toFixed(3),
+        "-t",
+        durationSec.toFixed(3),
+        "-i",
+        inputName,
+        "-af",
+        filterChain,
+        "-ar",
+        "48000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_f32le",
+        outputName,
+      ],
+      "Long-form chunk mix-ready render",
+    );
+  };
+
   const probeInputDurationSeconds = async (ffmpeg: FFmpeg, inputName: string) => {
     resetLogBuffer();
     await execOrThrow(
@@ -4124,6 +4188,127 @@ const summarizeFailureReason = (error: unknown) => {
       ],
       "Loudnorm render"
     );
+  };
+
+  const renderLongFormSafeMode = async (
+    ffmpeg: FFmpeg,
+    job: JobEntry,
+    profile: AdaptiveProfile | null,
+    durationSeconds: number,
+    fileIndex: number,
+    totalFiles: number,
+    outputEntries: OutputEntry[],
+    silenceSpans: SilenceSpan[] = [],
+  ) => {
+    const chunks = planLongFormChunks(durationSeconds, undefined, silenceSpans);
+    if (chunks.length === 0) {
+      throw new Error("Long-form safe mode could not plan export chunks.");
+    }
+
+    const candidateVariant: CandidateVariant =
+      profile?.preferSinglePassContinuity ? "continuity-safe" : "cinematic-stable";
+    appendLog(
+      `[LongForm] ${job.base}: ${durationSeconds.toFixed(
+        0,
+      )}s exceeds browser planner budget; using low-stress chunked export (${chunks.length} part${
+        chunks.length === 1 ? "" : "s"
+      }, silence-aware cuts, one render chain, no full-file planner decode, no duplicate QC candidate renders).`,
+    );
+
+    for (const chunk of chunks) {
+      const partTag = formatLongFormPartTag(chunk);
+      const partLabel = `${chunk.index + 1}/${chunk.total}`;
+      const mixChunkName = `${job.base}_${partTag}_mixready.wav`;
+      const blendChunkName = `${job.base}_${partTag}_blend_mixready.wav`;
+      const loudChunkName = loudnessConfig ? `${job.base}_${partTag}_${loudnessConfig.suffix}.wav` : null;
+      const blendLoudChunkName =
+        loudnessConfig && sceneBlend ? `${job.base}_${partTag}_blend_${loudnessConfig.suffix}.wav` : null;
+      let blendRendered = false;
+
+      try {
+        setStatus(`Long-form mix: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
+        setActiveQueueStage(job.base, "Long-form mix", `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`);
+        await runMixReadyRange(
+          ffmpeg,
+          job.inputName,
+          mixChunkName,
+          profile,
+          chunk.startSec,
+          chunk.durationSec,
+          {
+            candidateVariant,
+            forceEndingProtection: true,
+            skipSpeechSegmentation: true,
+          },
+        );
+
+        if (keepMixReady || loudnessConfig === null) {
+          outputEntries.push(await writeOutput(ffmpeg, mixChunkName, "mixready", "clean"));
+          setOutputs([...outputEntries]);
+        }
+
+        if (sceneBlend) {
+          const indoorGain = profile?.blendIndoorGain ?? 0;
+          const outdoorGain = profile?.blendOutdoorGain ?? 0;
+          if (indoorGain + outdoorGain <= 0.0001) {
+            appendLog(`[Blend] ${job.base} ${partTag}: bypassed (adaptive blend gain near zero).`);
+          } else {
+            setStatus(`Long-form blend: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
+            setActiveQueueStage(job.base, "Long-form blend", `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`);
+            await runBlendMixReady(ffmpeg, mixChunkName, blendChunkName, profile);
+            blendRendered = true;
+            if (keepMixReady || loudnessConfig === null) {
+              outputEntries.push(await writeOutput(ffmpeg, blendChunkName, "mixready", "blend"));
+              setOutputs([...outputEntries]);
+            }
+          }
+        }
+
+        if (loudnessConfig && loudChunkName) {
+          setStatus(`Long-form loudness: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
+          setActiveQueueStage(job.base, "Long-form loudness", `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`);
+          await runLoudnorm(ffmpeg, mixChunkName, loudChunkName, loudnessConfig);
+          outputEntries.push(await writeOutput(ffmpeg, loudChunkName, "loudness", "clean"));
+          setOutputs([...outputEntries]);
+
+          if (blendRendered && blendLoudChunkName) {
+            setStatus(`Long-form blend loudness: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
+            setActiveQueueStage(
+              job.base,
+              "Long-form blend loudness",
+              `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`,
+            );
+            await runLoudnorm(ffmpeg, blendChunkName, blendLoudChunkName, loudnessConfig);
+            outputEntries.push(await writeOutput(ffmpeg, blendLoudChunkName, "loudness", "blend"));
+            setOutputs([...outputEntries]);
+          }
+        }
+
+        appendLog(
+          `[LongForm] ${job.base}: exported ${partTag} (${chunk.startSec.toFixed(1)}s-${(
+            chunk.startSec + chunk.durationSec
+          ).toFixed(1)}s).`,
+        );
+      } finally {
+        await safeDeleteFile(ffmpeg, mixChunkName);
+        await safeDeleteFile(ffmpeg, blendChunkName);
+        if (loudChunkName) await safeDeleteFile(ffmpeg, loudChunkName);
+        if (blendLoudChunkName) await safeDeleteFile(ffmpeg, blendLoudChunkName);
+      }
+
+      if (
+        chunk.index < chunks.length - 1 &&
+        (chunk.index + 1) % LONG_FORM_WORKER_REFRESH_INTERVAL === 0
+      ) {
+        ffmpeg = await refreshFfmpeg(`long-form chunk guard on ${job.base} (${partLabel})`);
+        await writeJobInput(ffmpeg, job);
+      }
+    }
+
+    appendLog(
+      `[LongForm] ${job.base}: complete. Review bundles and duplicate candidate renders were skipped to keep this PC cool and memory-bounded.`,
+    );
+    return ffmpeg;
   };
 
   const safeDeleteFile = async (ffmpeg: FFmpeg, name: string) => {
@@ -5165,19 +5350,7 @@ const summarizeFailureReason = (error: unknown) => {
             }
           }
 
-          const sourceQcSnapshot = toReviewMetricSnapshot(fileAnalysis);
-          let sourceDecodedForReview: DecodedMonoAudio | null = null;
-          try {
-            sourceDecodedForReview = decodeWavToMono(new Uint8Array(await job.file.arrayBuffer()));
-          } catch (error) {
-            appendLog(
-              `[ReviewBundle] ${job.base}: source decode fallback (${
-                error instanceof Error ? error.message : String(error)
-              }).`
-            );
-          }
-
-          let fileDurationForVariants = speechRenderPlan?.durationSeconds ?? sourceDecodedForReview?.durationSec ?? null;
+          let fileDurationForVariants = speechRenderPlan?.durationSeconds ?? null;
           if (fileDurationForVariants === null) {
             try {
               fileDurationForVariants = await probeInputDurationSeconds(ffmpeg, job.inputName);
@@ -5185,6 +5358,53 @@ const summarizeFailureReason = (error: unknown) => {
               fileDurationForVariants = null;
             }
           }
+          const longFormDurationSeconds = fileDurationForVariants ?? estimateAudioSeconds(job.file);
+          const longFormSafeMode = shouldUseLongFormSafeMode(fileDurationForVariants, longFormDurationSeconds);
+
+          if (longFormSafeMode) {
+            ffmpeg = await renderLongFormSafeMode(
+              ffmpeg,
+              job,
+              profile,
+              longFormDurationSeconds,
+              i,
+              jobs.length,
+              outputEntries,
+              speechRenderPlan?.silenceSpans ?? [],
+            );
+            markQueueDone(
+              job.base,
+              `Long-form outputs ready (${
+                planLongFormChunks(longFormDurationSeconds, undefined, speechRenderPlan?.silenceSpans ?? []).length
+              } parts)`,
+            );
+            setOutputs([...outputEntries]);
+          } else {
+          const sourceQcSnapshot = toReviewMetricSnapshot(fileAnalysis);
+          const candidateQcSafeDurationSeconds = fileDurationForVariants ?? longFormDurationSeconds;
+          const useLongCandidateMemoryPolicy = candidateQcSafeDurationSeconds >= LONG_CANDIDATE_QC_SAFE_SECONDS;
+          let sourceDecodedForReview: DecodedMonoAudio | null = null;
+          if (useLongCandidateMemoryPolicy) {
+            appendLog(
+              `[ReviewBundle] ${job.base}: skipped full-file JS review decode for ${candidateQcSafeDurationSeconds.toFixed(
+                0,
+              )}s long file to protect memory.`,
+            );
+          } else {
+            try {
+              sourceDecodedForReview = decodeWavToMono(new Uint8Array(await job.file.arrayBuffer()));
+            } catch (error) {
+              appendLog(
+                `[ReviewBundle] ${job.base}: source decode fallback (${
+                  error instanceof Error ? error.message : String(error)
+                }).`
+              );
+            }
+          }
+          if (fileDurationForVariants === null) {
+            fileDurationForVariants = sourceDecodedForReview?.durationSec ?? null;
+          }
+
           const plannerContext = await preparePlannerRenderContext(
             ffmpeg,
             job,
@@ -5208,6 +5428,7 @@ const summarizeFailureReason = (error: unknown) => {
           let selectedReason: string | null = null;
           let attemptedCandidates = 0;
           let degradedCandidates = 0;
+          let candidateQcMemoryFailed = false;
           const candidateArtifacts: CandidateReviewArtifact[] = [];
 
           for (let variantIndex = 0; variantIndex < candidateVariants.length; variantIndex += 1) {
@@ -5251,68 +5472,90 @@ const summarizeFailureReason = (error: unknown) => {
 
               let candidateAnalysis: FileAnalysis | null = null;
               let candidateMeta = renderResult.meta;
-              try {
-                const candidateAnalysisFfmpeg = ffmpeg;
-                const analysisResult = await analyzeFile(ffmpeg, candidateName, [job.inputName]);
-                ffmpeg = analysisResult.ffmpeg;
-                candidateAnalysis = analysisResult.analysis;
-                const degradeReasons = [...candidateMeta.degradeReasons];
-                if ((candidateAnalysis.analysisWindowRetryCount ?? 0) > 0) {
-                  degradeReasons.push("analysis-window-retry");
-                }
-                if ((candidateAnalysis.analysisWindowsDropped ?? 0) > 0) {
-                  degradeReasons.push("analysis-window-drop");
-                }
-                candidateMeta = {
-                  ...candidateMeta,
-                  degradeReasons: Array.from(new Set(degradeReasons)),
-                  degraded: degradeReasons.length > 0,
-                  analysisWindowsAttempted: candidateAnalysis.analysisWindowsAttempted ?? 0,
-                  analysisWindowsSucceeded: candidateAnalysis.analysisWindowsSucceeded ?? 0,
-                  analysisWindowsDropped: candidateAnalysis.analysisWindowsDropped ?? 0,
-                };
-                if (ffmpeg !== candidateAnalysisFfmpeg) {
-                  await writeJobInput(ffmpeg, job);
-                }
-              } catch (error) {
+              let candidateQcUnavailable = false;
+              if (useLongCandidateMemoryPolicy && candidateQcMemoryFailed) {
+                candidateQcUnavailable = true;
                 appendLog(
-                  `[CandidateQC] ${job.base}/${candidateLabel}: analysis fallback (${
-                    error instanceof Error ? error.message : String(error)
-                  }).`
+                  `[CandidateQC] ${job.base}/${candidateLabel}: skipped after previous long-file QC memory failure; using render-metadata fallback.`,
                 );
                 candidateMeta = {
                   ...candidateMeta,
                   degraded: true,
-                  degradeReasons: Array.from(
-                    new Set([...candidateMeta.degradeReasons, "analysis-window-drop", "qc-unavailable"]),
-                  ),
+                  degradeReasons: Array.from(new Set([...candidateMeta.degradeReasons, "qc-unavailable"])),
                 };
-                if (shouldResetFfmpegForError(error)) {
-                  ffmpeg = await refreshFfmpeg(`candidate QC on ${job.base}`);
-                  await writeJobInput(ffmpeg, job);
+              } else {
+                try {
+                  const candidateAnalysisFfmpeg = ffmpeg;
+                  const analysisResult = await analyzeFile(ffmpeg, candidateName, [job.inputName]);
+                  ffmpeg = analysisResult.ffmpeg;
+                  candidateAnalysis = analysisResult.analysis;
+                  const degradeReasons = [...candidateMeta.degradeReasons];
+                  if ((candidateAnalysis.analysisWindowRetryCount ?? 0) > 0) {
+                    degradeReasons.push("analysis-window-retry");
+                  }
+                  if ((candidateAnalysis.analysisWindowsDropped ?? 0) > 0) {
+                    degradeReasons.push("analysis-window-drop");
+                  }
+                  candidateMeta = {
+                    ...candidateMeta,
+                    degradeReasons: Array.from(new Set(degradeReasons)),
+                    degraded: degradeReasons.length > 0,
+                    analysisWindowsAttempted: candidateAnalysis.analysisWindowsAttempted ?? 0,
+                    analysisWindowsSucceeded: candidateAnalysis.analysisWindowsSucceeded ?? 0,
+                    analysisWindowsDropped: candidateAnalysis.analysisWindowsDropped ?? 0,
+                  };
+                  if (ffmpeg !== candidateAnalysisFfmpeg) {
+                    await writeJobInput(ffmpeg, job);
+                  }
+                } catch (error) {
+                  candidateQcUnavailable = true;
+                  const shouldRefreshForQcError = shouldResetFfmpegForError(error);
+                  if (useLongCandidateMemoryPolicy && (shouldRefreshForQcError || isRecoverableFailure(error))) {
+                    candidateQcMemoryFailed = true;
+                  }
+                  appendLog(
+                    `[CandidateQC] ${job.base}/${candidateLabel}: analysis fallback (${
+                      error instanceof Error ? error.message : String(error)
+                    }).`
+                  );
+                  candidateMeta = {
+                    ...candidateMeta,
+                    degraded: true,
+                    degradeReasons: Array.from(
+                      new Set([...candidateMeta.degradeReasons, "analysis-window-drop", "qc-unavailable"]),
+                    ),
+                  };
+                  if (shouldRefreshForQcError) {
+                    ffmpeg = await refreshFfmpeg(`candidate QC on ${job.base}`);
+                    await writeJobInput(ffmpeg, job);
+                  }
                 }
               }
 
               const candidateBaselineScore = buildCandidateScore(candidateAnalysis);
               const candidateQcSnapshot = toReviewMetricSnapshot(candidateAnalysis);
               let candidateDecodedForReview: DecodedMonoAudio | null = null;
-              try {
-                candidateDecodedForReview = decodeWavToMono(candidateBytes);
-              } catch (error) {
-                appendLog(
-                  `[CandidateQC] ${job.base}/${candidateLabel}: alignment fallback (${
-                    error instanceof Error ? error.message : String(error)
-                  }).`
-                );
+              if (!useLongCandidateMemoryPolicy) {
+                try {
+                  candidateDecodedForReview = decodeWavToMono(candidateBytes);
+                } catch (error) {
+                  appendLog(
+                    `[CandidateQC] ${job.base}/${candidateLabel}: alignment fallback (${
+                      error instanceof Error ? error.message : String(error)
+                    }).`
+                  );
+                }
               }
-              const alignment = sourceDecodedForReview && candidateDecodedForReview
-                ? estimateAlignmentMetrics(
-                    sourceDecodedForReview.monoSamples,
-                    sourceDecodedForReview.sampleRate,
-                    candidateDecodedForReview.monoSamples,
-                    candidateDecodedForReview.sampleRate,
-                  )
-                : buildFallbackAlignmentMetrics(sourceDecodedForReview, candidateDecodedForReview);
+              const alignment = useLongCandidateMemoryPolicy
+                ? buildDurationOnlyAlignmentMetrics(fileDurationForVariants)
+                : sourceDecodedForReview && candidateDecodedForReview
+                  ? estimateAlignmentMetrics(
+                      sourceDecodedForReview.monoSamples,
+                      sourceDecodedForReview.sampleRate,
+                      candidateDecodedForReview.monoSamples,
+                      candidateDecodedForReview.sampleRate,
+                    )
+                  : buildFallbackAlignmentMetrics(sourceDecodedForReview, candidateDecodedForReview);
               const ranking = scoreCandidateWithLearnedWeights({
                 baselineScore: candidateBaselineScore,
                 candidateQc: candidateQcSnapshot,
@@ -5332,7 +5575,7 @@ const summarizeFailureReason = (error: unknown) => {
               candidateArtifacts.push({
                 variant: candidateVariant,
                 label: candidateLabel,
-                bytes: candidateBytes.slice(),
+                bytes: candidateBytes,
                 analysis: candidateAnalysis,
                 meta: candidateMeta,
                 baselineScore: candidateBaselineScore,
@@ -5361,7 +5604,24 @@ const summarizeFailureReason = (error: unknown) => {
                 selectedReason = decision.reason;
               }
 
+              const candidateHasRenderDegrade = candidateMeta.degradeReasons.some(
+                (reason) =>
+                  reason !== "analysis-window-retry" &&
+                  reason !== "analysis-window-drop" &&
+                  reason !== "qc-unavailable",
+              );
               await safeDeleteFile(ffmpeg, candidateName);
+              if (
+                useLongCandidateMemoryPolicy &&
+                candidateQcUnavailable &&
+                candidateQcMemoryFailed &&
+                !candidateHasRenderDegrade
+              ) {
+                appendLog(
+                  `[CandidateQC] ${job.base}/${candidateLabel}: stopping remaining candidate rerenders after QC memory failure to keep this PC cool; rendered audio will be selected by fallback if no QC candidate is available.`,
+                );
+                break;
+              }
             } catch (error) {
               appendLog(
                 `[CandidateQC] ${job.base}/${candidateLabel}: render failed (${error instanceof Error ? error.message : String(
@@ -5371,6 +5631,32 @@ const summarizeFailureReason = (error: unknown) => {
               if (shouldResetFfmpegForError(error)) {
                 ffmpeg = await refreshFfmpeg(`candidate render failure on ${job.base}`);
                 await writeJobInput(ffmpeg, job);
+              }
+            }
+          }
+
+          if (!selectedBytes || !selectedVariant) {
+            const fallbackSelection = selectQcUnavailableFallbackCandidate(
+              candidateArtifacts.map((artifact, index) => ({
+                variant: artifact.variant,
+                index,
+                hasAudio: artifact.bytes.byteLength > 0,
+                meta: artifact.meta,
+                score: artifact.scoredScore,
+              })),
+            );
+            if (fallbackSelection) {
+              const fallbackArtifact = candidateArtifacts[fallbackSelection.candidate.index];
+              if (fallbackArtifact) {
+                selectedVariant = fallbackArtifact.variant;
+                selectedBytes = fallbackArtifact.bytes;
+                selectedScore = fallbackArtifact.scoredScore;
+                selectedAnalysis = fallbackArtifact.analysis;
+                selectedMeta = fallbackArtifact.meta;
+                selectedReason = "QC-unavailable fallback because rendered audio exists and all candidate QC failed";
+                appendLog(
+                  `[CandidateSelect] ${job.base}: kept ${fallbackArtifact.label} via QC-unavailable fallback because rendered audio exists and all candidate QC failed (${fallbackSelection.reason}).`,
+                );
               }
             }
           }
@@ -5420,7 +5706,13 @@ const summarizeFailureReason = (error: unknown) => {
             }.`
           );
           appendLog(`[CandidateSummary] ${job.base}: ${selectedSummary}.`);
-          if (selectedArtifact) {
+          if (selectedArtifact && useLongCandidateMemoryPolicy) {
+            appendLog(
+              `[ReviewBundle] ${job.base}: skipped QC Lab review bundle for ${candidateQcSafeDurationSeconds.toFixed(
+                0,
+              )}s long file to avoid duplicating large audio blobs in browser memory.`,
+            );
+          } else if (selectedArtifact) {
             const bundleId = `${job.base}_review_${String(i + 1).padStart(3, "0")}`;
             const sourceDurationSec =
               sourceDecodedForReview?.durationSec ?? speechRenderPlan?.durationSeconds ?? 0;
@@ -5548,6 +5840,7 @@ const summarizeFailureReason = (error: unknown) => {
           // users can see and download completed files even if a later
           // file fails or the browser crashes mid-batch.
           setOutputs([...outputEntries]);
+          }
         } catch (error) {
           const reason = summarizeFailureReason(error);
           appendLog(`Error (${job.base}): ${reason}`);

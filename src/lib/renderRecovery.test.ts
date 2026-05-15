@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   buildRenderRiskProfile,
   compareCandidateScores,
+  selectQcUnavailableFallbackCandidate,
   shouldPreferCandidate,
   type CandidateRenderMeta,
   type CandidateScore,
@@ -159,4 +160,76 @@ test("unavailable QC candidate cannot become the first winner", () => {
 
   assert.equal(decision.select, false);
   assert.equal(decision.reason, "candidate unavailable for selection");
+});
+
+test("qc-unavailable fallback chooses rendered cinematic candidate when all QC failed", () => {
+  const cinematicScore = buildScore({ gateReasons: ["qc-unavailable"] });
+  const continuityScore = buildScore({ gateReasons: ["qc-unavailable"] });
+
+  const selection = selectQcUnavailableFallbackCandidate([
+    {
+      variant: "cinematic-stable",
+      index: 0,
+      hasAudio: true,
+      meta: buildMeta({ degraded: true, degradeReasons: ["analysis-window-drop", "qc-unavailable"] }),
+      score: cinematicScore,
+    },
+    {
+      variant: "continuity-safe",
+      index: 1,
+      hasAudio: true,
+      meta: buildMeta({ degraded: true, degradeReasons: ["analysis-window-drop", "qc-unavailable"] }),
+      score: continuityScore,
+    },
+  ]);
+
+  assert.equal(selection?.candidate.variant, "cinematic-stable");
+  assert.match(selection?.reason ?? "", /healthy rendered segmented audio/);
+});
+
+test("qc-unavailable fallback prefers cleaner render metadata over variant priority", () => {
+  const selection = selectQcUnavailableFallbackCandidate([
+    {
+      variant: "cinematic-stable",
+      index: 0,
+      hasAudio: true,
+      meta: buildMeta({
+        renderPath: "single-pass-recovered",
+        segmentedHealthy: false,
+        degraded: true,
+        degradeReasons: ["segment-render-memory-fault", "single-pass-recovery", "qc-unavailable"],
+      }),
+      score: buildScore({ gateReasons: ["qc-unavailable"] }),
+    },
+    {
+      variant: "continuity-safe",
+      index: 1,
+      hasAudio: true,
+      meta: buildMeta({ degraded: true, degradeReasons: ["analysis-window-drop", "qc-unavailable"] }),
+      score: buildScore({ gateReasons: ["qc-unavailable"] }),
+    },
+  ]);
+
+  assert.equal(selection?.candidate.variant, "continuity-safe");
+});
+
+test("qc-unavailable fallback rejects candidates without rendered audio or with planner gates", () => {
+  const selection = selectQcUnavailableFallbackCandidate([
+    {
+      variant: "cinematic-stable",
+      index: 0,
+      hasAudio: false,
+      meta: buildMeta({ degraded: true, degradeReasons: ["qc-unavailable"] }),
+      score: buildScore({ gateReasons: ["qc-unavailable"] }),
+    },
+    {
+      variant: "continuity-safe",
+      index: 1,
+      hasAudio: true,
+      meta: buildMeta({ degraded: true, degradeReasons: ["planner-apply-failed", "qc-unavailable"] }),
+      score: buildScore({ gateReasons: ["planner-apply-failed", "qc-unavailable"] }),
+    },
+  ]);
+
+  assert.equal(selection, null);
 });

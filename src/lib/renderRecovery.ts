@@ -56,6 +56,19 @@ export type RenderRiskProfile = {
   shouldUseFixedSegmentation: boolean;
 };
 
+export type QcUnavailableFallbackCandidate<TVariant extends string = string> = {
+  variant: TVariant;
+  index: number;
+  hasAudio: boolean;
+  meta: CandidateRenderMeta;
+  score: CandidateScore;
+};
+
+export type QcUnavailableFallbackSelection<TVariant extends string = string> = {
+  candidate: QcUnavailableFallbackCandidate<TVariant>;
+  reason: string;
+};
+
 type RenderRiskInput = {
   durationSeconds: number;
   longSparseMode: boolean;
@@ -72,6 +85,11 @@ type RenderRiskInput = {
 const HEALTHY_SEGMENTED_STABILITY_DELTA = 0.03;
 const HEALTHY_SEGMENTED_PAUSE_DELTA = 0.03;
 const HEALTHY_SEGMENTED_COMPRESSION_DELTA = 0.05;
+const QC_ONLY_DEGRADE_REASONS = new Set<DegradeReason>([
+  "analysis-window-retry",
+  "analysis-window-drop",
+  "qc-unavailable",
+]);
 
 const roundedScore = (value: number) => Math.round(value * 100);
 
@@ -99,6 +117,75 @@ const hasUnselectableGate = (score: CandidateScore) =>
     reason === "planner-required" ||
     reason === "planner-apply-failed"
   );
+
+const hasPlannerGate = (score: CandidateScore) =>
+  (score.gateReasons ?? []).some((reason) => reason === "planner-required" || reason === "planner-apply-failed");
+
+const hasQcUnavailableGate = (score: CandidateScore) =>
+  (score.gateReasons ?? []).includes("qc-unavailable");
+
+const hasRenderDegradeReason = (meta: CandidateRenderMeta) =>
+  meta.degradeReasons.some((reason) => !QC_ONLY_DEGRADE_REASONS.has(reason));
+
+const fallbackVariantPriority = (variant: string) => {
+  if (variant === "cinematic-stable") return 0;
+  if (variant === "continuity-safe") return 1;
+  if (variant === "pause-safe") return 2;
+  if (variant === "source-safe" || variant === "core-safe") return 3;
+  return 4;
+};
+
+const fallbackRenderPathPriority = (meta: CandidateRenderMeta) => {
+  if (meta.renderPath === "fixed-segmented") return 0;
+  if (meta.renderPath === "speech-pause-segmented" || meta.renderPath === "speech-aligned-segmented") return 1;
+  if (meta.renderPath === "single-pass") return 2;
+  return 3;
+};
+
+const compareQcUnavailableFallbackCandidates = <TVariant extends string>(
+  left: QcUnavailableFallbackCandidate<TVariant>,
+  right: QcUnavailableFallbackCandidate<TVariant>,
+) => {
+  const leftRenderDegraded = hasRenderDegradeReason(left.meta);
+  const rightRenderDegraded = hasRenderDegradeReason(right.meta);
+  if (leftRenderDegraded !== rightRenderDegraded) return leftRenderDegraded ? 1 : -1;
+
+  const leftHealthy = isHealthySegmentedRender(left.meta);
+  const rightHealthy = isHealthySegmentedRender(right.meta);
+  if (leftHealthy !== rightHealthy) return leftHealthy ? -1 : 1;
+
+  const leftRecovered = isRecoveredSinglePass(left.meta);
+  const rightRecovered = isRecoveredSinglePass(right.meta);
+  if (leftRecovered !== rightRecovered) return leftRecovered ? 1 : -1;
+
+  const variantDelta = fallbackVariantPriority(left.variant) - fallbackVariantPriority(right.variant);
+  if (variantDelta !== 0) return variantDelta;
+
+  const pathDelta = fallbackRenderPathPriority(left.meta) - fallbackRenderPathPriority(right.meta);
+  if (pathDelta !== 0) return pathDelta;
+
+  const scoreDelta = compareCandidateScores(left.score, right.score);
+  if (scoreDelta !== 0) return scoreDelta;
+
+  return left.index - right.index;
+};
+
+export const selectQcUnavailableFallbackCandidate = <TVariant extends string>(
+  candidates: QcUnavailableFallbackCandidate<TVariant>[],
+): QcUnavailableFallbackSelection<TVariant> | null => {
+  const eligible = candidates.filter(
+    (candidate) => candidate.hasAudio && hasQcUnavailableGate(candidate.score) && !hasPlannerGate(candidate.score),
+  );
+  if (eligible.length === 0) return null;
+
+  const [candidate] = [...eligible].sort(compareQcUnavailableFallbackCandidates);
+  const reason = hasRenderDegradeReason(candidate.meta)
+    ? "QC-unavailable fallback with render degradation because no cleaner rendered candidate was available"
+    : isHealthySegmentedRender(candidate.meta)
+      ? "QC-unavailable fallback from healthy rendered segmented audio"
+      : "QC-unavailable fallback from rendered audio";
+  return { candidate, reason };
+};
 
 export const buildRenderRiskProfile = (input: RenderRiskInput): RenderRiskProfile => {
   const highRisk =
