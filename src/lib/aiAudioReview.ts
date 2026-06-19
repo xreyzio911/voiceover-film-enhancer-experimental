@@ -130,7 +130,7 @@ export type AudioReviewRecommendedProfile = {
   smartMatchMode: "Off" | "Gentle" | "Balanced";
   leveler: "Minimal (no auto-leveler)" | "Gentle" | "Balanced" | "Firm";
   breathControl: "Off" | "Light" | "Medium";
-  neuralSpeechEnhancement: "mandatory";
+  neuralSpeechEnhancement: "off";
   roomCleanup: boolean;
   softenHarshness: boolean;
   cinematicColor: boolean;
@@ -250,7 +250,7 @@ const AUDIO_REVIEW_RECOMMENDED_PROFILE_SCHEMA = {
       enum: ["Minimal (no auto-leveler)", "Gentle", "Balanced", "Firm"],
     },
     breathControl: { type: "string", enum: ["Off", "Light", "Medium"] },
-    neuralSpeechEnhancement: { type: "string", enum: ["mandatory"] },
+    neuralSpeechEnhancement: { type: "string", enum: ["off"] },
     roomCleanup: { type: "boolean" },
     softenHarshness: { type: "boolean" },
     cinematicColor: { type: "boolean" },
@@ -388,7 +388,7 @@ The app pipeline you are reviewing:
 2. The app builds an adaptive profile per file: high-pass, low-mid warmth, presence/air correction, harshness cuts, de-esser depth, room cleanup, measured-SNR noise reduction, segmentation, tone matching against the batch reference, and cinematic color.
 3. The speech-aware gain planner runs before downstream dynamics. It normalizes speech runs toward a shared house target, micro-rides only where needed, ducks pauses, protects sentence endings, and locally tames plosives or body-relative speech spikes.
 4. Candidate variants are rendered and QC-scored: cinematic-stable, continuity-safe, pause-safe, and source-safe. Hard gates prefer stable volume, clean pauses, low compression artifacts, and controlled echo.
-5. Neural speech enhancement is a fixed black-box pass: one ClearVoice speech_enhancement run using the app's server-side model. You cannot change its model, strength, denoise amount, aggressiveness, chunking, number of passes, or internal behavior. You also cannot disable, veto, bypass, or skip it from this review. If you are worried neural enhancement may expose echo, smear breaths, dull transients, or mask actor rhythm, express that only as app-side pre/post profile choices, final-polish intensity, deterministic QC rejection gates, and next listening checks.
+5. Neural speech enhancement is temporarily disabled. Do not ask for ClearVoice, neural repair, neural cleanup, remote worker changes, neural strength changes, or a neural retry. The active path is source-first AI review, one app render, and one subtle final app polish.
 6. Loudness normalization is a delivery step after mix-ready processing; it must not hide profile mistakes.
 
 Primary quality target: actors recorded with different microphones and settings should converge toward the same rich, smooth, balanced, crystal-clear, cinematic house tone while preserving actor identity and performance intent.
@@ -397,7 +397,7 @@ Known problem to hunt: rare mid-sentence shallow-volume dips that recover later,
 
 You must return one perFileProfiles entry for every input file. Each file needs its own recommendedProfile and adaptiveDirectives. Do not collapse the batch into one shared profile; use the batch only as a house-tone reference. Use adaptiveDirectives as bounded micro-intents for the adaptive DSP: warmth/presence/air bias, de-harshing, sag recovery, onset/breath taming, denoise/room bias, compression bias, and single-pass final polish intensity. These are expert nudges, not raw filter graphs.
 
-Review depth requirement: do not give generic feedback. For each per-file recommendation, include concrete metric evidence, the exact app-side control or adaptiveDirective to use, the expected audible change, and the acceptance check. Guardrails must be phrased as things the app can enforce or the editor can verify; never write guardrails that imply changing neural enhancement internals.
+Review depth requirement: do not give generic feedback. For each per-file recommendation, include concrete metric evidence, the exact app-side control or adaptiveDirective to use, the expected audible change, and the acceptance check. Guardrails must be phrased as things the app can enforce or the editor can verify; never write guardrails that imply changing neural enhancement internals or reranking multiple candidates.
 
 Return only valid JSON matching the schema. Keep each string concise and concrete. If objective metrics are insufficient, say what to listen for rather than inventing certainty.
 `.trim();
@@ -646,14 +646,14 @@ export const buildAudioReviewUserPrompt = (payload: AudioReviewRequestPayload) =
   return [
     "Review this source-first VO batch before rendering and recommend the safest processing profile.",
     "",
-    "Required source-first pipeline: per-audio AI review -> per-file adaptive profile -> app pass -> neural speech enhancement -> final app touch -> result.",
-    "App pipeline reminder: source analysis metrics -> per-file AI profile selection -> adaptive profile -> speech-aware gain planner -> one preferred render variant -> deterministic QC gates -> mandatory neural speech enhancement -> one subtle final app polish -> loudness delivery.",
-    "Neural speech enhancement is fixed and black-box: one ClearVoice speech_enhancement pass with the server-side model. Do not claim you can tune neural model, strength, denoise amount, aggressiveness, chunking, pass count, breath handling, transient handling, or internal neural behavior.",
-    "Neural speech enhancement is mandatory: do not recommend off, bypass, try-then-gate, lower neural strength, change neural settings, or make neural do/avoid anything. If neural could create risk, recommend app-side pre/post controls, finalPolishIntensity, deterministic QC rejection, and listening checks instead.",
+    "Required source-first pipeline: per-audio AI review -> per-file adaptive profile -> one app pass -> one subtle final app polish -> result.",
+    "App pipeline reminder: source analysis metrics -> per-file AI profile selection -> adaptive profile -> speech-aware gain planner -> one AI-selected render variant -> one subtle final app polish -> loudness delivery.",
+    "Neural speech enhancement is temporarily off. Always set neuralSpeechEnhancement to off. Do not recommend ClearVoice, neural repair, neural worker setup, neural bypass logic, neural strength changes, or neural retry behavior.",
+    "Candidate reranking is temporarily off. Pick exactly one selectedVariant from source evidence before render; do not ask for challenger renders, learned reranking, review bundles, or post-render winner selection.",
     "Return exactly one perFileProfiles item per input file, preserving each fileName and base exactly as provided. Every file can choose a different selectedVariant, controls, and adaptiveDirectives.",
     "House tone target: use the batch reference and profile toneMatchDeltaDb to pull different mics toward the same rich, smooth, balanced bass/treble profile without extreme EQ or voice identity shifts.",
     "Main failure priorities: mid-sentence shallow-volume dips, line swing, mid-line sag, sentence jumps, harsh sibilance, over-bright presence/air, over-compression, and room/echo that makes actors sound unmatched.",
-    "Adaptive safeguards to respect: sagRecoveryStrength, preserveEndings, onsetTameStrength, breathTameStrength, echoNotchCutDb, denoiseStrength, and useTailGate are subtle controls; do not recommend stacking all of them unless the metrics justify it.",
+    "Adaptive safeguards to respect: sagRecoveryStrength, preserveEndings, onsetTameStrength, breathTameStrength, echoNotchCutDb, denoiseStrength, and useTailGate are subtle app controls; do not recommend stacking all of them unless the metrics justify it.",
     "perFileProfiles[].adaptiveDirectives are bounded expert nudges beyond presets. Keep them subtle: prefer +/-0.2 to +/-0.5 moves, reserve larger moves for strong evidence, and make finalPolishIntensity a single-pass finishing strength, not an iteration request.",
     "Detail rules: every summary, finding, adjustment, guardrail, and listening check should say why it matters using source metrics or profile fields, what app-side action to take, and what audible/QC result should prove it worked.",
     "Recommendation rules: choose the profile and one selectedVariant from source evidence before render, keep parameter changes subtle, preserve actor identity, prefer objective gates over taste, and call out listening checks when the metrics cannot prove a problem.",
@@ -744,7 +744,7 @@ export const buildAudioReviewControlPatch = (
     smartMatchMode: profile.smartMatchMode,
     leveler: profile.leveler,
     breathControl: profile.breathControl,
-    neuralSpeechEnhancementEnabled: true,
+    neuralSpeechEnhancementEnabled: false,
     roomCleanup: profile.roomCleanup,
     softenHarshness: profile.softenHarshness,
     cinematicColor: profile.cinematicColor,
@@ -779,7 +779,7 @@ export const buildSourceFirstAudioReviewPlan = (
     controls: {
       ...currentControls,
       ...patch.controls,
-      neuralSpeechEnhancementEnabled: true,
+      neuralSpeechEnhancementEnabled: false,
     },
     changedKeys: patch.changedKeys,
     selectedVariant: fileReview.recommendedProfile.selectedVariant,
@@ -811,7 +811,7 @@ const normalizeRecommendedProfile = (value: unknown): AudioReviewRecommendedProf
       "Balanced",
     ),
     breathControl: stringEnum(profile.breathControl, ["Off", "Light", "Medium"] as const, "Medium"),
-    neuralSpeechEnhancement: "mandatory",
+    neuralSpeechEnhancement: "off",
     roomCleanup: boolOrFalse(profile.roomCleanup),
     softenHarshness: boolOrFalse(profile.softenHarshness),
     cinematicColor: boolOrFalse(profile.cinematicColor),

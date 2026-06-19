@@ -25,7 +25,7 @@ const baseControls = {
   floorGuard: true,
   cinematicColor: true,
   gainPlannerEnabled: true,
-  neuralSpeechEnhancementEnabled: true,
+  neuralSpeechEnhancementEnabled: false,
 };
 
 const reviewPayload = {
@@ -86,7 +86,7 @@ const reviewPayload = {
       selectedCandidate: {
         variant: "continuity-safe",
         reason: "line continuity risk",
-        processingFlow: "app-neural-speech-enhancement-app",
+        processingFlow: "app-final-polish",
         score: {
           stability: 0.22,
           pause: 0.08,
@@ -104,18 +104,18 @@ test("audio review prompt teaches Gemini the app pipeline and failure priorities
 
   assert.match(prompt, /source-first/i);
   assert.match(prompt, /before rendering/i);
-  assert.match(prompt, /per-audio AI review -> per-file adaptive profile -> app pass -> neural speech enhancement -> final app touch/i);
-  assert.match(prompt, /neural speech enhancement is mandatory/i);
-  assert.match(prompt, /fixed and black-box/i);
-  assert.match(prompt, /Do not claim you can tune neural model, strength, denoise amount/i);
-  assert.match(prompt, /app-side pre\/post controls/i);
+  assert.match(prompt, /per-audio AI review -> per-file adaptive profile -> one app pass -> one subtle final app polish/i);
+  assert.match(prompt, /neural speech enhancement is temporarily off/i);
+  assert.match(prompt, /Always set neuralSpeechEnhancement to off/i);
+  assert.match(prompt, /Candidate reranking is temporarily off/i);
+  assert.match(prompt, /one selectedVariant from source evidence/i);
   assert.match(prompt, /one perFileProfiles item per input file/i);
   assert.match(prompt, /adaptiveDirectives/i);
   assert.match(prompt, /Detail rules/i);
   assert.match(prompt, /source metrics or profile fields/i);
   assert.match(prompt, /audible\/QC result/i);
   assert.match(prompt, /speech-aware gain planner/i);
-  assert.match(prompt, /one preferred render variant/i);
+  assert.match(prompt, /one AI-selected render variant/i);
   assert.match(prompt, /mid-sentence shallow-volume/i);
   assert.match(prompt, /harshness/i);
   assert.match(prompt, /house tone/i);
@@ -136,7 +136,7 @@ test("Gemini request uses Flash-Lite with low thinking and JSON schema output", 
   const schema = request.body.generationConfig.responseSchema as { properties?: Record<string, unknown> };
   assert.ok(schema.properties?.perFileProfiles);
   assert.match(request.body.systemInstruction.parts[0].text, /VO mastering/i);
-  assert.match(request.body.systemInstruction.parts[0].text, /fixed black-box pass/i);
+  assert.match(request.body.systemInstruction.parts[0].text, /source-first AI review, one app render, and one subtle final app polish/i);
   assert.match(request.body.systemInstruction.parts[0].text, /never write guardrails that imply changing neural enhancement internals/i);
 });
 
@@ -214,7 +214,7 @@ test("merges chunked Gemini review results in original file order with worst ver
       smartMatchMode: "Balanced" as const,
       leveler: "Gentle" as const,
       breathControl: "Medium" as const,
-      neuralSpeechEnhancement: "mandatory" as const,
+      neuralSpeechEnhancement: "off" as const,
       roomCleanup: true,
       softenHarshness: true,
       cinematicColor: true,
@@ -380,7 +380,7 @@ test("parses Gemini JSON review and clamps unsafe confidence values", () => {
   assert.equal(parsed.perFileProfiles[0].base, "actor_a");
   assert.equal(parsed.perFileProfiles[0].confidence, 1);
   assert.equal(parsed.perFileProfiles[0].recommendedProfile.selectedVariant, "continuity-safe");
-  assert.equal(parsed.perFileProfiles[0].recommendedProfile.neuralSpeechEnhancement, "mandatory");
+  assert.equal(parsed.perFileProfiles[0].recommendedProfile.neuralSpeechEnhancement, "off");
   assert.deepEqual(parsed.perFileProfiles[0].adaptiveDirectives, {
     warmthDb: 1.2,
     presenceDb: -1.2,
@@ -416,7 +416,7 @@ test("parses Gemini review with a missing comma between adjacent array strings",
             "smartMatchMode": "Balanced",
             "leveler": "Gentle",
             "breathControl": "Medium",
-            "neuralSpeechEnhancement": "mandatory",
+            "neuralSpeechEnhancement": "off",
             "roomCleanup": true,
             "softenHarshness": true,
             "cinematicColor": true,
@@ -523,7 +523,6 @@ test("builds a bounded automatic control patch from Gemini profile recommendatio
     smartMatchMode: "Balanced",
     leveler: "Gentle",
     breathControl: "Light",
-    neuralSpeechEnhancementEnabled: true,
     roomCleanup: true,
     softenHarshness: true,
     cinematicColor: true,
@@ -532,12 +531,11 @@ test("builds a bounded automatic control patch from Gemini profile recommendatio
     "smartMatchMode",
     "leveler",
     "breathControl",
-    "neuralSpeechEnhancementEnabled",
     "roomCleanup",
     "softenHarshness",
     "cinematicColor",
   ]);
-  assert.match(patch.summary, /7 control/);
+  assert.match(patch.summary, /6 control/);
 });
 
 test("builds separate source-first render plans from per-file Gemini recommendations", () => {
@@ -592,7 +590,7 @@ test("builds separate source-first render plans from per-file Gemini recommendat
             "smartMatchMode": "Gentle",
             "leveler": "Firm",
             "breathControl": "Medium",
-            "neuralSpeechEnhancement": "mandatory",
+            "neuralSpeechEnhancement": "off",
             "roomCleanup": true,
             "softenHarshness": false,
             "cinematicColor": true,
@@ -629,7 +627,7 @@ test("builds separate source-first render plans from per-file Gemini recommendat
     smartMatchMode: "Gentle",
     leveler: "Firm",
     breathControl: "Medium",
-    neuralSpeechEnhancementEnabled: true,
+    neuralSpeechEnhancementEnabled: false,
     roomCleanup: true,
     softenHarshness: false,
     cinematicColor: false,
@@ -645,7 +643,7 @@ test("builds separate source-first render plans from per-file Gemini recommendat
     smartMatchMode: "Balanced",
     leveler: "Gentle",
     breathControl: "Light",
-    neuralSpeechEnhancementEnabled: true,
+    neuralSpeechEnhancementEnabled: false,
     roomCleanup: false,
     softenHarshness: true,
     cinematicColor: true,

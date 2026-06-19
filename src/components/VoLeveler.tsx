@@ -16,7 +16,6 @@ import {
   compareCandidateScores,
   isHealthySegmentedRender,
   selectQcUnavailableFallbackCandidate,
-  shouldPreferCandidate,
   type CandidateRenderMeta,
   type CandidateScore,
   type DegradeReason,
@@ -65,18 +64,6 @@ import type {
   SourceFirstAudioReviewPlan,
 } from "../lib/aiAudioReview";
 import { DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES, buildSourceFirstAudioReviewPlan } from "../lib/aiAudioReview";
-import {
-  NeuralRepairError,
-  requestNeuralRepair,
-  requestNeuralRepairHealth,
-  type NeuralRepairHealth,
-} from "../lib/neuralRepairClient";
-import { CLEARVOICE_SE_REQUEST, type NeuralRepairReport } from "../lib/neuralRepairPolicy";
-import {
-  NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES,
-  planNeuralRepairTransport,
-  type NeuralRepairTransportPlan,
-} from "../lib/neuralRepairChunkPolicy";
 import {
   buildEchoRoomCleanupDecision,
   deriveEarlyEchoCancelStrength,
@@ -220,7 +207,7 @@ const GAIN_PLANNER_FRAME_MS = 10;
  */
 const GAIN_PLANNER_MAX_DURATION_SECONDS = 4800; // 80 minutes — fine at 16 kHz mono
 const NEURAL_SPEECH_ENHANCEMENT_ENABLED_BY_DEFAULT =
-  true;
+  false;
 const sanitizeBase = (name: string) =>
   name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9-_]+/g, "_");
 
@@ -231,15 +218,6 @@ const formatBytes = (bytes: number | null | undefined) => {
   const sizes = ["B", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
-};
-
-const normalizeAudioBytes = async (value: unknown, label: string) => {
-  if (value instanceof Uint8Array) return value;
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (typeof Blob !== "undefined" && value instanceof Blob) {
-    return new Uint8Array(await value.arrayBuffer());
-  }
-  throw new Error(`${label} returned unsupported audio bytes.`);
 };
 
 const assertUsableWavBytes = (bytes: Uint8Array, label: string) => {
@@ -348,7 +326,7 @@ type OutputEntry = {
   size: number;
   kind: "mixready" | "loudness";
   variant: "clean" | "blend";
-  processingFlow: "app" | "app-neural-speech-enhancement-app";
+  processingFlow: "app" | "app-final-polish" | "app-neural-speech-enhancement-app";
 };
 
 type ReviewBundleAsset = {
@@ -610,8 +588,6 @@ export default function VoLeveler() {
     SourceFirstAudioReviewPlan["selectedVariant"] | null
   >(null);
   const sourceFirstPlansByBaseRef = useRef<Map<string, SourceFirstAudioReviewPlan>>(new Map());
-  const neuralRepairHealthPromiseRef = useRef<Promise<NeuralRepairHealth> | null>(null);
-  const neuralRepairHealthLogRef = useRef<string | null>(null);
 
   const [files, setFiles] = useState<File[]>([]);
   const [outputs, setOutputs] = useState<OutputEntry[]>([]);
@@ -679,7 +655,7 @@ export default function VoLeveler() {
       floorGuard,
       cinematicColor,
       gainPlannerEnabled,
-      neuralSpeechEnhancementEnabled: true,
+      neuralSpeechEnhancementEnabled: false,
     }),
     [
       loudnessTarget,
@@ -1239,68 +1215,6 @@ const summarizeFailureReason = (error: unknown) => {
     aiAdaptiveDirectivesOverrideRef.current = plan?.adaptiveDirectives ?? null;
     sourceFirstCandidateVariantRef.current = plan?.selectedVariant ?? null;
     return plan;
-  };
-
-  const resetNeuralRepairPreflight = () => {
-    neuralRepairHealthPromiseRef.current = null;
-    neuralRepairHealthLogRef.current = null;
-  };
-
-  const logNeuralRepairPreflightOnce = (key: string, message: string) => {
-    if (neuralRepairHealthLogRef.current === key) return;
-    neuralRepairHealthLogRef.current = key;
-    appendLog(message);
-  };
-
-  const neuralRepairErrorMessage = (error: unknown) => {
-    const message = error instanceof Error ? error.message : String(error);
-    return error instanceof NeuralRepairError && error.code ? `${message} [${error.code}]` : message;
-  };
-
-  const ensureNeuralSpeechEnhancementAvailable = async () => {
-    if (!neuralSpeechEnhancementEnabled) return false;
-    if (!neuralRepairHealthPromiseRef.current) {
-      neuralRepairHealthPromiseRef.current = requestNeuralRepairHealth();
-    }
-
-    try {
-      const health = await neuralRepairHealthPromiseRef.current;
-      if (!health.enabled) {
-        logNeuralRepairPreflightOnce(
-          "disabled",
-          "[SpeechEnhancement] Neural backend is disabled on this server; keeping deterministic app output for this run.",
-        );
-        return false;
-      }
-      if (!health.engines.includes(CLEARVOICE_SE_REQUEST.engine)) {
-        logNeuralRepairPreflightOnce(
-          `missing-engine:${health.engines.join(",")}`,
-          `[SpeechEnhancement] Neural backend does not expose ${CLEARVOICE_SE_REQUEST.engine}; keeping deterministic app output for this run.`,
-        );
-        return false;
-      }
-      if (health.selfTest?.ok === false || (health.exitCode !== null && health.exitCode !== 0)) {
-        logNeuralRepairPreflightOnce(
-          `failed:${health.exitCode ?? "self-test"}`,
-          `[SpeechEnhancement] Neural backend self-test failed before batch render; keeping deterministic app output for this run.`,
-        );
-        return false;
-      }
-
-      logNeuralRepairPreflightOnce(
-        `ready:${health.target ?? "server"}`,
-        `[SpeechEnhancement] Neural backend ready (${health.target ?? "server"} target); using cached health check for this run.`,
-      );
-      return true;
-    } catch (error) {
-      logNeuralRepairPreflightOnce(
-        `error:${neuralRepairErrorMessage(error)}`,
-        `[SpeechEnhancement] Neural backend unavailable before batch render; keeping deterministic app output for this run (${neuralRepairErrorMessage(
-          error,
-        )}).`,
-      );
-      return false;
-    }
   };
 
   const getSmartMatchConfigForControls = (controls: AudioReviewControls) =>
@@ -3969,7 +3883,7 @@ const summarizeFailureReason = (error: unknown) => {
     };
   };
 
-  const runNeuralSpeechEnhancementAppPass = async (
+  const runFinalAppPolishPass = async (
     ffmpeg: FFmpeg,
     targetName: string,
     profile: AdaptiveProfile | null,
@@ -3983,219 +3897,22 @@ const summarizeFailureReason = (error: unknown) => {
     const directives = getActiveAudioReviewAdaptiveDirectives();
     const finalPolishProfile = buildFinalPolishProfile(profile, directives);
     const inputBytes = await readVirtualFileBytes(activeFfmpeg, targetName);
-    const inputByteLength = assertUsableWavBytes(inputBytes, "App output before neural speech enhancement");
-    const inputDurationSeconds = await probeInputDurationSeconds(activeFfmpeg, targetName).catch(() => null);
+    const inputByteLength = assertUsableWavBytes(inputBytes, "App output before final app polish");
     const tempBase = targetName.replace(/\.wav$/i, "");
-    const enhancementName = `${tempBase}_speech_enhancement_tmp.wav`;
     const appPassName = `${tempBase}_final_polish_tmp.wav`;
     const candidateVariant =
       context.candidateVariant && context.candidateVariant !== "source-safe"
         ? context.candidateVariant
         : "continuity-safe";
 
-    if (!(await ensureNeuralSpeechEnhancementAvailable())) {
-      appendLog(
-        `[SpeechEnhancement] ${context.base}: skipped neural pass from cached backend preflight; delivery uses deterministic app output.`,
-      );
-      await activeFfmpeg.writeFile(targetName, inputBytes);
-      return {
-        ffmpeg: activeFfmpeg,
-        applied: false,
-        polishPasses: 0,
-      };
-    }
-
-    setStatus(`Neural speech enhancement: ${context.base}`);
-    setActiveQueueStage(context.base, "Neural speech enhancement", context.detail);
-    appendLog(
-      `[SpeechEnhancement] ${context.base}: app output -> neural speech enhancement (${formatBytes(
-        inputByteLength,
-      )}).`,
-    );
-
-    type NeuralRepairPassResult = {
-      repairedBytes: Uint8Array;
-      repairedByteLength: number;
-      report: NeuralRepairReport | null;
-    };
-
-    const runDirectNeuralRepair = async (): Promise<NeuralRepairPassResult> => {
-      const result = await requestNeuralRepair(inputBytes, CLEARVOICE_SE_REQUEST, targetName);
-      const repairedBytes = await normalizeAudioBytes(result.bytes, "Neural speech enhancement");
-      const repairedByteLength = assertUsableWavBytes(repairedBytes, "Neural speech enhancement");
-      return { repairedBytes, repairedByteLength, report: result.report };
-    };
-
-    const runChunkedNeuralRepair = async (plan: NeuralRepairTransportPlan): Promise<NeuralRepairPassResult> => {
-      const chunkInputNames: string[] = [];
-      const chunkOutputNames: string[] = [];
-      appendLog(
-        `[SpeechEnhancement] ${context.base}: using Vercel-safe chunked neural transport (${plan.chunks.length} chunks, max ${formatBytes(
-          NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES,
-        )} per request).`,
-      );
-
-      try {
-        for (const chunk of plan.chunks) {
-          const partLabel = `${chunk.index + 1}/${chunk.total}`;
-          const chunkInputName = `${tempBase}_neural_chunk_${String(chunk.index + 1).padStart(3, "0")}_input.wav`;
-          const chunkOutputName = `${tempBase}_neural_chunk_${String(chunk.index + 1).padStart(3, "0")}_enhanced.wav`;
-          const isLast = chunk.index === chunk.total - 1;
-          const span = isLast
-            ? chunk.durationSec
-            : Math.min(chunk.durationSec + CHUNK_CROSSFADE_SECONDS, plan.durationSeconds - chunk.startSec);
-          chunkInputNames.push(chunkInputName);
-          chunkOutputNames.push(chunkOutputName);
-
-          await safeDeleteFile(activeFfmpeg, chunkInputName);
-          await safeDeleteFile(activeFfmpeg, chunkOutputName);
-          resetLogBuffer();
-          await execOrThrow(
-            activeFfmpeg,
-            [
-              "-hide_banner",
-              "-nostdin",
-              "-threads",
-              "1",
-              "-filter_threads",
-              "1",
-              "-y",
-              "-ss",
-              chunk.startSec.toFixed(3),
-              "-t",
-              span.toFixed(3),
-              "-i",
-              targetName,
-              "-ar",
-              "48000",
-              "-ac",
-              "1",
-              "-c:a",
-              "pcm_f32le",
-              chunkInputName,
-            ],
-            `Neural speech enhancement chunk extract ${partLabel}`,
-          );
-
-          const chunkBytes = await readVirtualFileBytes(activeFfmpeg, chunkInputName);
-          const chunkByteLength = assertUsableWavBytes(
-            chunkBytes,
-            `Neural speech enhancement chunk ${partLabel}`,
-          );
-          if (chunkByteLength > NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES) {
-            throw new Error(
-              `Neural speech enhancement chunk ${partLabel} is ${formatBytes(
-                chunkByteLength,
-              )}, above the Vercel-safe request budget ${formatBytes(NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES)}.`,
-            );
-          }
-
-          setActiveQueueStage(
-            context.base,
-            "Neural speech enhancement",
-            `${context.detail}, chunk ${partLabel}`,
-          );
-          appendLog(
-            `[SpeechEnhancement] ${context.base}: neural chunk ${partLabel} (${formatBytes(
-              chunkByteLength,
-            )}, ${chunk.durationSec.toFixed(1)}s).`,
-          );
-          const result = await requestNeuralRepair(chunkBytes, CLEARVOICE_SE_REQUEST, chunkInputName);
-          const chunkRepairedBytes = await normalizeAudioBytes(
-            result.bytes,
-            `Neural speech enhancement chunk ${partLabel}`,
-          );
-          const chunkRepairedByteLength = assertUsableWavBytes(
-            chunkRepairedBytes,
-            `Neural speech enhancement chunk ${partLabel}`,
-          );
-          await activeFfmpeg.writeFile(chunkOutputName, chunkRepairedBytes);
-          appendLog(
-            `[SpeechEnhancement] ${context.base}: neural chunk ${partLabel} complete (${formatBytes(
-              chunkRepairedByteLength,
-            )}).`,
-          );
-        }
-
-        await safeDeleteFile(activeFfmpeg, enhancementName);
-        await runCrossfadeConcat(
-          activeFfmpeg,
-          chunkOutputNames,
-          enhancementName,
-          CHUNK_CROSSFADE_SECONDS,
-          "Neural speech enhancement chunk concat",
-        );
-        const repairedBytes = await readVirtualFileBytes(activeFfmpeg, enhancementName);
-        const repairedByteLength = assertUsableWavBytes(
-          repairedBytes,
-          "Chunked neural speech enhancement",
-        );
-        const report: NeuralRepairReport = {
-          engine: CLEARVOICE_SE_REQUEST.engine,
-          mode: CLEARVOICE_SE_REQUEST.mode,
-          model: CLEARVOICE_SE_REQUEST.model,
-          durationSeconds: plan.durationSeconds,
-          outputBytes: repairedByteLength,
-          chunksTotal: plan.chunks.length,
-          chunksProcessed: plan.chunks.length,
-          warnings: ["Used Vercel-safe chunked neural repair transport."],
-        };
-        return {
-          repairedBytes,
-          repairedByteLength,
-          report,
-        };
-      } finally {
-        for (const name of [...chunkInputNames, ...chunkOutputNames]) {
-          await safeDeleteFile(activeFfmpeg, name);
-        }
-      }
-    };
-
     try {
-      await safeDeleteFile(activeFfmpeg, enhancementName);
-      const transportPlan = planNeuralRepairTransport({
-        inputBytes: inputByteLength,
-        durationSeconds: inputDurationSeconds,
-      });
-      const result =
-        transportPlan.strategy === "chunked"
-          ? await runChunkedNeuralRepair(transportPlan)
-          : await runDirectNeuralRepair();
-      const { repairedBytes, repairedByteLength } = result;
-      if (
-        typeof result.report?.outputBytes === "number" &&
-        result.report.outputBytes > 44 &&
-        Math.abs(result.report.outputBytes - repairedByteLength) > 44
-      ) {
-        appendLog(
-          `[SpeechEnhancement] ${context.base}: worker reported ${formatBytes(
-            result.report.outputBytes,
-          )}, browser received ${formatBytes(repairedByteLength)}; using received WAV bytes.`,
-        );
-      }
-      await activeFfmpeg.writeFile(enhancementName, repairedBytes);
-      const neuralReportDetail = result.report?.speechAware
-        ? `, speech-aware ${Math.round(result.report.activeDutyPct ?? 0)}% active, ${(
-            result.report.processedSeconds ?? 0
-          ).toFixed(1)}s processed, ${result.report.chunksProcessed ?? 0}/${result.report.chunksTotal ?? 0} chunks${
-            result.report.torchThreads ? `, ${result.report.torchThreads} torch threads` : ""
-          }`
-        : result.report?.chunksTotal
-          ? `, ${result.report.chunksProcessed ?? 0}/${result.report.chunksTotal} chunks${
-              result.report.torchThreads ? `, ${result.report.torchThreads} torch threads` : ""
-            }`
-          : "";
-      appendLog(
-        `[SpeechEnhancement] ${context.base}: enhancement pass complete (${formatBytes(repairedByteLength)}${
-          result.report?.elapsedSeconds ? `, ${result.report.elapsedSeconds.toFixed(1)}s` : ""
-        }${neuralReportDetail}).`,
-      );
-
       setStatus(`Final app polish: ${context.base}`);
       setActiveQueueStage(context.base, "Final app polish", `${context.detail}, subtle single pass`);
       await safeDeleteFile(activeFfmpeg, appPassName);
-      await runMixReady(activeFfmpeg, enhancementName, appPassName, finalPolishProfile, {
+      appendLog(
+        `[FinalPolish] ${context.base}: app output -> final app polish (${formatBytes(inputByteLength)}).`,
+      );
+      await runMixReady(activeFfmpeg, targetName, appPassName, finalPolishProfile, {
         candidateVariant,
         forceEndingProtection: true,
         skipSpeechSegmentation: true,
@@ -4208,9 +3925,9 @@ const summarizeFailureReason = (error: unknown) => {
 
       await activeFfmpeg.writeFile(targetName, passBytes);
       appendLog(
-        `[SpeechEnhancement] ${context.base}: final app polish applied once (${formatBytes(
+        `[FinalPolish] ${context.base}: final app polish applied once (${formatBytes(
           passByteLength,
-        )}; delivery uses neural enhancement + final polish).`,
+        )}; delivery uses app + final app polish).`,
       );
       return {
         ffmpeg: activeFfmpeg,
@@ -4219,12 +3936,12 @@ const summarizeFailureReason = (error: unknown) => {
       };
     } catch (error) {
       appendLog(
-        `[SpeechEnhancement] ${context.base}: neural/final polish unavailable; keeping app output (${
+        `[FinalPolish] ${context.base}: final app polish unavailable; keeping primary app output (${
           error instanceof Error ? error.message : String(error)
         }).`,
       );
       if (shouldResetFfmpegForError(error)) {
-        activeFfmpeg = await refreshFfmpeg(`speech enhancement failure on ${context.base}`);
+        activeFfmpeg = await refreshFfmpeg(`final polish failure on ${context.base}`);
       }
       await activeFfmpeg.writeFile(targetName, inputBytes);
       return {
@@ -4233,7 +3950,6 @@ const summarizeFailureReason = (error: unknown) => {
         polishPasses: 0,
       };
     } finally {
-      await safeDeleteFile(activeFfmpeg, enhancementName);
       await safeDeleteFile(activeFfmpeg, appPassName);
     }
   };
@@ -5114,13 +4830,13 @@ const summarizeFailureReason = (error: unknown) => {
             skipSpeechSegmentation: true,
           },
         );
-        const chunkEnhancement = await runNeuralSpeechEnhancementAppPass(ffmpeg, mixChunkName, profile, {
+        const chunkPolish = await runFinalAppPolishPass(ffmpeg, mixChunkName, profile, {
           base: job.base,
-          detail: `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}, neural speech enhancement`,
+          detail: `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}, final app polish`,
           candidateVariant,
         });
-        ffmpeg = chunkEnhancement.ffmpeg;
-        const chunkFlow = chunkEnhancement.applied ? "app-neural-speech-enhancement-app" : "app";
+        ffmpeg = chunkPolish.ffmpeg;
+        const chunkFlow = chunkPolish.applied ? "app-final-polish" : "app";
 
         if (keepMixReady || loudnessConfig === null) {
           outputEntries.push(
@@ -5437,10 +5153,7 @@ const summarizeFailureReason = (error: unknown) => {
     const sourceFirstVariant = sourceFirstCandidateVariantRef.current;
     if (sourceFirstVariant) return [sourceFirstVariant];
 
-    const variants: CandidateVariant[] = ["cinematic-stable", "continuity-safe"];
-    // On batch-episode-length files (≥ 10 min) we skip the third variant
-    // unless pause/noise evidence says it could win; long files recycle
-    // between variants, so the extra quality candidate is still bounded.
+    let variant: CandidateVariant = profile?.preferSinglePassContinuity ? "continuity-safe" : "cinematic-stable";
     const longFile = durationSeconds !== null && durationSeconds >= LONG_FILE_DURATION_SECONDS;
     const severeNoise =
       (profile?.pauseNoiseRisk ?? 0) >= 0.55 ||
@@ -5449,41 +5162,17 @@ const summarizeFailureReason = (error: unknown) => {
     const longFilePauseCandidate =
       longFile && ((profile?.pauseNoiseRisk ?? 0) >= 0.4 || profile?.noiseRisk === "medium");
     if (severeNoise || longFilePauseCandidate) {
-      variants.push("pause-safe");
+      variant = "pause-safe";
     } else if (
       !longFile &&
       ((profile?.pauseNoiseRisk ?? 0) >= 0.32 ||
         profile?.noiseRisk === "medium" ||
         profile?.noiseRisk === "high")
     ) {
-      variants.push("pause-safe");
+      variant = "pause-safe";
     }
 
-    // SPIKY SOURCES SHOULD NOT GET CORE-SAFE.
-    //
-    // `source-safe` (a.k.a. "core-safe") disables the entire downstream
-    // chain — no acompressor glue, no dynaudnorm safety pass — and relies
-    // on the planner + final alimiter for ALL dynamics control. That's the
-    // wrong choice for a take with visible volume spikes inside sentences,
-    // because any spike the planner's body-relative guard misses then has
-    // no second-line defense before the limiter (which only catches
-    // absolute-ceiling violations, not body-relative ones).
-    //
-    // We drop core-safe from the candidate list when:
-    //   - line swing ≥ 0.55 (within-sentence variation is high), OR
-    //   - the same instabilityBlend the planner uses for its spike taming
-    //     decision is ≥ 0.50 (the planner is already actively dipping
-    //     spikes — meaning the source HAS them).
-    const lineSwing = profile?.lineSwingScore ?? 0;
-    const instabilityBlend =
-      (profile?.instabilityScore ?? 0) * 0.5 +
-      lineSwing * 0.3 +
-      (profile?.sentenceJumpScore ?? 0) * 0.2;
-    const spikySource = lineSwing >= 0.55 || instabilityBlend >= 0.5;
-    if (!spikySource) {
-      variants.push("source-safe");
-    }
-    return variants;
+    return [variant];
   };
 
   const buildCandidateScore = (analysis: FileAnalysis | null): CandidateScore => {
@@ -6030,7 +5719,6 @@ const summarizeFailureReason = (error: unknown) => {
     aiAdaptiveDirectivesOverrideRef.current = null;
     sourceFirstCandidateVariantRef.current = null;
     sourceFirstPlansByBaseRef.current = new Map();
-    resetNeuralRepairPreflight();
     setLoading(true);
     setOutputs([]);
     setReviewBundles([]);
@@ -6343,7 +6031,7 @@ const summarizeFailureReason = (error: unknown) => {
             fileDurationForVariants !== null && fileDurationForVariants >= LONG_FILE_DURATION_SECONDS;
           if (isLongFile) {
             appendLog(
-              `[LongFile] ${job.base}: ${fileDurationForVariants!.toFixed(0)}s duration \u2014 ${candidateVariants.length} candidate variant(s), worker recycle between variants.`,
+              `[LongFile] ${job.base}: ${fileDurationForVariants!.toFixed(0)}s duration \u2014 using one source-first render variant; reranking is temporarily paused.`,
             );
           }
           let selectedVariant: CandidateVariant | null = null;
@@ -6520,14 +6208,13 @@ const summarizeFailureReason = (error: unknown) => {
               if (candidateMeta.degraded) {
                 degradedCandidates += 1;
               }
-              const decision = shouldPreferCandidate(candidateScore, candidateMeta, selectedScore, selectedMeta);
-              if (decision.select) {
+              if (!selectedBytes) {
                 selectedVariant = candidateVariant;
                 selectedBytes = candidateBytes;
                 selectedScore = candidateScore;
                 selectedAnalysis = candidateAnalysis;
                 selectedMeta = candidateMeta;
-                selectedReason = decision.reason;
+                selectedReason = "source-first single render; reranking temporarily disabled";
               }
 
               const candidateHasRenderDegrade = candidateMeta.degradeReasons.some(
@@ -6544,7 +6231,7 @@ const summarizeFailureReason = (error: unknown) => {
                 !candidateHasRenderDegrade
               ) {
                 appendLog(
-                  `[CandidateQC] ${job.base}/${candidateLabel}: stopping remaining candidate rerenders after QC memory failure to keep this PC cool; rendered audio will be selected by fallback if no QC candidate is available.`,
+                  `[CandidateQC] ${job.base}/${candidateLabel}: stopping after QC memory failure to keep this PC cool; rendered audio will be selected by fallback if QC is unavailable.`,
                 );
                 break;
               }
@@ -6723,13 +6410,13 @@ const summarizeFailureReason = (error: unknown) => {
               );
             }
           }
-          const enhancementResult = await runNeuralSpeechEnhancementAppPass(ffmpeg, job.mixName, profile, {
+          const polishResult = await runFinalAppPolishPass(ffmpeg, job.mixName, profile, {
             base: job.base,
-            detail: `File ${i + 1} of ${jobs.length}, neural speech enhancement`,
+            detail: `File ${i + 1} of ${jobs.length}, final app polish`,
             candidateVariant: selectedVariant,
           });
-          ffmpeg = enhancementResult.ffmpeg;
-          const outputProcessingFlow = enhancementResult.applied ? "app-neural-speech-enhancement-app" : "app";
+          ffmpeg = polishResult.ffmpeg;
+          const outputProcessingFlow = polishResult.applied ? "app-final-polish" : "app";
 
           if (keepMixReady || loudnessConfig === null) {
             const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean", outputProcessingFlow);
@@ -6889,7 +6576,6 @@ const summarizeFailureReason = (error: unknown) => {
       aiAdaptiveDirectivesOverrideRef.current = null;
       sourceFirstCandidateVariantRef.current = null;
       sourceFirstPlansByBaseRef.current = new Map();
-      resetNeuralRepairPreflight();
       setLoading(false);
     }
   };
@@ -6966,8 +6652,8 @@ const summarizeFailureReason = (error: unknown) => {
       sceneBlend,
       keepMixReady,
       gainPlannerEnabled,
-      neuralSpeechEnhancement: true,
-      reviewReranker: learnedReviewWeights.modelName,
+      neuralSpeechEnhancement: false,
+      reviewReranker: "paused-temporary-single-render",
     },
     files: manifestOutputs.map((output) => ({
       name: output.name,
@@ -7344,21 +7030,21 @@ const summarizeFailureReason = (error: unknown) => {
             <div>
               <strong>Neural speech enhancement</strong>
               <div className={styles.label}>
-                Mandatory VO cleanup pass between adaptive app processing and one subtle final polish.
+                Temporarily disabled. The active chain is AI review, app render, then one subtle final app polish.
               </div>
             </div>
             <input
               type="checkbox"
               checked={neuralSpeechEnhancementEnabled}
               disabled
-              onChange={() => setNeuralSpeechEnhancementEnabled(true)}
+              onChange={() => setNeuralSpeechEnhancementEnabled(false)}
             />
           </div>
           <div className={styles.toggleRow}>
             <div>
               <strong>AI Auto Pilot</strong>
               <div className={styles.label}>
-                Reviews original source audio first, applies a safe adaptive profile, then renders once through app, neural VO, and final app touch.
+                Reviews original source audio first, applies a safe adaptive profile, then renders once through the app and final app touch.
               </div>
               {aiAutoPilotStatus && <div className={styles.label}>{aiAutoPilotStatus}</div>}
             </div>
@@ -7464,7 +7150,7 @@ const summarizeFailureReason = (error: unknown) => {
                   <div>
                     <strong>Review reranker</strong>
                     <div className={styles.label}>
-                      Hard gates stay deterministic. The learned layer only reranks valid candidates.
+                      Temporarily paused. The current pipeline renders the AI-selected source-first variant once.
                     </div>
                   </div>
                   <span className={styles.reviewModelBadge}>
@@ -7482,6 +7168,7 @@ const summarizeFailureReason = (error: unknown) => {
                       type="file"
                       accept=".json,application/json"
                       hidden
+                      disabled
                       onChange={async (event) => {
                         const file = event.target.files?.[0] ?? null;
                         await importReviewWeights(file);
@@ -7493,7 +7180,7 @@ const summarizeFailureReason = (error: unknown) => {
                     type="button"
                     className={`${styles.button} ${styles.buttonGhost}`}
                     onClick={resetReviewWeights}
-                    disabled={learnedReviewWeightsSource === "default"}
+                    disabled
                   >
                     Reset to default
                   </button>
@@ -7713,6 +7400,9 @@ const summarizeFailureReason = (error: unknown) => {
                     </span>
                     {output.processingFlow === "app-neural-speech-enhancement-app" && (
                       <span className={styles.outputBadge}>Neural enhancement + app</span>
+                    )}
+                    {output.processingFlow === "app-final-polish" && (
+                      <span className={styles.outputBadge}>Final app polish</span>
                     )}
                     {output.kind === "mixready" ? (
                       <>
