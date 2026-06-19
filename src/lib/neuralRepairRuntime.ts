@@ -14,11 +14,37 @@ export type ResolvedNeuralRepairWorkerCommand = {
   configuredCommand: string;
 };
 
+export type NeuralRepairRuntimeTarget =
+  | {
+      kind: "local";
+      command: string;
+      args: string[];
+      source: NeuralRepairWorkerCommandSource;
+      configuredCommand: string;
+    }
+  | {
+      kind: "remote";
+      url: string;
+      token?: string;
+    }
+  | {
+      kind: "unavailable";
+      reason: string;
+      attemptedCommand: string;
+      commandSource: NeuralRepairWorkerCommandSource;
+    };
+
 type ResolveNeuralRepairWorkerCommandOptions = {
   commandLine?: string;
   cwd?: string;
   platform?: NodeJS.Platform;
   exists?: (candidate: string) => boolean;
+};
+
+type ResolveNeuralRepairRuntimeTargetOptions = ResolveNeuralRepairWorkerCommandOptions & {
+  remoteUrl?: string;
+  remoteToken?: string;
+  isVercel?: boolean;
 };
 
 export const splitCommandLine = (commandLine: string | undefined) => {
@@ -128,5 +154,50 @@ export const resolveNeuralRepairWorkerCommand = ({
     args,
     source: "runtime-python",
     configuredCommand,
+  };
+};
+
+export const normalizeRemoteWorkerUrl = (remoteUrl: string | undefined) => {
+  const trimmed = remoteUrl?.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+};
+
+export const resolveNeuralRepairRuntimeTarget = ({
+  remoteUrl,
+  remoteToken,
+  isVercel = process.env.VERCEL === "1",
+  ...commandOptions
+}: ResolveNeuralRepairRuntimeTargetOptions = {}): NeuralRepairRuntimeTarget => {
+  const normalizedRemoteUrl = normalizeRemoteWorkerUrl(remoteUrl);
+  if (normalizedRemoteUrl) {
+    return {
+      kind: "remote",
+      url: normalizedRemoteUrl,
+      ...(remoteToken ? { token: remoteToken } : {}),
+    };
+  }
+
+  const local = resolveNeuralRepairWorkerCommand(commandOptions);
+  if (isVercel && local.source === "runtime-python") {
+    return {
+      kind: "unavailable",
+      reason:
+        "Vercel's Next.js Node runtime does not provide a Python/ClearVoice process. Configure VO_NEURAL_REPAIR_REMOTE_URL to a remote ClearVoice worker, or run the app on a host that provisions the .venv-neural runtime.",
+      attemptedCommand: local.command,
+      commandSource: local.source,
+    };
+  }
+
+  return {
+    kind: "local",
+    ...local,
   };
 };

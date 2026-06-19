@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
 import {
+  resolveNeuralRepairRuntimeTarget,
   resolveNeuralRepairWorkerCommand,
   resolveProjectRelativePathOption,
   splitCommandLine,
@@ -69,4 +70,33 @@ test("keeps a valid Windows neural venv command on Windows", () => {
   assert.equal(resolved.command, windowsPython);
   assert.deepEqual(resolved.args, []);
   assert.equal(resolved.source, "configured-path");
+});
+
+test("uses a remote neural worker when one is configured", () => {
+  const resolved = resolveNeuralRepairRuntimeTarget({
+    commandLine: ".venv-neural\\Scripts\\python.exe",
+    remoteUrl: "https://worker.example.test/neural",
+    remoteToken: "secret-token",
+    cwd: path.resolve("runtime-root"),
+    platform: "linux",
+    isVercel: true,
+    exists: () => false,
+  });
+
+  assert.equal(resolved.kind, "remote");
+  assert.equal(resolved.url, "https://worker.example.test/neural");
+  assert.equal(resolved.token, "secret-token");
+});
+
+test("does not fall back to python3 inside the Vercel Node runtime", () => {
+  const resolved = resolveNeuralRepairRuntimeTarget({
+    commandLine: ".venv-neural\\Scripts\\python.exe",
+    cwd: path.resolve("runtime-root"),
+    platform: "linux",
+    isVercel: true,
+    exists: () => false,
+  });
+
+  assert.equal(resolved.kind, "unavailable");
+  assert.match(resolved.reason, /remote ClearVoice worker/i);
 });

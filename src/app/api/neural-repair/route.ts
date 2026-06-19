@@ -13,7 +13,7 @@ import {
   type NeuralRepairRequest,
   type NeuralRepairReport,
 } from "@/lib/neuralRepairPolicy";
-import { resolveNeuralRepairWorkerCommand } from "@/lib/neuralRepairRuntime";
+import { resolveNeuralRepairRuntimeTarget, type NeuralRepairRuntimeTarget } from "@/lib/neuralRepairRuntime";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -63,11 +63,14 @@ const authorizeRequest = async (request: NextRequest) => {
   return localMode || isAllowedEmail(session?.user?.email);
 };
 
-const workerCommand = () =>
-  resolveNeuralRepairWorkerCommand({
+const runtimeTarget = () =>
+  resolveNeuralRepairRuntimeTarget({
     commandLine: process.env.VO_NEURAL_REPAIR_COMMAND,
+    remoteUrl: process.env.VO_NEURAL_REPAIR_REMOTE_URL,
+    remoteToken: process.env.VO_NEURAL_REPAIR_REMOTE_TOKEN,
     cwd: process.cwd(),
     platform: process.platform,
+    isVercel: process.env.VERCEL === "1",
     exists: existsSync,
   });
 
@@ -154,10 +157,13 @@ const readUploadPayload = async (request: NextRequest): Promise<UploadPayload | 
   };
 };
 
-const runWorker = async (args: string[], timeout: number) => {
-  const commandConfig = workerCommand();
+const runLocalWorker = async (
+  target: Extract<NeuralRepairRuntimeTarget, { kind: "local" }>,
+  args: string[],
+  timeout: number,
+) => {
   return await new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(commandConfig.command, [...commandConfig.args, ...args], {
+    const child = spawn(target.command, [...target.args, ...args], {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -179,7 +185,7 @@ const runWorker = async (args: string[], timeout: number) => {
       reject(
         new Error(
           nodeError.code === "ENOENT"
-            ? `neural repair worker command not found: ${commandConfig.command}. Set VO_NEURAL_REPAIR_COMMAND to a Python runtime with ClearVoice installed, or provision .venv-neural for this deployment.`
+            ? `neural repair worker command not found: ${target.command}. Set VO_NEURAL_REPAIR_COMMAND to a Python runtime with ClearVoice installed, or provision .venv-neural for this deployment.`
             : error.message,
         ),
       );
@@ -189,6 +195,113 @@ const runWorker = async (args: string[], timeout: number) => {
       resolve({ exitCode, stdout, stderr });
     });
   });
+};
+
+const remoteAuthHeaders = (target: Extract<NeuralRepairRuntimeTarget, { kind: "remote" }>) => {
+  const headers: Record<string, string> = {};
+  if (target.token) {
+    headers.Authorization = `Bearer ${target.token}`;
+    headers["x-vo-neural-worker-token"] = target.token;
+  }
+  return headers;
+};
+
+const remoteSelfTestUrl = (target: Extract<NeuralRepairRuntimeTarget, { kind: "remote" }>) => {
+  const url = new URL(target.url);
+  url.searchParams.set("selfTest", "1");
+  return url;
+};
+
+const readRemoteError = async (response: Response) => {
+  const text = (await response.text()).trim();
+  if (!text) return `HTTP ${response.status}`;
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown };
+    if (typeof parsed.error === "string") return parsed.error;
+  } catch {
+    // Keep the raw text below.
+  }
+  return text.slice(0, 1000);
+};
+
+const parseReportHeader = (value: string | null): NeuralRepairReport | null => {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(decodeURIComponent(value)) as NeuralRepairReport;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const runRemoteSelfTest = async (
+  target: Extract<NeuralRepairRuntimeTarget, { kind: "remote" }>,
+  timeout: number,
+) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(remoteSelfTestUrl(target), {
+      headers: remoteAuthHeaders(target),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`remote neural worker self-test failed: ${await readRemoteError(response)}`);
+    }
+    return (await response.json()) as NeuralRepairReport | Record<string, unknown>;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const remoteRepairHeaders = (
+  target: Extract<NeuralRepairRuntimeTarget, { kind: "remote" }>,
+  repairRequest: NeuralRepairRequest,
+) => ({
+  ...remoteAuthHeaders(target),
+  "Content-Type": "audio/wav",
+  "x-vo-neural-variant": repairRequest.variant,
+  "x-vo-neural-engine": repairRequest.engine,
+  "x-vo-neural-mode": repairRequest.mode,
+  "x-vo-neural-model": repairRequest.model,
+  "x-vo-neural-device": process.env.VO_NEURAL_REPAIR_DEVICE || "cpu",
+  "x-vo-neural-speech-aware": boolEnv(process.env.VO_NEURAL_REPAIR_SPEECH_AWARE ?? "on") ? "on" : "off",
+  "x-vo-neural-speech-aware-min-seconds": String(numericEnv("VO_NEURAL_REPAIR_SPEECH_AWARE_MIN_SECONDS", 90)),
+  "x-vo-neural-speech-aware-max-duty-pct": String(numericEnv("VO_NEURAL_REPAIR_SPEECH_AWARE_MAX_DUTY_PCT", 62)),
+  "x-vo-neural-speech-aware-pad-ms": String(numericEnv("VO_NEURAL_REPAIR_SPEECH_AWARE_PAD_MS", 360)),
+  "x-vo-neural-speech-aware-merge-gap-ms": String(numericEnv("VO_NEURAL_REPAIR_SPEECH_AWARE_MERGE_GAP_MS", 900)),
+  "x-vo-neural-speech-aware-fade-ms": String(numericEnv("VO_NEURAL_REPAIR_SPEECH_AWARE_FADE_MS", 80)),
+});
+
+const runRemoteRepair = async (
+  target: Extract<NeuralRepairRuntimeTarget, { kind: "remote" }>,
+  audioBytes: Buffer,
+  repairRequest: NeuralRepairRequest,
+  timeout: number,
+) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(target.url, {
+      method: "POST",
+      headers: remoteRepairHeaders(target, repairRequest),
+      body: new Uint8Array(audioBytes),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`remote neural worker failed: ${await readRemoteError(response)}`);
+    }
+    const outputBytes = Buffer.from(await response.arrayBuffer());
+    if (outputBytes.byteLength <= MIN_WAV_HEADER_BYTES) {
+      throw new Error(`remote neural worker produced invalid audio (${outputBytes.byteLength} bytes).`);
+    }
+    return {
+      outputBytes,
+      report: parseReportHeader(response.headers.get("x-vo-neural-report")),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 };
 
 const parseWorkerReport = (stdout: string, stderr: string): NeuralRepairReport | null => {
@@ -216,17 +329,34 @@ export async function GET(request: NextRequest) {
 
   const enabled = boolEnv(process.env.VO_NEURAL_REPAIR_ENABLED);
   const engines = enabledEngines();
-  const commandConfig = workerCommand();
+  const target = runtimeTarget();
   if (request.nextUrl.searchParams.get("selfTest") === "1") {
     try {
-      const result = await runWorker([workerPath(), "--self-test"], 30_000);
+      if (target.kind === "unavailable") {
+        return jsonError(`Neural repair self-test unavailable: ${target.reason}`, 503, "config");
+      }
+      if (target.kind === "remote") {
+        const report = await runRemoteSelfTest(target, 30_000);
+        return NextResponse.json(
+          {
+            enabled,
+            engines,
+            target: target.kind,
+            selfTest: report,
+            exitCode: 0,
+          },
+          { headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const result = await runLocalWorker(target, [workerPath(), "--self-test"], 30_000);
       const report = parseWorkerReport(result.stdout, result.stderr);
       return NextResponse.json(
         {
           enabled,
           engines,
-          command: commandConfig.command,
-          commandSource: commandConfig.source,
+          target: target.kind,
+          command: target.command,
+          commandSource: target.source,
           selfTest: report,
           exitCode: result.exitCode,
         },
@@ -245,8 +375,9 @@ export async function GET(request: NextRequest) {
     {
       enabled,
       engines,
-      command: commandConfig.command,
-      commandSource: commandConfig.source,
+      target: target.kind,
+      ...(target.kind === "local" ? { command: target.command, commandSource: target.source } : {}),
+      ...(target.kind === "unavailable" ? { unavailableReason: target.reason } : {}),
       maxAudioBytes: maxAudioBytes(),
       timeoutSeconds: timeoutMs() / 1000,
     },
@@ -260,6 +391,10 @@ export async function POST(request: NextRequest) {
   }
   if (!boolEnv(process.env.VO_NEURAL_REPAIR_ENABLED)) {
     return jsonError("Neural speech enhancement is disabled. Set VO_NEURAL_REPAIR_ENABLED=on on the server.", 503, "config");
+  }
+  const target = runtimeTarget();
+  if (target.kind === "unavailable") {
+    return jsonError(`Neural speech enhancement is not available on this server: ${target.reason}`, 503, "config");
   }
 
   const maxBytes = maxAudioBytes();
@@ -292,12 +427,34 @@ export async function POST(request: NextRequest) {
     return jsonError(`Neural repair engine is not enabled: ${repairRequest.engine}`, 400, "bad_request");
   }
 
+  if (target.kind === "remote") {
+    try {
+      const result = await runRemoteRepair(target, audioBytes, repairRequest, timeoutMs());
+      const headerReport = result.report ? encodeURIComponent(JSON.stringify(result.report)) : "";
+      return new NextResponse(result.outputBytes, {
+        status: 200,
+        headers: {
+          "Content-Type": "audio/wav",
+          "Cache-Control": "no-store",
+          ...(headerReport ? { "x-vo-neural-report": headerReport } : {}),
+        },
+      });
+    } catch (error) {
+      return jsonError(
+        `Neural repair failed: ${error instanceof Error ? error.message : String(error)}`,
+        502,
+        "worker",
+      );
+    }
+  }
+
   const tempRoot = await mkdtemp(path.join(tmpdir(), "vo-neural-repair-"));
   const inputPath = path.join(tempRoot, "input.wav");
   const outputPath = path.join(tempRoot, "output.wav");
   try {
     await writeFile(inputPath, audioBytes);
-    const result = await runWorker(
+    const result = await runLocalWorker(
+      target,
       [
         workerPath(),
         "--input",

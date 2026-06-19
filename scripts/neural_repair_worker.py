@@ -9,6 +9,9 @@ from pathlib import Path
 
 faulthandler.enable()
 
+_CLEARVOICE_MODEL_CACHE = {}
+_TORCH_THREADS_CONFIGURED = None
+
 
 def module_available(name):
     return importlib.util.find_spec(name) is not None
@@ -75,6 +78,9 @@ def clearvoice_process_chunk(model, audio):
 
 
 def configure_torch_threads():
+    global _TORCH_THREADS_CONFIGURED
+    if _TORCH_THREADS_CONFIGURED is not None:
+        return _TORCH_THREADS_CONFIGURED
     try:
         import torch
 
@@ -85,8 +91,10 @@ def configure_torch_threads():
             torch.set_num_interop_threads(1)
         except RuntimeError:
             pass
+        _TORCH_THREADS_CONFIGURED = threads
         return threads
     except Exception:
+        _TORCH_THREADS_CONFIGURED = None
         return None
 
 
@@ -323,15 +331,13 @@ def resample_numpy(audio, orig_sr, target_sr):
 
 
 def run_clearvoice(args):
-    from clearvoice import ClearVoice
-
     start = time.perf_counter()
     torchThreads = configure_torch_threads()
     input_audio, input_sr = load_audio_soundfile(args.input)
     target_sr = 48000
     audio = resample_numpy(input_audio, input_sr, target_sr)
 
-    model = ClearVoice(task=args.mode, model_names=[args.model])
+    model = get_clearvoice_model(args.mode, args.model)
     output_audio, chunk_report = clearvoice_process_speech_aware(
         model,
         audio,
@@ -359,6 +365,17 @@ def run_clearvoice(args):
         **({"torchThreads": torchThreads} if torchThreads is not None else {}),
         **chunk_report,
     }
+
+
+def get_clearvoice_model(mode, model_name):
+    from clearvoice import ClearVoice
+
+    cache_key = (mode, model_name)
+    model = _CLEARVOICE_MODEL_CACHE.get(cache_key)
+    if model is None:
+        model = ClearVoice(task=mode, model_names=[model_name])
+        _CLEARVOICE_MODEL_CACHE[cache_key] = model
+    return model
 
 
 def self_test():

@@ -18,6 +18,8 @@
 # testing
 /coverage
 /.playwright-mcp/
+__pycache__/
+*.pyc
 
 # next.js
 /.next/
