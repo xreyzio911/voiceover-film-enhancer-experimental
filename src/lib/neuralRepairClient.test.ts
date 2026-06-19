@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { CLEARVOICE_SE_REQUEST } from "./neuralRepairPolicy.ts";
-import { NeuralRepairError, requestNeuralRepair } from "./neuralRepairClient.ts";
+import { NeuralRepairError, requestNeuralRepair, requestNeuralRepairHealth } from "./neuralRepairClient.ts";
 
 test("neural repair client uploads raw wav bytes without multipart framing", async () => {
   const originalFetch = globalThis.fetch;
@@ -80,6 +80,63 @@ test("neural repair client reports network fetch failures with a stable code", a
         assert.equal((error as NeuralRepairError).status, 0);
         assert.equal((error as NeuralRepairError).code, "network");
         assert.match((error as Error).message, /could not reach \/api\/neural-repair/i);
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("neural repair client self-tests the server worker once with cache disabled", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured: RequestInit | undefined;
+
+  try {
+    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+      assert.equal(url, "/api/neural-repair?selfTest=1");
+      captured = init;
+      return Response.json({
+        enabled: true,
+        engines: ["clearvoice"],
+        target: "remote",
+        selfTest: { ok: true },
+        exitCode: 0,
+      });
+    }) as typeof fetch;
+
+    const result = await requestNeuralRepairHealth();
+
+    assert.equal(captured?.method, "GET");
+    assert.equal(captured?.cache, "no-store");
+    assert.equal(result.enabled, true);
+    assert.equal(result.target, "remote");
+    assert.equal(result.selfTest?.ok, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("neural repair client turns self-test config failures into stable errors", async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = (async () =>
+      Response.json(
+        {
+          error: "Neural repair self-test unavailable: configure VO_NEURAL_REPAIR_REMOTE_URL.",
+          code: "config",
+        },
+        { status: 503 },
+      )) as typeof fetch;
+
+    await assert.rejects(
+      () => requestNeuralRepairHealth(),
+      (error) => {
+        assert.equal(error instanceof NeuralRepairError, true);
+        assert.equal((error as NeuralRepairError).status, 503);
+        assert.equal((error as NeuralRepairError).code, "config");
+        assert.match((error as Error).message, /VO_NEURAL_REPAIR_REMOTE_URL/i);
         return true;
       },
     );

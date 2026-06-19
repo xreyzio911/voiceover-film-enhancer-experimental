@@ -65,7 +65,12 @@ import type {
   SourceFirstAudioReviewPlan,
 } from "../lib/aiAudioReview";
 import { DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES, buildSourceFirstAudioReviewPlan } from "../lib/aiAudioReview";
-import { requestNeuralRepair } from "../lib/neuralRepairClient";
+import {
+  NeuralRepairError,
+  requestNeuralRepair,
+  requestNeuralRepairHealth,
+  type NeuralRepairHealth,
+} from "../lib/neuralRepairClient";
 import { CLEARVOICE_SE_REQUEST, type NeuralRepairReport } from "../lib/neuralRepairPolicy";
 import {
   NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES,
@@ -605,6 +610,8 @@ export default function VoLeveler() {
     SourceFirstAudioReviewPlan["selectedVariant"] | null
   >(null);
   const sourceFirstPlansByBaseRef = useRef<Map<string, SourceFirstAudioReviewPlan>>(new Map());
+  const neuralRepairHealthPromiseRef = useRef<Promise<NeuralRepairHealth> | null>(null);
+  const neuralRepairHealthLogRef = useRef<string | null>(null);
 
   const [files, setFiles] = useState<File[]>([]);
   const [outputs, setOutputs] = useState<OutputEntry[]>([]);
@@ -1232,6 +1239,68 @@ const summarizeFailureReason = (error: unknown) => {
     aiAdaptiveDirectivesOverrideRef.current = plan?.adaptiveDirectives ?? null;
     sourceFirstCandidateVariantRef.current = plan?.selectedVariant ?? null;
     return plan;
+  };
+
+  const resetNeuralRepairPreflight = () => {
+    neuralRepairHealthPromiseRef.current = null;
+    neuralRepairHealthLogRef.current = null;
+  };
+
+  const logNeuralRepairPreflightOnce = (key: string, message: string) => {
+    if (neuralRepairHealthLogRef.current === key) return;
+    neuralRepairHealthLogRef.current = key;
+    appendLog(message);
+  };
+
+  const neuralRepairErrorMessage = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    return error instanceof NeuralRepairError && error.code ? `${message} [${error.code}]` : message;
+  };
+
+  const ensureNeuralSpeechEnhancementAvailable = async () => {
+    if (!neuralSpeechEnhancementEnabled) return false;
+    if (!neuralRepairHealthPromiseRef.current) {
+      neuralRepairHealthPromiseRef.current = requestNeuralRepairHealth();
+    }
+
+    try {
+      const health = await neuralRepairHealthPromiseRef.current;
+      if (!health.enabled) {
+        logNeuralRepairPreflightOnce(
+          "disabled",
+          "[SpeechEnhancement] Neural backend is disabled on this server; keeping deterministic app output for this run.",
+        );
+        return false;
+      }
+      if (!health.engines.includes(CLEARVOICE_SE_REQUEST.engine)) {
+        logNeuralRepairPreflightOnce(
+          `missing-engine:${health.engines.join(",")}`,
+          `[SpeechEnhancement] Neural backend does not expose ${CLEARVOICE_SE_REQUEST.engine}; keeping deterministic app output for this run.`,
+        );
+        return false;
+      }
+      if (health.selfTest?.ok === false || (health.exitCode !== null && health.exitCode !== 0)) {
+        logNeuralRepairPreflightOnce(
+          `failed:${health.exitCode ?? "self-test"}`,
+          `[SpeechEnhancement] Neural backend self-test failed before batch render; keeping deterministic app output for this run.`,
+        );
+        return false;
+      }
+
+      logNeuralRepairPreflightOnce(
+        `ready:${health.target ?? "server"}`,
+        `[SpeechEnhancement] Neural backend ready (${health.target ?? "server"} target); using cached health check for this run.`,
+      );
+      return true;
+    } catch (error) {
+      logNeuralRepairPreflightOnce(
+        `error:${neuralRepairErrorMessage(error)}`,
+        `[SpeechEnhancement] Neural backend unavailable before batch render; keeping deterministic app output for this run (${neuralRepairErrorMessage(
+          error,
+        )}).`,
+      );
+      return false;
+    }
   };
 
   const getSmartMatchConfigForControls = (controls: AudioReviewControls) =>
@@ -3924,6 +3993,18 @@ const summarizeFailureReason = (error: unknown) => {
         ? context.candidateVariant
         : "continuity-safe";
 
+    if (!(await ensureNeuralSpeechEnhancementAvailable())) {
+      appendLog(
+        `[SpeechEnhancement] ${context.base}: skipped neural pass from cached backend preflight; delivery uses deterministic app output.`,
+      );
+      await activeFfmpeg.writeFile(targetName, inputBytes);
+      return {
+        ffmpeg: activeFfmpeg,
+        applied: false,
+        polishPasses: 0,
+      };
+    }
+
     setStatus(`Neural speech enhancement: ${context.base}`);
     setActiveQueueStage(context.base, "Neural speech enhancement", context.detail);
     appendLog(
@@ -5949,6 +6030,7 @@ const summarizeFailureReason = (error: unknown) => {
     aiAdaptiveDirectivesOverrideRef.current = null;
     sourceFirstCandidateVariantRef.current = null;
     sourceFirstPlansByBaseRef.current = new Map();
+    resetNeuralRepairPreflight();
     setLoading(true);
     setOutputs([]);
     setReviewBundles([]);
@@ -6807,6 +6889,7 @@ const summarizeFailureReason = (error: unknown) => {
       aiAdaptiveDirectivesOverrideRef.current = null;
       sourceFirstCandidateVariantRef.current = null;
       sourceFirstPlansByBaseRef.current = new Map();
+      resetNeuralRepairPreflight();
       setLoading(false);
     }
   };
@@ -7261,7 +7344,7 @@ const summarizeFailureReason = (error: unknown) => {
             <div>
               <strong>Neural speech enhancement</strong>
               <div className={styles.label}>
-                Mandatory restoration pass between adaptive app processing and one subtle final polish.
+                Mandatory VO cleanup pass between adaptive app processing and one subtle final polish.
               </div>
             </div>
             <input

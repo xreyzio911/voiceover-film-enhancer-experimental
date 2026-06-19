@@ -18,6 +18,14 @@ export type NeuralRepairResult = {
   contentType: string;
 };
 
+export type NeuralRepairHealth = {
+  enabled: boolean;
+  engines: string[];
+  target: string | null;
+  selfTest: { ok?: boolean; [key: string]: unknown } | null;
+  exitCode: number | null;
+};
+
 const MIN_WAV_HEADER_BYTES = 44;
 
 const parseReportHeader = (value: string | null): NeuralRepairReport | null => {
@@ -63,6 +71,54 @@ const audioBytesBody = (audio: Uint8Array): ArrayBuffer => {
   const copy = new ArrayBuffer(byteLength);
   new Uint8Array(copy).set(audio);
   return copy;
+};
+
+const stringArray = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+};
+
+export const requestNeuralRepairHealth = async (): Promise<NeuralRepairHealth> => {
+  let response: Response;
+  try {
+    response = await fetch("/api/neural-repair?selfTest=1", {
+      method: "GET",
+      cache: "no-store",
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new NeuralRepairError(
+      `Neural repair self-test could not reach /api/neural-repair (${detail}).`,
+      0,
+      "network",
+    );
+  }
+
+  if (!response.ok) {
+    const error = await responseErrorMessage(response);
+    if (typeof error === "string") {
+      throw new NeuralRepairError(error, response.status);
+    }
+    throw new NeuralRepairError(error.message, response.status, error.code);
+  }
+
+  const payload = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!payload || typeof payload !== "object") {
+    throw new NeuralRepairError("Neural repair self-test returned invalid JSON.", response.status, "invalid-json");
+  }
+
+  const selfTest =
+    payload.selfTest && typeof payload.selfTest === "object"
+      ? (payload.selfTest as { ok?: boolean; [key: string]: unknown })
+      : null;
+
+  return {
+    enabled: payload.enabled === true,
+    engines: stringArray(payload.engines),
+    target: typeof payload.target === "string" ? payload.target : null,
+    selfTest,
+    exitCode: typeof payload.exitCode === "number" ? payload.exitCode : null,
+  };
 };
 
 export const requestNeuralRepair = async (
