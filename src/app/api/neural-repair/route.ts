@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -12,6 +13,7 @@ import {
   type NeuralRepairRequest,
   type NeuralRepairReport,
 } from "@/lib/neuralRepairPolicy";
+import { resolveNeuralRepairWorkerCommand } from "@/lib/neuralRepairRuntime";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -61,32 +63,13 @@ const authorizeRequest = async (request: NextRequest) => {
   return localMode || isAllowedEmail(session?.user?.email);
 };
 
-const splitCommandLine = (command: string) => {
-  const parts: string[] = [];
-  let current = "";
-  let quote: "'" | '"' | null = null;
-  for (let index = 0; index < command.length; index += 1) {
-    const char = command[index];
-    if ((char === "'" || char === '"') && quote === null) {
-      quote = char;
-      continue;
-    }
-    if (quote === char) {
-      quote = null;
-      continue;
-    }
-    if (/\s/.test(char) && quote === null) {
-      if (current) parts.push(current);
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  if (current) parts.push(current);
-  return parts.length > 0 ? parts : ["python"];
-};
-
-const workerCommand = () => splitCommandLine(process.env.VO_NEURAL_REPAIR_COMMAND || "python");
+const workerCommand = () =>
+  resolveNeuralRepairWorkerCommand({
+    commandLine: process.env.VO_NEURAL_REPAIR_COMMAND,
+    cwd: process.cwd(),
+    platform: process.platform,
+    exists: existsSync,
+  });
 
 const enabledEngines = (): NeuralRepairEngine[] =>
   (process.env.VO_NEURAL_REPAIR_ENGINE || "clearvoice")
@@ -172,9 +155,9 @@ const readUploadPayload = async (request: NextRequest): Promise<UploadPayload | 
 };
 
 const runWorker = async (args: string[], timeout: number) => {
-  const [command, ...commandArgs] = workerCommand();
+  const commandConfig = workerCommand();
   return await new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn(command, [...commandArgs, ...args], {
+    const child = spawn(commandConfig.command, [...commandConfig.args, ...args], {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -192,7 +175,14 @@ const runWorker = async (args: string[], timeout: number) => {
     });
     child.on("error", (error) => {
       clearTimeout(timer);
-      reject(error);
+      const nodeError = error as NodeJS.ErrnoException;
+      reject(
+        new Error(
+          nodeError.code === "ENOENT"
+            ? `neural repair worker command not found: ${commandConfig.command}. Set VO_NEURAL_REPAIR_COMMAND to a Python runtime with ClearVoice installed, or provision .venv-neural for this deployment.`
+            : error.message,
+        ),
+      );
     });
     child.on("close", (exitCode) => {
       clearTimeout(timer);
@@ -226,12 +216,20 @@ export async function GET(request: NextRequest) {
 
   const enabled = boolEnv(process.env.VO_NEURAL_REPAIR_ENABLED);
   const engines = enabledEngines();
+  const commandConfig = workerCommand();
   if (request.nextUrl.searchParams.get("selfTest") === "1") {
     try {
       const result = await runWorker([workerPath(), "--self-test"], 30_000);
       const report = parseWorkerReport(result.stdout, result.stderr);
       return NextResponse.json(
-        { enabled, engines, selfTest: report, exitCode: result.exitCode },
+        {
+          enabled,
+          engines,
+          command: commandConfig.command,
+          commandSource: commandConfig.source,
+          selfTest: report,
+          exitCode: result.exitCode,
+        },
         { headers: { "Cache-Control": "no-store" } },
       );
     } catch (error) {
@@ -247,7 +245,8 @@ export async function GET(request: NextRequest) {
     {
       enabled,
       engines,
-      command: workerCommand()[0],
+      command: commandConfig.command,
+      commandSource: commandConfig.source,
       maxAudioBytes: maxAudioBytes(),
       timeoutSeconds: timeoutMs() / 1000,
     },
