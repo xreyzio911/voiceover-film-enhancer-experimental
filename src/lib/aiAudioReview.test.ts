@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST,
   buildAudioReviewControlPatch,
   buildSourceFirstAudioReviewPlan,
   buildAudioReviewUserPrompt,
   buildGeminiAudioReviewRequest,
+  mergeChunkedAudioReviewResults,
   normalizeAudioReviewRequest,
   parseGeminiAudioReviewText,
+  splitAudioReviewPayloadForGemini,
 } from "./aiAudioReview.ts";
 
 const baseControls = {
@@ -128,7 +131,7 @@ test("Gemini request uses Flash-Lite with low thinking and JSON schema output", 
   assert.equal(request.model, "gemini-3.1-flash-lite");
   assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel, "low");
   assert.equal(request.body.generationConfig.responseMimeType, "application/json");
-  assert.equal(request.body.generationConfig.maxOutputTokens, 3600);
+  assert.equal(request.body.generationConfig.maxOutputTokens, 6400);
   assert.equal(request.body.generationConfig.responseSchema.type, "object");
   const schema = request.body.generationConfig.responseSchema as { properties?: Record<string, unknown> };
   assert.ok(schema.properties?.perFileProfiles);
@@ -159,6 +162,150 @@ test("normalizes review payloads and bounds batch size", () => {
   assert.equal(normalized.files[0].fileName, "actor-0.wav");
   assert.deepEqual(normalized.files[0].profile?.toneMatchDeltaDb, [0.4, -0.7, 0, 0.2, -0.9, -0.3, 0, 0.5]);
   assert.equal(normalized.files[0].profile?.sagRecoveryStrength, 0.52);
+});
+
+test("splits 10+ file audio review payloads into bounded Gemini requests", () => {
+  const files = Array.from({ length: 12 }, (_, index) => ({
+    ...reviewPayload.files[0],
+    fileName: `actor-${String(index + 1).padStart(2, "0")}.wav`,
+    base: `actor_${String(index + 1).padStart(2, "0")}`,
+  }));
+  const normalized = normalizeAudioReviewRequest({
+    generatedAt: reviewPayload.generatedAt,
+    controls: baseControls,
+    files,
+  });
+
+  assert.ok(normalized);
+  const chunks = splitAudioReviewPayloadForGemini(normalized);
+
+  assert.equal(AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST, 4);
+  assert.deepEqual(
+    chunks.map((chunk) => chunk.files.length),
+    [4, 4, 4],
+  );
+  assert.equal(chunks[0].files[0].fileName, "actor-01.wav");
+  assert.equal(chunks[2].files[3].fileName, "actor-12.wav");
+  assert.deepEqual(chunks[1].controls, normalized.controls);
+  assert.equal(chunks[2].generatedAt, reviewPayload.generatedAt);
+});
+
+test("merges chunked Gemini review results in original file order with worst verdict", () => {
+  const files = Array.from({ length: 10 }, (_, index) => ({
+    ...reviewPayload.files[0],
+    fileName: `actor-${String(index + 1).padStart(2, "0")}.wav`,
+    base: `actor_${String(index + 1).padStart(2, "0")}`,
+  }));
+  const payload = normalizeAudioReviewRequest({
+    generatedAt: reviewPayload.generatedAt,
+    controls: baseControls,
+    files,
+  });
+
+  assert.ok(payload);
+  const profileFor = (fileIndex: number, confidence: number) => ({
+    fileName: `actor-${String(fileIndex).padStart(2, "0")}.wav`,
+    base: `actor_${String(fileIndex).padStart(2, "0")}`,
+    confidence,
+    summary: `Actor ${fileIndex} reviewed.`,
+    recommendedProfile: {
+      name: "Continuity-Safe Cinematic",
+      selectedVariant: "continuity-safe" as const,
+      smartMatchMode: "Balanced" as const,
+      leveler: "Gentle" as const,
+      breathControl: "Medium" as const,
+      neuralSpeechEnhancement: "mandatory" as const,
+      roomCleanup: true,
+      softenHarshness: true,
+      cinematicColor: true,
+      notes: "Keep correction subtle.",
+    },
+    adaptiveDirectives: {
+      warmthDb: 0,
+      presenceDb: 0,
+      airDb: 0,
+      deHarshDb: 0,
+      sagRecoveryBoost: 0,
+      onsetTameBoost: 0,
+      breathTameBoost: 0,
+      denoiseBias: 0,
+      roomCleanupBias: 0,
+      compressionBias: 0,
+      finalPolishIntensity: 0.5,
+    },
+    profileRationale: [`Actor ${fileIndex} rationale.`],
+    guardrails: [`Actor ${fileIndex} guardrail.`],
+    nextListeningChecks: [`Actor ${fileIndex} check.`],
+  });
+
+  const merged = mergeChunkedAudioReviewResults(
+    [
+      {
+        verdict: "ready",
+        confidence: 0.88,
+        summary: "First chunk ready.",
+        perFileProfiles: [profileFor(1, 0.91), profileFor(2, 0.89), profileFor(3, 0.87), profileFor(4, 0.86)],
+        adjustments: [],
+        findings: [],
+        profileRationale: ["First chunk rationale."],
+        guardrails: ["First chunk guardrail."],
+        nextListeningChecks: ["First chunk check."],
+      },
+      {
+        verdict: "risky",
+        confidence: 0.72,
+        summary: "Last chunk risky.",
+        perFileProfiles: [profileFor(9, 0.71), profileFor(10, 0.69)],
+        adjustments: [],
+        findings: [
+          {
+            fileName: "actor-10.wav",
+            issue: "Echo risk",
+            severity: "high",
+            evidence: "echoScore 0.48",
+            action: "Use room cleanup and verify tail",
+          },
+        ],
+        profileRationale: ["Last chunk rationale."],
+        guardrails: ["Last chunk guardrail."],
+        nextListeningChecks: ["Last chunk check."],
+      },
+      {
+        verdict: "adjust",
+        confidence: 0.8,
+        summary: "Middle chunk adjust.",
+        perFileProfiles: [profileFor(5, 0.85), profileFor(6, 0.83), profileFor(7, 0.81), profileFor(8, 0.79)],
+        adjustments: [
+          {
+            control: "Room cleanup",
+            recommendation: "Keep enabled",
+            why: "Medium room risk",
+            risk: "Low",
+          },
+        ],
+        findings: [],
+        profileRationale: ["Middle chunk rationale."],
+        guardrails: ["Middle chunk guardrail."],
+        nextListeningChecks: ["Middle chunk check."],
+      },
+    ],
+    payload,
+  );
+
+  assert.equal(merged.verdict, "risky");
+  assert.equal(merged.confidence, 0.8);
+  assert.deepEqual(
+    merged.perFileProfiles.map((profile) => profile.fileName),
+    files.map((file) => file.fileName),
+  );
+  assert.equal(merged.adjustments.length, 1);
+  assert.equal(merged.findings.length, 1);
+  assert.match(merged.summary, /10 file/);
+  assert.deepEqual(merged.profileRationale, [
+    "First chunk rationale.",
+    "Last chunk rationale.",
+    "Middle chunk rationale.",
+  ]);
 });
 
 test("parses Gemini JSON review and clamps unsafe confidence values", () => {
@@ -249,6 +396,66 @@ test("parses Gemini JSON review and clamps unsafe confidence values", () => {
   });
   assert.equal(parsed.adjustments.length, 1);
   assert.equal(parsed.findings[0].severity, "high");
+});
+
+test("parses Gemini review with a missing comma between adjacent array strings", () => {
+  const parsed = parseGeminiAudioReviewText(`
+    {
+      "verdict": "adjust",
+      "confidence": 0.82,
+      "summary": "Use continuity-safe processing.",
+      "perFileProfiles": [
+        {
+          "fileName": "actor-a.wav",
+          "base": "actor_a",
+          "confidence": 0.82,
+          "summary": "Actor A needs source-first continuity protection.",
+          "recommendedProfile": {
+            "name": "Continuity-Safe Cinematic",
+            "selectedVariant": "continuity-safe",
+            "smartMatchMode": "Balanced",
+            "leveler": "Gentle",
+            "breathControl": "Medium",
+            "neuralSpeechEnhancement": "mandatory",
+            "roomCleanup": true,
+            "softenHarshness": true,
+            "cinematicColor": true,
+            "notes": "Keep the app-side correction subtle."
+          },
+          "adaptiveDirectives": {
+            "warmthDb": 0.2,
+            "presenceDb": -0.1,
+            "airDb": 0,
+            "deHarshDb": 0.25,
+            "sagRecoveryBoost": 0.3,
+            "onsetTameBoost": 0.1,
+            "breathTameBoost": 0.15,
+            "denoiseBias": 0.1,
+            "roomCleanupBias": 0.2,
+            "compressionBias": -0.15,
+            "finalPolishIntensity": 0.7
+          },
+          "profileRationale": [
+            "midLineSagScore 0.52 needs continuity-safe recovery"
+            "preserveEndings is already active so keep tail protection"
+          ],
+          "guardrails": ["Reject if sentence endings dull."],
+          "nextListeningChecks": ["Listen for the final word tail."]
+        }
+      ],
+      "adjustments": [],
+      "findings": [],
+      "profileRationale": ["Source metrics show line-continuity risk."],
+      "guardrails": ["Render once and verify endings."],
+      "nextListeningChecks": ["Check the final word tail."]
+    }
+  `);
+
+  assert.deepEqual(parsed.perFileProfiles[0].profileRationale, [
+    "midLineSagScore 0.52 needs continuity-safe recovery",
+    "preserveEndings is already active so keep tail protection",
+  ]);
+  assert.equal(parsed.perFileProfiles[0].recommendedProfile.selectedVariant, "continuity-safe");
 });
 
 test("builds a bounded automatic control patch from Gemini profile recommendations", () => {

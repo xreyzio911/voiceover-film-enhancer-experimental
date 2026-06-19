@@ -1,10 +1,13 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { getServerAuthSession } from "@/auth";
 import {
+  AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST,
   DEFAULT_GEMINI_AUDIO_REVIEW_MODEL,
   buildGeminiAudioReviewRequest,
+  mergeChunkedAudioReviewResults,
   normalizeAudioReviewRequest,
   parseGeminiAudioReviewText,
+  splitAudioReviewPayloadForGemini,
 } from "@/lib/aiAudioReview";
 import { isAllowedEmail } from "@/lib/authAllowlist";
 import { isLocalHost } from "@/lib/isLocalHost";
@@ -86,6 +89,55 @@ const providerErrorMessage = async (response: Response) => {
   }
 };
 
+class GeminiProviderError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "GeminiProviderError";
+    this.status = status;
+  }
+}
+
+const requestGeminiAudioReviewChunk = async ({
+  apiKey,
+  modelPath,
+  requestBody,
+  signal,
+}: {
+  apiKey: string;
+  modelPath: string;
+  requestBody: ReturnType<typeof buildGeminiAudioReviewRequest>["body"];
+  signal: AbortSignal;
+}) => {
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelPath)}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify(requestBody),
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    throw new GeminiProviderError(
+      await providerErrorMessage(response),
+      response.status >= 500 ? 502 : response.status,
+    );
+  }
+
+  const responseJson = (await response.json()) as unknown;
+  const text = extractGeminiText(responseJson);
+  if (!text) {
+    throw new Error("Gemini review returned an empty response.");
+  }
+  return parseGeminiAudioReviewText(text);
+};
+
 export async function POST(request: NextRequest) {
   if (!(await authorizeRequest(request))) {
     return jsonError("Unauthorized", 401, "auth");
@@ -112,36 +164,24 @@ export async function POST(request: NextRequest) {
   }
 
   const model = reviewModel();
-  const geminiRequest = buildGeminiAudioReviewRequest(payload, model);
+  const payloadChunks = splitAudioReviewPayloadForGemini(payload);
+  const geminiRequests = payloadChunks.map((chunk) => buildGeminiAudioReviewRequest(chunk, model));
   const modelPath = model.startsWith("models/") ? model.slice("models/".length) : model;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs());
 
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelPath)}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": apiKey,
-        },
-        body: JSON.stringify(geminiRequest.body),
-        signal: controller.signal,
-      },
+    const chunkReviews = await Promise.all(
+      geminiRequests.map((geminiRequest) =>
+        requestGeminiAudioReviewChunk({
+          apiKey,
+          modelPath,
+          requestBody: geminiRequest.body,
+          signal: controller.signal,
+        }),
+      ),
     );
-
-    if (!response.ok) {
-      return jsonError(await providerErrorMessage(response), response.status >= 500 ? 502 : response.status, "provider");
-    }
-
-    const responseJson = (await response.json()) as unknown;
-    const text = extractGeminiText(responseJson);
-    if (!text) {
-      return jsonError("Gemini review returned an empty response.", 502, "provider");
-    }
-
-    const review = parseGeminiAudioReviewText(text);
+    const review = mergeChunkedAudioReviewResults(chunkReviews, payload);
     const reviewedKeys = new Set(
       review.perFileProfiles.flatMap((file) => [file.base, file.fileName].filter(Boolean)),
     );
@@ -159,7 +199,11 @@ export async function POST(request: NextRequest) {
       );
     }
     return NextResponse.json(
-      { model: geminiRequest.model, review },
+      {
+        model,
+        review,
+        reviewBatch: { filesPerRequest: AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST, requests: geminiRequests.length },
+      },
       { headers: { "Cache-Control": "no-store" } },
     );
   } catch (error) {
@@ -167,7 +211,7 @@ export async function POST(request: NextRequest) {
       error instanceof Error && error.name === "AbortError"
         ? "Gemini review timed out."
         : `Gemini review failed: ${error instanceof Error ? error.message : String(error)}`;
-    return jsonError(message, 502, "provider");
+    return jsonError(message, error instanceof GeminiProviderError ? error.status : 502, "provider");
   } finally {
     clearTimeout(timer);
   }

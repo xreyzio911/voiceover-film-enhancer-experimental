@@ -1,5 +1,6 @@
 export const DEFAULT_GEMINI_AUDIO_REVIEW_MODEL = "gemini-3.1-flash-lite";
 export const MAX_AUDIO_REVIEW_FILES = 12;
+export const AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST = 4;
 
 export type AudioReviewControls = {
   loudnessTarget: string;
@@ -159,6 +160,8 @@ export type AudioReviewResult = {
   guardrails: string[];
   nextListeningChecks: string[];
 };
+
+type AudioReviewVerdict = AudioReviewResult["verdict"];
 
 export type AudioReviewControlPatch = Partial<
   Pick<
@@ -422,6 +425,19 @@ const finiteNumberArray = (value: unknown, maxItems = 16) => {
   return normalized.length > 0 ? normalized : null;
 };
 
+const uniqueStrings = (values: string[], maxItems = 8) => {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
+  for (const value of values) {
+    const cleaned = cleanString(value, "", 180);
+    if (!cleaned || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    deduped.push(cleaned);
+    if (deduped.length >= maxItems) break;
+  }
+  return deduped;
+};
+
 export const DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES: AudioReviewAdaptiveDirectives = {
   warmthDb: 0,
   presenceDb: 0,
@@ -602,6 +618,25 @@ export const normalizeAudioReviewRequest = (value: unknown): AudioReviewRequestP
   };
 };
 
+export const splitAudioReviewPayloadForGemini = (
+  payload: AudioReviewRequestPayload,
+): AudioReviewRequestPayload[] => {
+  const normalized = normalizeAudioReviewRequest(payload);
+  if (!normalized) {
+    throw new Error("Invalid audio review payload.");
+  }
+
+  const chunks: AudioReviewRequestPayload[] = [];
+  for (let index = 0; index < normalized.files.length; index += AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST) {
+    chunks.push({
+      generatedAt: normalized.generatedAt,
+      controls: normalized.controls,
+      files: normalized.files.slice(index, index + AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST),
+    });
+  }
+  return chunks;
+};
+
 export const buildAudioReviewUserPrompt = (payload: AudioReviewRequestPayload) => {
   const normalized = normalizeAudioReviewRequest(payload);
   if (!normalized) {
@@ -650,7 +685,7 @@ export const buildGeminiAudioReviewRequest = (
       },
       responseMimeType: "application/json",
       responseSchema: AUDIO_REVIEW_RESPONSE_SCHEMA,
-      maxOutputTokens: 3600,
+      maxOutputTokens: 6400,
     },
   },
 });
@@ -665,6 +700,32 @@ const extractJsonText = (text: string) => {
     return trimmed.slice(objectStart, objectEnd + 1);
   }
   return trimmed;
+};
+
+const repairCommonGeminiJsonText = (jsonText: string) =>
+  jsonText
+    .replace(/,\s*([}\]])/g, "$1")
+    .replace(/"\s*[\r\n]+\s*"/g, "\",\n\"")
+    .replace(/}\s*[\r\n]+\s*{/g, "},\n{")
+    .replace(/]\s*[\r\n]+\s*"/g, "],\n\"")
+    .replace(/}\s*[\r\n]+\s*"/g, "},\n\"")
+    .replace(/(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*[\r\n]+\s*"/g, "$1,\n\"");
+
+const parseGeminiJsonObject = (text: string) => {
+  const jsonText = extractJsonText(text);
+  try {
+    return JSON.parse(jsonText) as unknown;
+  } catch (firstError) {
+    const repairedText = repairCommonGeminiJsonText(jsonText);
+    if (repairedText !== jsonText) {
+      try {
+        return JSON.parse(repairedText) as unknown;
+      } catch {
+        // Keep the first parser location because it points at the provider's original response.
+      }
+    }
+    throw firstError;
+  }
 };
 
 const stringArray = (value: unknown, maxItems = 8, maxLength = 180) =>
@@ -758,8 +819,65 @@ const normalizeRecommendedProfile = (value: unknown): AudioReviewRecommendedProf
   };
 };
 
+const verdictRank: Record<AudioReviewVerdict, number> = {
+  ready: 0,
+  adjust: 1,
+  risky: 2,
+};
+
+const worstVerdict = (results: AudioReviewResult[]): AudioReviewVerdict =>
+  results.reduce<AudioReviewVerdict>(
+    (worst, result) => (verdictRank[result.verdict] > verdictRank[worst] ? result.verdict : worst),
+    "ready",
+  );
+
+export const mergeChunkedAudioReviewResults = (
+  results: AudioReviewResult[],
+  payload: AudioReviewRequestPayload,
+): AudioReviewResult => {
+  const normalized = normalizeAudioReviewRequest(payload);
+  if (!normalized) {
+    throw new Error("Invalid audio review payload.");
+  }
+  if (results.length === 0) {
+    throw new Error("No Gemini audio review results to merge.");
+  }
+
+  const profilesByKey = new Map<string, AudioReviewPerFileProfile>();
+  for (const result of results) {
+    for (const profile of result.perFileProfiles) {
+      if (profile.base) profilesByKey.set(profile.base, profile);
+      if (profile.fileName) profilesByKey.set(profile.fileName, profile);
+    }
+  }
+
+  const perFileProfiles = normalized.files
+    .map((file) => profilesByKey.get(file.base) ?? profilesByKey.get(file.fileName) ?? null)
+    .filter((profile): profile is AudioReviewPerFileProfile => profile !== null)
+    .slice(0, MAX_AUDIO_REVIEW_FILES);
+  const averageConfidence =
+    results.reduce((sum, result) => sum + result.confidence, 0) / Math.max(1, results.length);
+
+  return {
+    verdict: worstVerdict(results),
+    confidence: clamp(Math.round(averageConfidence * 1000) / 1000, 0, 1),
+    summary:
+      results.length === 1
+        ? results[0].summary
+        : `Gemini reviewed ${perFileProfiles.length} file${perFileProfiles.length === 1 ? "" : "s"} across ${
+            results.length
+          } bounded batch request${results.length === 1 ? "" : "s"}. Worst verdict: ${worstVerdict(results)}.`,
+    perFileProfiles,
+    adjustments: results.flatMap((result) => result.adjustments).slice(0, 12),
+    findings: results.flatMap((result) => result.findings).slice(0, 16),
+    profileRationale: uniqueStrings(results.flatMap((result) => result.profileRationale)),
+    guardrails: uniqueStrings(results.flatMap((result) => result.guardrails)),
+    nextListeningChecks: uniqueStrings(results.flatMap((result) => result.nextListeningChecks)),
+  };
+};
+
 export const parseGeminiAudioReviewText = (text: string): AudioReviewResult => {
-  const parsed = JSON.parse(extractJsonText(text)) as unknown;
+  const parsed = parseGeminiJsonObject(text);
   if (!isRecord(parsed)) {
     throw new Error("Gemini review response was not an object.");
   }

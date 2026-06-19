@@ -66,7 +66,12 @@ import type {
 } from "../lib/aiAudioReview";
 import { DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES, buildSourceFirstAudioReviewPlan } from "../lib/aiAudioReview";
 import { requestNeuralRepair } from "../lib/neuralRepairClient";
-import { CLEARVOICE_SE_REQUEST } from "../lib/neuralRepairPolicy";
+import { CLEARVOICE_SE_REQUEST, type NeuralRepairReport } from "../lib/neuralRepairPolicy";
+import {
+  NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES,
+  planNeuralRepairTransport,
+  type NeuralRepairTransportPlan,
+} from "../lib/neuralRepairChunkPolicy";
 import {
   buildEchoRoomCleanupDecision,
   deriveEarlyEchoCancelStrength,
@@ -3910,6 +3915,7 @@ const summarizeFailureReason = (error: unknown) => {
     const finalPolishProfile = buildFinalPolishProfile(profile, directives);
     const inputBytes = await readVirtualFileBytes(activeFfmpeg, targetName);
     const inputByteLength = assertUsableWavBytes(inputBytes, "App output before neural speech enhancement");
+    const inputDurationSeconds = await probeInputDurationSeconds(activeFfmpeg, targetName).catch(() => null);
     const tempBase = targetName.replace(/\.wav$/i, "");
     const enhancementName = `${tempBase}_speech_enhancement_tmp.wav`;
     const appPassName = `${tempBase}_final_polish_tmp.wav`;
@@ -3926,11 +3932,156 @@ const summarizeFailureReason = (error: unknown) => {
       )}).`,
     );
 
-    try {
-      await safeDeleteFile(activeFfmpeg, enhancementName);
+    type NeuralRepairPassResult = {
+      repairedBytes: Uint8Array;
+      repairedByteLength: number;
+      report: NeuralRepairReport | null;
+    };
+
+    const runDirectNeuralRepair = async (): Promise<NeuralRepairPassResult> => {
       const result = await requestNeuralRepair(inputBytes, CLEARVOICE_SE_REQUEST, targetName);
       const repairedBytes = await normalizeAudioBytes(result.bytes, "Neural speech enhancement");
       const repairedByteLength = assertUsableWavBytes(repairedBytes, "Neural speech enhancement");
+      return { repairedBytes, repairedByteLength, report: result.report };
+    };
+
+    const runChunkedNeuralRepair = async (plan: NeuralRepairTransportPlan): Promise<NeuralRepairPassResult> => {
+      const chunkInputNames: string[] = [];
+      const chunkOutputNames: string[] = [];
+      appendLog(
+        `[SpeechEnhancement] ${context.base}: using Vercel-safe chunked neural transport (${plan.chunks.length} chunks, max ${formatBytes(
+          NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES,
+        )} per request).`,
+      );
+
+      try {
+        for (const chunk of plan.chunks) {
+          const partLabel = `${chunk.index + 1}/${chunk.total}`;
+          const chunkInputName = `${tempBase}_neural_chunk_${String(chunk.index + 1).padStart(3, "0")}_input.wav`;
+          const chunkOutputName = `${tempBase}_neural_chunk_${String(chunk.index + 1).padStart(3, "0")}_enhanced.wav`;
+          const isLast = chunk.index === chunk.total - 1;
+          const span = isLast
+            ? chunk.durationSec
+            : Math.min(chunk.durationSec + CHUNK_CROSSFADE_SECONDS, plan.durationSeconds - chunk.startSec);
+          chunkInputNames.push(chunkInputName);
+          chunkOutputNames.push(chunkOutputName);
+
+          await safeDeleteFile(activeFfmpeg, chunkInputName);
+          await safeDeleteFile(activeFfmpeg, chunkOutputName);
+          resetLogBuffer();
+          await execOrThrow(
+            activeFfmpeg,
+            [
+              "-hide_banner",
+              "-nostdin",
+              "-threads",
+              "1",
+              "-filter_threads",
+              "1",
+              "-y",
+              "-ss",
+              chunk.startSec.toFixed(3),
+              "-t",
+              span.toFixed(3),
+              "-i",
+              targetName,
+              "-ar",
+              "48000",
+              "-ac",
+              "1",
+              "-c:a",
+              "pcm_f32le",
+              chunkInputName,
+            ],
+            `Neural speech enhancement chunk extract ${partLabel}`,
+          );
+
+          const chunkBytes = await readVirtualFileBytes(activeFfmpeg, chunkInputName);
+          const chunkByteLength = assertUsableWavBytes(
+            chunkBytes,
+            `Neural speech enhancement chunk ${partLabel}`,
+          );
+          if (chunkByteLength > NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES) {
+            throw new Error(
+              `Neural speech enhancement chunk ${partLabel} is ${formatBytes(
+                chunkByteLength,
+              )}, above the Vercel-safe request budget ${formatBytes(NEURAL_REPAIR_SAFE_FUNCTION_BODY_BYTES)}.`,
+            );
+          }
+
+          setActiveQueueStage(
+            context.base,
+            "Neural speech enhancement",
+            `${context.detail}, chunk ${partLabel}`,
+          );
+          appendLog(
+            `[SpeechEnhancement] ${context.base}: neural chunk ${partLabel} (${formatBytes(
+              chunkByteLength,
+            )}, ${chunk.durationSec.toFixed(1)}s).`,
+          );
+          const result = await requestNeuralRepair(chunkBytes, CLEARVOICE_SE_REQUEST, chunkInputName);
+          const chunkRepairedBytes = await normalizeAudioBytes(
+            result.bytes,
+            `Neural speech enhancement chunk ${partLabel}`,
+          );
+          const chunkRepairedByteLength = assertUsableWavBytes(
+            chunkRepairedBytes,
+            `Neural speech enhancement chunk ${partLabel}`,
+          );
+          await activeFfmpeg.writeFile(chunkOutputName, chunkRepairedBytes);
+          appendLog(
+            `[SpeechEnhancement] ${context.base}: neural chunk ${partLabel} complete (${formatBytes(
+              chunkRepairedByteLength,
+            )}).`,
+          );
+        }
+
+        await safeDeleteFile(activeFfmpeg, enhancementName);
+        await runCrossfadeConcat(
+          activeFfmpeg,
+          chunkOutputNames,
+          enhancementName,
+          CHUNK_CROSSFADE_SECONDS,
+          "Neural speech enhancement chunk concat",
+        );
+        const repairedBytes = await readVirtualFileBytes(activeFfmpeg, enhancementName);
+        const repairedByteLength = assertUsableWavBytes(
+          repairedBytes,
+          "Chunked neural speech enhancement",
+        );
+        const report: NeuralRepairReport = {
+          engine: CLEARVOICE_SE_REQUEST.engine,
+          mode: CLEARVOICE_SE_REQUEST.mode,
+          model: CLEARVOICE_SE_REQUEST.model,
+          durationSeconds: plan.durationSeconds,
+          outputBytes: repairedByteLength,
+          chunksTotal: plan.chunks.length,
+          chunksProcessed: plan.chunks.length,
+          warnings: ["Used Vercel-safe chunked neural repair transport."],
+        };
+        return {
+          repairedBytes,
+          repairedByteLength,
+          report,
+        };
+      } finally {
+        for (const name of [...chunkInputNames, ...chunkOutputNames]) {
+          await safeDeleteFile(activeFfmpeg, name);
+        }
+      }
+    };
+
+    try {
+      await safeDeleteFile(activeFfmpeg, enhancementName);
+      const transportPlan = planNeuralRepairTransport({
+        inputBytes: inputByteLength,
+        durationSeconds: inputDurationSeconds,
+      });
+      const result =
+        transportPlan.strategy === "chunked"
+          ? await runChunkedNeuralRepair(transportPlan)
+          : await runDirectNeuralRepair();
+      const { repairedBytes, repairedByteLength } = result;
       if (
         typeof result.report?.outputBytes === "number" &&
         result.report.outputBytes > 44 &&
