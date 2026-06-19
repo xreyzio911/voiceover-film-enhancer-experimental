@@ -775,8 +775,10 @@ export const analyzeFrameAudio = (
     speechRun = 0;
   }
   const reverbScore = clamp(tailEventScores.length > 0 ? mean(tailEventScores) : 0, 0, 1);
+  const echoCorrelationScore = clamp((bestCorr - 0.22) / 0.22, 0, 1);
+  const echoTailSupport = clamp(0.18 + clamp((reverbScore - 0.1) / 0.3, 0, 1) * 0.82, 0.18, 1);
   const echoScore = clamp(
-    reverbScore * 0.72 + clamp((bestCorr - 0.22) / 0.22, 0, 1) * 0.28,
+    reverbScore * 0.72 + echoCorrelationScore * 0.28 * echoTailSupport,
     0,
     1
   );
@@ -857,7 +859,7 @@ export const analyzeFrameAudio = (
     reverbScore,
     echoScore,
     roomScore,
-    echoDelayMs: bestEchoLagFrames > 0 ? bestEchoLagFrames * frameMs : null,
+    echoDelayMs: echoScore >= 0.18 && bestEchoLagFrames > 0 ? bestEchoLagFrames * frameMs : null,
     analysisConfidence,
     drynessScore,
     overallRisk,

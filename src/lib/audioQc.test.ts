@@ -153,6 +153,37 @@ test("pause-noise scoring rises when long silences stay lifted", () => {
   assert.ok(noisyPauses.pauseNoiseRisk > quietPauses.pauseNoiseRisk + 0.3);
 });
 
+test("echo scoring does not treat clean rhythmic speech correlation as room echo", () => {
+  const rhythmicSpeech: Section[] = [];
+  for (let index = 0; index < 50; index += 1) {
+    rhythmicSpeech.push({ frames: 4, fromDb: -30 }, { frames: 4, fromDb: -78 });
+  }
+
+  const metrics = analyzeSections(rhythmicSpeech);
+
+  assert.ok(metrics.reverbScore < 0.05);
+  assert.ok(metrics.echoScore < 0.08);
+  assert.equal(metrics.echoDelayMs, null);
+});
+
+test("echo scoring still flags real room tails with supported short-lag correlation", () => {
+  const roomy = analyzeSections([
+    { frames: 120, fromDb: -78 },
+    { frames: 120, fromDb: -30 },
+    { frames: 18, fromDb: -35, toDb: -42 },
+    { frames: 22, fromDb: -42, toDb: -48 },
+    { frames: 70, fromDb: -78 },
+    { frames: 110, fromDb: -30 },
+    { frames: 18, fromDb: -35, toDb: -42 },
+    { frames: 22, fromDb: -42, toDb: -48 },
+    { frames: 80, fromDb: -78 },
+  ]);
+
+  assert.ok(roomy.reverbScore > 0.35);
+  assert.ok(roomy.echoScore >= 0.38);
+  assert.notEqual(roomy.echoDelayMs, null);
+});
+
 test("breath-spike scoring rises for isolated inhale bursts before speech", () => {
   const protectedTail = analyzeSections([
     { frames: 120, fromDb: -75 },

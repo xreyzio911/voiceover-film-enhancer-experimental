@@ -1,0 +1,474 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  buildAudioReviewControlPatch,
+  buildSourceFirstAudioReviewPlan,
+  buildAudioReviewUserPrompt,
+  buildGeminiAudioReviewRequest,
+  normalizeAudioReviewRequest,
+  parseGeminiAudioReviewText,
+} from "./aiAudioReview.ts";
+
+const baseControls = {
+  loudnessTarget: "Mix-ready only (no loudness normalize)",
+  smartMatchMode: "Balanced",
+  leveler: "Balanced",
+  breathControl: "Medium",
+  eqCleanup: true,
+  roomCleanup: true,
+  sceneBlend: false,
+  softenHarshness: true,
+  noiseGuard: true,
+  floorGuard: true,
+  cinematicColor: true,
+  gainPlannerEnabled: true,
+  neuralSpeechEnhancementEnabled: true,
+};
+
+const reviewPayload = {
+  generatedAt: "2026-06-19T00:00:00.000Z",
+  controls: baseControls,
+  files: [
+    {
+      fileName: "actor-a.wav",
+      base: "actor_a",
+      durationSeconds: 42.5,
+      source: {
+        instabilityScore: 0.28,
+        lineSwingScore: 0.61,
+        sentenceJumpScore: 0.37,
+        midLineSagScore: 0.52,
+        endFadeRiskScore: 0.18,
+        onsetOvershootScore: 0.24,
+        breathSpikeRisk: 0.31,
+        sibilanceScore: 0.72,
+        compressionScore: 0.34,
+        clickScore: 0.06,
+        pauseNoiseRisk: 0.22,
+        echoScore: 0.18,
+        roomScore: 0.2,
+        noiseFloorDb: -68,
+        noiseContrastDb: 26,
+        dynamicRangeDb: 13.4,
+        speechDutyCyclePct: 48,
+        speechSegmentCount: 12,
+      },
+      profile: {
+        highpassHz: 78,
+        lowMidGainDb: -1.2,
+        presenceGainDb: -0.4,
+        airGainDb: -0.25,
+        emotionalHarshnessCutDb: 0.9,
+        topEndHarshnessCutDb: 0.68,
+        levelingNeed: 0.36,
+        emotionProtection: 0.22,
+        toneMatchDeltaDb: [0.4, -0.7, 0, 0.2, -0.9, -0.3, 0, 0.5],
+        noiseRisk: "low",
+        roomRisk: "low",
+        lineContinuityRisk: 0.54,
+        preserveEndings: true,
+        preferSinglePassContinuity: true,
+        useSpeechAlignedSegmentation: false,
+        useSpeechPauseSegmentation: false,
+        useDenoise: false,
+        denoiseStrength: 0.08,
+        sibilanceScore: 0.72,
+        onsetTameStrength: 0.2,
+        sagRecoveryStrength: 0.52,
+        breathTameStrength: 0.35,
+        echoNotchCutDb: 0.45,
+        useTailGate: false,
+        cinematicColorEnabled: true,
+      },
+      selectedCandidate: {
+        variant: "continuity-safe",
+        reason: "line continuity risk",
+        processingFlow: "app-neural-speech-enhancement-app",
+        score: {
+          stability: 0.22,
+          pause: 0.08,
+          compression: 0.2,
+          echo: 0.05,
+          total: 229,
+        },
+      },
+    },
+  ],
+};
+
+test("audio review prompt teaches Gemini the app pipeline and failure priorities", () => {
+  const prompt = buildAudioReviewUserPrompt(reviewPayload);
+
+  assert.match(prompt, /source-first/i);
+  assert.match(prompt, /before rendering/i);
+  assert.match(prompt, /per-audio AI review -> per-file adaptive profile -> app pass -> neural speech enhancement -> final app touch/i);
+  assert.match(prompt, /neural speech enhancement is mandatory/i);
+  assert.match(prompt, /fixed and black-box/i);
+  assert.match(prompt, /Do not claim you can tune neural model, strength, denoise amount/i);
+  assert.match(prompt, /app-side pre\/post controls/i);
+  assert.match(prompt, /one perFileProfiles item per input file/i);
+  assert.match(prompt, /adaptiveDirectives/i);
+  assert.match(prompt, /Detail rules/i);
+  assert.match(prompt, /source metrics or profile fields/i);
+  assert.match(prompt, /audible\/QC result/i);
+  assert.match(prompt, /speech-aware gain planner/i);
+  assert.match(prompt, /one preferred render variant/i);
+  assert.match(prompt, /mid-sentence shallow-volume/i);
+  assert.match(prompt, /harshness/i);
+  assert.match(prompt, /house tone/i);
+  assert.match(prompt, /toneMatchDeltaDb/i);
+  assert.match(prompt, /sagRecoveryStrength/i);
+  assert.match(prompt, /actor-a\.wav/);
+  assert.match(prompt, /continuity-safe/);
+});
+
+test("Gemini request uses Flash-Lite with low thinking and JSON schema output", () => {
+  const request = buildGeminiAudioReviewRequest(reviewPayload);
+
+  assert.equal(request.model, "gemini-3.1-flash-lite");
+  assert.equal(request.body.generationConfig.thinkingConfig.thinkingLevel, "low");
+  assert.equal(request.body.generationConfig.responseMimeType, "application/json");
+  assert.equal(request.body.generationConfig.maxOutputTokens, 3600);
+  assert.equal(request.body.generationConfig.responseSchema.type, "object");
+  const schema = request.body.generationConfig.responseSchema as { properties?: Record<string, unknown> };
+  assert.ok(schema.properties?.perFileProfiles);
+  assert.match(request.body.systemInstruction.parts[0].text, /VO mastering/i);
+  assert.match(request.body.systemInstruction.parts[0].text, /fixed black-box pass/i);
+  assert.match(request.body.systemInstruction.parts[0].text, /never write guardrails that imply changing neural enhancement internals/i);
+});
+
+test("normalizes review payloads and bounds batch size", () => {
+  const files = Array.from({ length: 16 }, (_, index) => ({
+    ...reviewPayload.files[0],
+    fileName: `actor-${index}.wav`,
+    source: {
+      ...reviewPayload.files[0].source,
+      lineSwingScore: Number.NaN,
+    },
+  }));
+
+  const normalized = normalizeAudioReviewRequest({
+    generatedAt: reviewPayload.generatedAt,
+    controls: baseControls,
+    files,
+  });
+
+  assert.ok(normalized);
+  assert.equal(normalized.files.length, 12);
+  assert.equal(normalized.files[0].source.lineSwingScore, null);
+  assert.equal(normalized.files[0].fileName, "actor-0.wav");
+  assert.deepEqual(normalized.files[0].profile?.toneMatchDeltaDb, [0.4, -0.7, 0, 0.2, -0.9, -0.3, 0, 0.5]);
+  assert.equal(normalized.files[0].profile?.sagRecoveryStrength, 0.52);
+});
+
+test("parses Gemini JSON review and clamps unsafe confidence values", () => {
+  const parsed = parseGeminiAudioReviewText(`
+    {
+      "verdict": "adjust",
+      "confidence": 1.7,
+      "summary": "Continuity-safe profile is preferred.",
+      "perFileProfiles": [
+        {
+          "fileName": "actor-a.wav",
+          "base": "actor_a",
+          "confidence": 1.4,
+          "summary": "Actor A needs continuity-safe polish.",
+          "recommendedProfile": {
+            "name": "Continuity-Safe Cinematic",
+            "selectedVariant": "continuity-safe",
+            "smartMatchMode": "Balanced",
+            "leveler": "Balanced",
+            "breathControl": "Medium",
+            "neuralSpeechEnhancement": "off",
+            "roomCleanup": true,
+            "softenHarshness": true,
+            "cinematicColor": true,
+            "notes": "Keep changes subtle."
+          },
+          "adaptiveDirectives": {
+            "warmthDb": 1.9,
+            "presenceDb": -1.6,
+            "airDb": -1.4,
+            "deHarshDb": 1.8,
+            "sagRecoveryBoost": 1.2,
+            "onsetTameBoost": -0.5,
+            "breathTameBoost": 0.7,
+            "denoiseBias": 0.8,
+            "roomCleanupBias": 1.4,
+            "compressionBias": -1.5,
+            "finalPolishIntensity": 1.3
+          },
+          "profileRationale": ["Line continuity dominates."],
+          "guardrails": ["Reject if harshness increases."],
+          "nextListeningChecks": ["Listen for shallow mid-sentence dips."]
+        }
+      ],
+      "adjustments": [
+        {
+          "control": "Soften harshness",
+          "recommendation": "Keep enabled",
+          "why": "High sibilance score",
+          "risk": "Low"
+        }
+      ],
+      "findings": [
+        {
+          "fileName": "actor-a.wav",
+          "issue": "Mid-line sag",
+          "severity": "high",
+          "evidence": "midLineSagScore 0.52",
+          "action": "Use continuity-safe candidate"
+        }
+      ],
+      "profileRationale": ["Line continuity dominates."],
+      "guardrails": ["Reject if harshness increases."],
+      "nextListeningChecks": ["Listen for shallow mid-sentence dips."]
+    }
+  `);
+
+  assert.equal(parsed.verdict, "adjust");
+  assert.equal(parsed.confidence, 1);
+  assert.equal(parsed.perFileProfiles.length, 1);
+  assert.equal(parsed.perFileProfiles[0].fileName, "actor-a.wav");
+  assert.equal(parsed.perFileProfiles[0].base, "actor_a");
+  assert.equal(parsed.perFileProfiles[0].confidence, 1);
+  assert.equal(parsed.perFileProfiles[0].recommendedProfile.selectedVariant, "continuity-safe");
+  assert.equal(parsed.perFileProfiles[0].recommendedProfile.neuralSpeechEnhancement, "mandatory");
+  assert.deepEqual(parsed.perFileProfiles[0].adaptiveDirectives, {
+    warmthDb: 1.2,
+    presenceDb: -1.2,
+    airDb: -0.9,
+    deHarshDb: 1.2,
+    sagRecoveryBoost: 0.45,
+    onsetTameBoost: -0.1,
+    breathTameBoost: 0.45,
+    denoiseBias: 0.45,
+    roomCleanupBias: 0.45,
+    compressionBias: -0.45,
+    finalPolishIntensity: 1,
+  });
+  assert.equal(parsed.adjustments.length, 1);
+  assert.equal(parsed.findings[0].severity, "high");
+});
+
+test("builds a bounded automatic control patch from Gemini profile recommendations", () => {
+  const review = parseGeminiAudioReviewText(`
+    {
+      "verdict": "adjust",
+      "confidence": 0.84,
+      "summary": "Use a safer profile.",
+      "perFileProfiles": [
+        {
+          "fileName": "actor-a.wav",
+          "base": "actor_a",
+          "confidence": 0.84,
+          "summary": "Use a safer profile.",
+          "recommendedProfile": {
+            "name": "Continuity-Safe Cinematic",
+            "selectedVariant": "continuity-safe",
+            "smartMatchMode": "Balanced",
+            "leveler": "Gentle",
+            "breathControl": "Light",
+            "neuralSpeechEnhancement": "off",
+            "roomCleanup": true,
+            "softenHarshness": true,
+            "cinematicColor": true,
+            "notes": "Subtle correction only."
+          },
+          "adaptiveDirectives": {
+            "warmthDb": 0,
+            "presenceDb": 0,
+            "airDb": 0,
+            "deHarshDb": 0,
+            "sagRecoveryBoost": 0,
+            "onsetTameBoost": 0,
+            "breathTameBoost": 0,
+            "denoiseBias": 0,
+            "roomCleanupBias": 0,
+            "compressionBias": 0,
+            "finalPolishIntensity": 0.5
+          },
+          "profileRationale": ["Line continuity risk is high."],
+          "guardrails": ["Rerun once only."],
+          "nextListeningChecks": ["Listen for sag recovery."]
+        }
+      ],
+      "adjustments": [],
+      "findings": [],
+      "profileRationale": ["Line continuity risk is high."],
+      "guardrails": ["Rerun once only."],
+      "nextListeningChecks": ["Listen for sag recovery."]
+    }
+  `);
+
+  const patch = buildAudioReviewControlPatch(review.perFileProfiles[0].recommendedProfile, {
+    ...baseControls,
+    smartMatchMode: "Gentle",
+    leveler: "Firm",
+    breathControl: "Medium",
+    neuralSpeechEnhancementEnabled: false,
+    roomCleanup: false,
+    softenHarshness: false,
+    cinematicColor: false,
+  });
+
+  assert.deepEqual(patch.controls, {
+    smartMatchMode: "Balanced",
+    leveler: "Gentle",
+    breathControl: "Light",
+    neuralSpeechEnhancementEnabled: true,
+    roomCleanup: true,
+    softenHarshness: true,
+    cinematicColor: true,
+  });
+  assert.deepEqual(patch.changedKeys, [
+    "smartMatchMode",
+    "leveler",
+    "breathControl",
+    "neuralSpeechEnhancementEnabled",
+    "roomCleanup",
+    "softenHarshness",
+    "cinematicColor",
+  ]);
+  assert.match(patch.summary, /7 control/);
+});
+
+test("builds separate source-first render plans from per-file Gemini recommendations", () => {
+  const review = parseGeminiAudioReviewText(`
+    {
+      "verdict": "adjust",
+      "confidence": 0.91,
+      "summary": "Review source first and render once per audio.",
+      "perFileProfiles": [
+        {
+          "fileName": "actor-a.wav",
+          "base": "actor_a",
+          "confidence": 0.91,
+          "summary": "Pause noise dominates actor A.",
+          "recommendedProfile": {
+            "name": "Source-First Pause Safe",
+            "selectedVariant": "pause-safe",
+            "smartMatchMode": "Balanced",
+            "leveler": "Gentle",
+            "breathControl": "Light",
+            "neuralSpeechEnhancement": "off",
+            "roomCleanup": false,
+            "softenHarshness": true,
+            "cinematicColor": true,
+            "notes": "No rerender loop."
+          },
+          "adaptiveDirectives": {
+            "warmthDb": 0.4,
+            "presenceDb": -0.3,
+            "airDb": -0.2,
+            "deHarshDb": 0.35,
+            "sagRecoveryBoost": 0.25,
+            "onsetTameBoost": 0.15,
+            "breathTameBoost": 0.2,
+            "denoiseBias": 0.1,
+            "roomCleanupBias": 0.2,
+            "compressionBias": -0.2,
+            "finalPolishIntensity": 0.85
+          },
+          "profileRationale": ["Pause noise dominates the source."],
+          "guardrails": ["Render the selected variant once."],
+          "nextListeningChecks": ["Check room bed between lines."]
+        },
+        {
+          "fileName": "actor-b.wav",
+          "base": "actor_b",
+          "confidence": 0.78,
+          "summary": "Actor B needs continuity and warmth.",
+          "recommendedProfile": {
+            "name": "Source-First Continuity Warm",
+            "selectedVariant": "continuity-safe",
+            "smartMatchMode": "Gentle",
+            "leveler": "Firm",
+            "breathControl": "Medium",
+            "neuralSpeechEnhancement": "mandatory",
+            "roomCleanup": true,
+            "softenHarshness": false,
+            "cinematicColor": true,
+            "notes": "Different file, different profile."
+          },
+          "adaptiveDirectives": {
+            "warmthDb": 0.7,
+            "presenceDb": 0.1,
+            "airDb": 0.3,
+            "deHarshDb": 0.1,
+            "sagRecoveryBoost": 0.35,
+            "onsetTameBoost": 0.05,
+            "breathTameBoost": 0.1,
+            "denoiseBias": 0,
+            "roomCleanupBias": 0.3,
+            "compressionBias": 0.12,
+            "finalPolishIntensity": 0.6
+          },
+          "profileRationale": ["Line continuity dominates."],
+          "guardrails": ["Keep warmth subtle."],
+          "nextListeningChecks": ["Check mid-sentence body."]
+        }
+      ],
+      "adjustments": [],
+      "findings": [],
+      "profileRationale": ["Pause noise dominates the source."],
+      "guardrails": ["Render the selected variant once."],
+      "nextListeningChecks": ["Check room bed between lines."]
+    }
+  `);
+
+  const plan = buildSourceFirstAudioReviewPlan(review.perFileProfiles[0], {
+    ...baseControls,
+    smartMatchMode: "Gentle",
+    leveler: "Firm",
+    breathControl: "Medium",
+    neuralSpeechEnhancementEnabled: true,
+    roomCleanup: true,
+    softenHarshness: false,
+    cinematicColor: false,
+  });
+
+  const secondPlan = buildSourceFirstAudioReviewPlan(review.perFileProfiles[1], baseControls);
+
+  assert.equal(plan.selectedVariant, "pause-safe");
+  assert.equal(plan.fileName, "actor-a.wav");
+  assert.equal(plan.base, "actor_a");
+  assert.deepEqual(plan.controls, {
+    ...baseControls,
+    smartMatchMode: "Balanced",
+    leveler: "Gentle",
+    breathControl: "Light",
+    neuralSpeechEnhancementEnabled: true,
+    roomCleanup: false,
+    softenHarshness: true,
+    cinematicColor: true,
+  });
+  assert.deepEqual(plan.changedKeys, [
+    "smartMatchMode",
+    "leveler",
+    "breathControl",
+    "roomCleanup",
+    "softenHarshness",
+    "cinematicColor",
+  ]);
+  assert.deepEqual(plan.adaptiveDirectives, {
+    warmthDb: 0.4,
+    presenceDb: -0.3,
+    airDb: -0.2,
+    deHarshDb: 0.35,
+    sagRecoveryBoost: 0.25,
+    onsetTameBoost: 0.15,
+    breathTameBoost: 0.2,
+    denoiseBias: 0.1,
+    roomCleanupBias: 0.2,
+    compressionBias: -0.2,
+    finalPolishIntensity: 0.85,
+  });
+  assert.match(plan.summary, /source-first/i);
+  assert.equal(secondPlan.selectedVariant, "continuity-safe");
+  assert.equal(secondPlan.fileName, "actor-b.wav");
+  assert.equal(secondPlan.base, "actor_b");
+  assert.equal(secondPlan.adaptiveDirectives.warmthDb, 0.7);
+  assert.equal(secondPlan.adaptiveDirectives.finalPolishIntensity, 0.6);
+  assert.notDeepEqual(secondPlan.adaptiveDirectives, plan.adaptiveDirectives);
+});

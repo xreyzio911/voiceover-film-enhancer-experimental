@@ -3,7 +3,7 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 import JSZip from "jszip";
-import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { analyzeFloatSamples, buildSpeechMask, type AudioQcMetrics } from "../lib/audioQc";
 import {
   applyGainCurveToSamples,
@@ -54,6 +54,24 @@ import {
   planLongFormChunks,
   shouldUseLongFormSafeMode,
 } from "../lib/longFormExportPolicy";
+import type {
+  AudioReviewControls,
+  AudioReviewAdaptiveDirectives,
+  AudioReviewFileInput,
+  AudioReviewMetricSnapshot,
+  AudioReviewProfileSnapshot,
+  AudioReviewResult,
+  AudioReviewSelectedCandidate,
+  SourceFirstAudioReviewPlan,
+} from "../lib/aiAudioReview";
+import { DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES, buildSourceFirstAudioReviewPlan } from "../lib/aiAudioReview";
+import { requestNeuralRepair } from "../lib/neuralRepairClient";
+import { CLEARVOICE_SE_REQUEST } from "../lib/neuralRepairPolicy";
+import {
+  buildEchoRoomCleanupDecision,
+  deriveEarlyEchoCancelStrength,
+  type RoomCleanupRisk,
+} from "../lib/roomCleanupPolicy";
 import styles from "./VoLeveler.module.css";
 
 const LOUDNESS_PRESETS = {
@@ -191,16 +209,39 @@ const GAIN_PLANNER_FRAME_MS = 10;
  * emitting planner-off legacy output.
  */
 const GAIN_PLANNER_MAX_DURATION_SECONDS = 4800; // 80 minutes — fine at 16 kHz mono
+const NEURAL_SPEECH_ENHANCEMENT_ENABLED_BY_DEFAULT =
+  true;
 const sanitizeBase = (name: string) =>
   name.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9-_]+/g, "_");
 
-const formatBytes = (bytes: number) => {
+const formatBytes = (bytes: number | null | undefined) => {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "unknown size";
   if (bytes === 0) return "0 B";
   const k = 1024;
   const sizes = ["B", "KB", "MB", "GB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 };
+
+const normalizeAudioBytes = async (value: unknown, label: string) => {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (typeof Blob !== "undefined" && value instanceof Blob) {
+    return new Uint8Array(await value.arrayBuffer());
+  }
+  throw new Error(`${label} returned unsupported audio bytes.`);
+};
+
+const assertUsableWavBytes = (bytes: Uint8Array, label: string) => {
+  const byteLength = bytes.byteLength;
+  if (!Number.isFinite(byteLength) || byteLength <= 44) {
+    throw new Error(`${label} returned invalid audio (${formatBytes(byteLength)}).`);
+  }
+  return byteLength;
+};
+
+const enhancedOutputName = (name: string) =>
+  /\.wav$/i.test(name) ? name.replace(/\.wav$/i, "_enhanced.wav") : `${name}_enhanced.wav`;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const toOddInt = (value: number, min: number, max: number) => {
@@ -297,6 +338,7 @@ type OutputEntry = {
   size: number;
   kind: "mixready" | "loudness";
   variant: "clean" | "blend";
+  processingFlow: "app" | "app-neural-speech-enhancement-app";
 };
 
 type ReviewBundleAsset = {
@@ -398,7 +440,7 @@ type BatchReference = {
 };
 
 type NoiseRisk = "low" | "medium" | "high";
-type RoomRisk = "low" | "medium" | "high";
+type RoomRisk = RoomCleanupRisk;
 
 type AdaptiveProfile = {
   highpassHz: number;
@@ -432,6 +474,12 @@ type AdaptiveProfile = {
   useTailGate: boolean;
   tailGateStrength: number;
   echoNotchCutDb: number;
+  echoDominantRoom: boolean;
+  severeEchoRoom: boolean;
+  allowDereverbDuringEndingProtection: boolean;
+  allowTailGateDuringEndingProtection: boolean;
+  echoDelayMs: number | null;
+  earlyEchoCancelStrength: number;
   echoScore: number;
   instabilityScore: number;
   clickScore: number;
@@ -544,6 +592,14 @@ export default function VoLeveler() {
   const activeQueueBaseRef = useRef<string | null>(null);
   const activeQueueStageRef = useRef<string>("Queued");
   const activeQueueProgressRef = useRef<number>(-1);
+  const aiReviewCloseRef = useRef<HTMLButtonElement | null>(null);
+  const aiReviewTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const processingControlsOverrideRef = useRef<AudioReviewControls | null>(null);
+  const aiAdaptiveDirectivesOverrideRef = useRef<AudioReviewAdaptiveDirectives | null>(null);
+  const sourceFirstCandidateVariantRef = useRef<
+    SourceFirstAudioReviewPlan["selectedVariant"] | null
+  >(null);
+  const sourceFirstPlansByBaseRef = useRef<Map<string, SourceFirstAudioReviewPlan>>(new Map());
 
   const [files, setFiles] = useState<File[]>([]);
   const [outputs, setOutputs] = useState<OutputEntry[]>([]);
@@ -561,20 +617,27 @@ export default function VoLeveler() {
   const [showFailureWarning, setShowFailureWarning] = useState(false);
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [reviewBundles, setReviewBundles] = useState<ReviewBundleEntry[]>([]);
+  const [aiReviewFiles, setAiReviewFiles] = useState<AudioReviewFileInput[]>([]);
+  const [aiReviewOpen, setAiReviewOpen] = useState(false);
+  const [aiReviewBusy, setAiReviewBusy] = useState(false);
+  const [aiReviewError, setAiReviewError] = useState<string | null>(null);
+  const [aiReviewResult, setAiReviewResult] = useState<AudioReviewResult | null>(null);
+  const [aiReviewModel, setAiReviewModel] = useState<string | null>(null);
+  const [aiAutoPilotEnabled, setAiAutoPilotEnabled] = useState(true);
+  const [aiAutoPilotStatus, setAiAutoPilotStatus] = useState<string | null>(null);
   const [learnedReviewWeights, setLearnedReviewWeights] =
     useState<LearnedReviewWeights>(DEFAULT_LEARNED_REVIEW_WEIGHTS);
   const [learnedReviewWeightsSource, setLearnedReviewWeightsSource] =
     useState<"default" | "local-import">("default");
 
   const [loudnessTarget, setLoudnessTarget] = useState<keyof typeof LOUDNESS_PRESETS>(
-    "ATSC A/85 (-24 LKFS, -2 dBTP)"
+    "Mix-ready only (no loudness normalize)"
   );
-  // Default off — users mostly want the final broadcast-loudness export, not
-  // the intermediate mix-ready bounce. Flip on per-session if you need it.
+  // Only applies when a loudness-normalized export is selected; mix-ready mode always emits the mix-ready file.
   const [keepMixReady, setKeepMixReady] = useState(false);
-  const [smartMatchMode, setSmartMatchMode] = useState<keyof typeof SMART_MATCH_PRESETS>("Gentle");
+  const [smartMatchMode, setSmartMatchMode] = useState<keyof typeof SMART_MATCH_PRESETS>("Balanced");
   const [eqCleanup, setEqCleanup] = useState(true);
-  const [breathControl, setBreathControl] = useState<keyof typeof BREATH_COMPAND>("Light");
+  const [breathControl, setBreathControl] = useState<keyof typeof BREATH_COMPAND>("Medium");
   const [leveler, setLeveler] = useState<keyof typeof LEVELER_PRESETS>("Balanced");
   const [roomCleanup, setRoomCleanup] = useState(true);
   const [sceneBlend, setSceneBlend] = useState(false);
@@ -583,10 +646,44 @@ export default function VoLeveler() {
   const [floorGuard, setFloorGuard] = useState(true);
   const [cinematicColor, setCinematicColor] = useState(true);
   const [gainPlannerEnabled, setGainPlannerEnabled] = useState(true);
+  const [neuralSpeechEnhancementEnabled, setNeuralSpeechEnhancementEnabled] = useState(
+    NEURAL_SPEECH_ENHANCEMENT_ENABLED_BY_DEFAULT,
+  );
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const loudnessConfig = useMemo(() => LOUDNESS_PRESETS[loudnessTarget], [loudnessTarget]);
   const smartMatchConfig = useMemo(() => SMART_MATCH_PRESETS[smartMatchMode], [smartMatchMode]);
+  const audioReviewControls = useMemo<AudioReviewControls>(
+    () => ({
+      loudnessTarget,
+      smartMatchMode,
+      leveler,
+      breathControl,
+      eqCleanup,
+      roomCleanup,
+      sceneBlend,
+      softenHarshness,
+      noiseGuard,
+      floorGuard,
+      cinematicColor,
+      gainPlannerEnabled,
+      neuralSpeechEnhancementEnabled: true,
+    }),
+    [
+      loudnessTarget,
+      smartMatchMode,
+      leveler,
+      breathControl,
+      eqCleanup,
+      roomCleanup,
+      sceneBlend,
+      softenHarshness,
+      noiseGuard,
+      floorGuard,
+      cinematicColor,
+      gainPlannerEnabled,
+    ],
+  );
 
   useEffect(() => {
     return () => {
@@ -601,6 +698,23 @@ export default function VoLeveler() {
       ffmpegAssetUrlsRef.current = null;
     };
   }, []);
+
+  const closeAiReview = useCallback(() => {
+    setAiReviewOpen(false);
+    window.requestAnimationFrame(() => aiReviewTriggerRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!aiReviewOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeAiReview();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.requestAnimationFrame(() => aiReviewCloseRef.current?.focus());
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [aiReviewOpen, closeAiReview]);
 
   const appendLog = (message: string) => {
     setLogs((prev) => [...prev.slice(-300), message]);
@@ -1079,6 +1193,197 @@ const summarizeFailureReason = (error: unknown) => {
     });
   };
 
+  const reviewNumber = (value: number | null | undefined) =>
+    typeof value === "number" && Number.isFinite(value) ? Math.round(value * 1000) / 1000 : null;
+
+  const reviewNumberArray = (values: number[] | null | undefined, maxItems = 8) =>
+    Array.isArray(values)
+      ? values
+          .slice(0, maxItems)
+          .map(reviewNumber)
+          .filter((value): value is number => value !== null)
+      : null;
+
+  const isSmartMatchMode = (value: unknown): value is keyof typeof SMART_MATCH_PRESETS =>
+    typeof value === "string" && value in SMART_MATCH_PRESETS;
+
+  const isLevelerPreset = (value: unknown): value is keyof typeof LEVELER_PRESETS =>
+    typeof value === "string" && value in LEVELER_PRESETS;
+
+  const isBreathControl = (value: unknown): value is keyof typeof BREATH_COMPAND =>
+    typeof value === "string" && value in BREATH_COMPAND;
+
+  const getActiveAudioReviewControls = () => processingControlsOverrideRef.current ?? audioReviewControls;
+
+  const getActiveAudioReviewAdaptiveDirectives = () =>
+    aiAdaptiveDirectivesOverrideRef.current ?? DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES;
+
+  const getSourceFirstPlanForJob = (job: JobEntry) =>
+    sourceFirstPlansByBaseRef.current.get(job.base) ?? sourceFirstPlansByBaseRef.current.get(job.file.name) ?? null;
+
+  const activateSourceFirstPlanForJob = (job: JobEntry) => {
+    const plan = getSourceFirstPlanForJob(job);
+    processingControlsOverrideRef.current = plan?.controls ?? null;
+    aiAdaptiveDirectivesOverrideRef.current = plan?.adaptiveDirectives ?? null;
+    sourceFirstCandidateVariantRef.current = plan?.selectedVariant ?? null;
+    return plan;
+  };
+
+  const getSmartMatchConfigForControls = (controls: AudioReviewControls) =>
+    isSmartMatchMode(controls.smartMatchMode) ? SMART_MATCH_PRESETS[controls.smartMatchMode] : smartMatchConfig;
+
+  const getLevelerForControls = (controls: AudioReviewControls): keyof typeof LEVELER_PRESETS =>
+    isLevelerPreset(controls.leveler) ? controls.leveler : leveler;
+
+  const getBreathControlForControls = (controls: AudioReviewControls): keyof typeof BREATH_COMPAND =>
+    isBreathControl(controls.breathControl) ? controls.breathControl : breathControl;
+
+  const toAudioReviewMetricSnapshot = (analysis: FileAnalysis | null | undefined): AudioReviewMetricSnapshot => ({
+    instabilityScore: reviewNumber(analysis?.instabilityScore),
+    lineSwingScore: reviewNumber(analysis?.lineSwingScore),
+    sentenceJumpScore: reviewNumber(analysis?.sentenceJumpScore),
+    midLineSagScore: reviewNumber(analysis?.midLineSagScore),
+    endFadeRiskScore: reviewNumber(analysis?.endFadeRiskScore),
+    onsetOvershootScore: reviewNumber(analysis?.onsetOvershootScore),
+    breathSpikeRisk: reviewNumber(analysis?.breathSpikeRisk),
+    pauseNoiseRisk: reviewNumber(analysis?.pauseNoiseRisk),
+    compressionScore: reviewNumber(analysis?.compressionScore),
+    clickScore: reviewNumber(analysis?.clickScore),
+    echoScore: reviewNumber(analysis?.echoScore),
+    roomScore: reviewNumber(analysis?.roomScore),
+    sibilanceScore: reviewNumber(analysis?.sibilanceScore),
+    noiseFloorDb: reviewNumber(analysis?.noiseFloorDb),
+    noiseContrastDb: reviewNumber(analysis?.noiseContrastDb),
+    dynamicRangeDb: reviewNumber(analysis?.dynamicRangeDb),
+    speechDutyCyclePct: reviewNumber(analysis?.speechDutyCyclePct),
+    speechSegmentCount: reviewNumber(analysis?.speechSegmentCount),
+  });
+
+  const toAudioReviewProfileSnapshot = (profile: AdaptiveProfile | null): AudioReviewProfileSnapshot | null => {
+    if (!profile) return null;
+    return {
+      highpassHz: reviewNumber(profile.highpassHz),
+      lowMidGainDb: reviewNumber(profile.lowMidGainDb),
+      presenceGainDb: reviewNumber(profile.presenceGainDb),
+      airGainDb: reviewNumber(profile.airGainDb),
+      emotionalHarshnessCutDb: reviewNumber(profile.emotionalHarshnessCutDb),
+      topEndHarshnessCutDb: reviewNumber(profile.topEndHarshnessCutDb),
+      levelingNeed: reviewNumber(profile.levelingNeed),
+      emotionProtection: reviewNumber(profile.emotionProtection),
+      toneMatchDeltaDb: reviewNumberArray(profile.toneMatchDeltaDb, 8),
+      noiseRisk: profile.noiseRisk,
+      roomRisk: profile.roomRisk,
+      lineContinuityRisk: reviewNumber(profile.lineContinuityRisk),
+      preserveEndings: profile.preserveEndings,
+      preferSinglePassContinuity: profile.preferSinglePassContinuity,
+      useSpeechAlignedSegmentation: profile.useSpeechAlignedSegmentation,
+      useSpeechPauseSegmentation: profile.useSpeechPauseSegmentation,
+      useDenoise: profile.useDenoise,
+      denoiseStrength: reviewNumber(profile.denoiseStrength),
+      sibilanceScore: reviewNumber(profile.sibilanceScore),
+      onsetTameStrength: reviewNumber(profile.onsetTameStrength),
+      sagRecoveryStrength: reviewNumber(profile.sagRecoveryStrength),
+      breathTameStrength: reviewNumber(profile.breathTameStrength),
+      echoNotchCutDb: reviewNumber(profile.echoNotchCutDb),
+      useTailGate: profile.useTailGate,
+      cinematicColorEnabled: profile.cinematicColorEnabled,
+    };
+  };
+
+  const buildAudioReviewFileInput = (
+    job: JobEntry,
+    analysis: FileAnalysis | null | undefined,
+    profile: AdaptiveProfile | null,
+    durationSeconds: number | null,
+    selectedCandidate: AudioReviewSelectedCandidate | null,
+  ): AudioReviewFileInput => ({
+    fileName: job.file.name,
+    base: job.base,
+    durationSeconds: reviewNumber(durationSeconds ?? estimateAudioSeconds(job.file)),
+    source: toAudioReviewMetricSnapshot(analysis),
+    profile: toAudioReviewProfileSnapshot(profile),
+    selectedCandidate,
+  });
+
+  const applyAiReviewProfiles = (
+    review: AudioReviewResult,
+    source: "manual" | "source-auto",
+    options: { activateCurrentRun?: boolean } = {},
+  ) => {
+    const plans = new Map<string, SourceFirstAudioReviewPlan>();
+    for (const fileReview of review.perFileProfiles) {
+      const plan = buildSourceFirstAudioReviewPlan(fileReview, audioReviewControls);
+      plans.set(fileReview.base, plan);
+      plans.set(fileReview.fileName, plan);
+    }
+
+    if (options.activateCurrentRun) {
+      sourceFirstPlansByBaseRef.current = plans;
+    }
+
+    const label = source === "source-auto" ? "AI Auto Pilot" : "AI review";
+    const statusText = `${label} selected ${review.perFileProfiles.length} per-audio source-first profile${
+      review.perFileProfiles.length === 1 ? "" : "s"
+    }.`;
+    setAiAutoPilotStatus(statusText);
+    appendLog(`[AIReview] ${statusText}`);
+    return plans;
+  };
+
+  const runAiAudioReview = async (
+    reviewFiles: AudioReviewFileInput[],
+    options: { autoApply?: boolean; activateCurrentRun?: boolean; source?: "manual" | "source-auto" } = {},
+  ) => {
+    if (aiReviewBusy || reviewFiles.length === 0) return null;
+    setAiReviewBusy(true);
+    setAiReviewError(null);
+    setAiAutoPilotStatus(
+      options.source === "source-auto" ? "AI Auto Pilot is reviewing source audio before rendering..." : null,
+    );
+    try {
+      const response = await fetch("/api/audio-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          generatedAt: new Date().toISOString(),
+          controls: audioReviewControls,
+          files: reviewFiles,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as {
+        error?: string;
+        model?: string;
+        review?: AudioReviewResult;
+      } | null;
+      if (!response.ok || !payload?.review) {
+        throw new Error(payload?.error || `AI review failed (HTTP ${response.status}).`);
+      }
+      setAiReviewResult(payload.review);
+      setAiReviewModel(payload.model ?? null);
+      appendLog(
+        `[AIReview] ${payload.model ?? "Gemini"}: ${payload.review.verdict} (${Math.round(
+          payload.review.confidence * 100,
+        )}% confidence).`,
+      );
+      const plans = options.autoApply
+        ? applyAiReviewProfiles(payload.review, options.source ?? "manual", {
+            activateCurrentRun: options.activateCurrentRun,
+          })
+        : null;
+      return { review: payload.review, model: payload.model ?? null, plans };
+    } catch (error) {
+      setAiReviewError(error instanceof Error ? error.message : String(error));
+      setAiAutoPilotStatus(
+        options.source === "source-auto"
+          ? "AI Auto Pilot source review failed; using current deterministic profile."
+          : null,
+      );
+      return null;
+    } finally {
+      setAiReviewBusy(false);
+    }
+  };
+
   /**
    * A completed gain plan. Holds the gain curve + enough metadata to emit a
    * `sendcmd` script over any time window (full file or per-segment). The
@@ -1127,7 +1432,7 @@ const summarizeFailureReason = (error: unknown) => {
     analysis: FileAnalysis | undefined,
     durationSeconds: number | null,
   ): Promise<PlannedGain | null> => {
-    if (!gainPlannerEnabled) return null;
+    if (!getActiveAudioReviewControls().gainPlannerEnabled) return null;
     if (durationSeconds !== null && durationSeconds > GAIN_PLANNER_MAX_DURATION_SECONDS) {
       throw new Error(
         `duration ${durationSeconds.toFixed(0)}s exceeds planner budget ${GAIN_PLANNER_MAX_DURATION_SECONDS}s`,
@@ -2019,10 +2324,29 @@ const summarizeFailureReason = (error: unknown) => {
     return aggregated;
   };
 
+  type AnalysisOptions = {
+    maxDistributedWindows?: number;
+    limitReason?: string;
+  };
+
+  function limitAnalysisWindows<T>(windows: T[], maxDistributedWindows?: number): T[] {
+    if (!maxDistributedWindows || maxDistributedWindows <= 0 || windows.length <= maxDistributedWindows) {
+      return windows;
+    }
+    if (maxDistributedWindows === 1) return [windows[Math.floor(windows.length / 2)]];
+    const selected: T[] = [];
+    const last = windows.length - 1;
+    for (let index = 0; index < maxDistributedWindows; index += 1) {
+      selected.push(windows[Math.round((index / (maxDistributedWindows - 1)) * last)]);
+    }
+    return selected;
+  }
+
   const analyzeFile = async (
     ffmpeg: FFmpeg,
     inputName: string,
-    recoveryInputNames: string[] = []
+    recoveryInputNames: string[] = [],
+    options: AnalysisOptions = {},
   ): Promise<AnalysisResult> => {
     let durationSeconds: number | null = null;
     const recoveryInputs = Array.from(new Set([inputName, ...recoveryInputNames]));
@@ -2155,19 +2479,22 @@ const summarizeFailureReason = (error: unknown) => {
         distributedWindowSec,
         distributedWindowCount
       );
+      const analysisWindows = limitAnalysisWindows(windows, options.maxDistributedWindows);
       appendLog(
         `[Analysis] ${sanitizeBase(inputName)}: distributed coverage on (speech-duty ${speechStats.speechDutyCyclePct.toFixed(
           1
-        )}%, median-run ${(speechStats.medianSpeechRunMs / 1000).toFixed(1)}s, windows ${windows.length}${
+        )}%, median-run ${(speechStats.medianSpeechRunMs / 1000).toFixed(1)}s, windows ${analysisWindows.length}${
+          analysisWindows.length < windows.length ? `/${windows.length}` : ""
+        }${
           speechStats.longSparseModeEligible ? ", sparse-mode" : ""
-        }).`
+        }${options.limitReason ? `, ${options.limitReason}` : ""}).`
       );
 
       const windowAnalyses: Array<{ analysis: FileAnalysis; weight: number }> = [];
       let windowRetryCount = 0;
       let windowDropCount = 0;
-      baseAnalysis.analysisWindowsAttempted = windows.length;
-      for (const window of windows) {
+      baseAnalysis.analysisWindowsAttempted = analysisWindows.length;
+      for (const window of analysisWindows) {
         let windowCompleted = false;
         for (let attempt = 0; attempt < 2 && !windowCompleted; attempt += 1) {
           try {
@@ -2286,12 +2613,18 @@ const summarizeFailureReason = (error: unknown) => {
     (noiseRisk === "high" && ((noiseFloorDb ?? -70) > -62 || pauseNoiseRisk >= 0.18));
 
   const buildAdaptiveProfile = (analysis: FileAnalysis | undefined, reference: BatchReference | null) => {
+    const controls = getActiveAudioReviewControls();
+    const directives = getActiveAudioReviewAdaptiveDirectives();
+    const activeSmartMatchConfig = getSmartMatchConfigForControls(controls);
     const needsAdaptiveProfile =
-      smartMatchConfig.tone > 0 || smartMatchConfig.dynamics > 0 || roomCleanup || sceneBlend;
+      activeSmartMatchConfig.tone > 0 ||
+      activeSmartMatchConfig.dynamics > 0 ||
+      controls.roomCleanup ||
+      controls.sceneBlend;
     if (!needsAdaptiveProfile || !analysis) return null;
 
-    const smartToneEnabled = smartMatchConfig.tone > 0;
-    const smartDynamicsEnabled = smartMatchConfig.dynamics > 0;
+    const smartToneEnabled = activeSmartMatchConfig.tone > 0;
+    const smartDynamicsEnabled = activeSmartMatchConfig.dynamics > 0;
 
     const referenceLowTilt = reference?.lowTilt ?? -11;
     const referenceHighTilt = reference?.highTilt ?? -13;
@@ -2308,19 +2641,27 @@ const summarizeFailureReason = (error: unknown) => {
     const lowTiltDiff = lowTilt - referenceLowTilt;
     const highTiltDiff = highTilt - referenceHighTilt;
 
-    const toneFactor = smartToneEnabled ? smartMatchConfig.tone : 0;
-    const dynamicsFactor = smartDynamicsEnabled ? smartMatchConfig.dynamics : 0;
+    const toneFactor = smartToneEnabled ? activeSmartMatchConfig.tone : 0;
+    const dynamicsFactor = smartDynamicsEnabled ? activeSmartMatchConfig.dynamics : 0;
 
-    const highpassHz = Math.round(clamp(80 + lowTiltDiff * 2.2 * toneFactor, 65, 105));
-    const lowMidGainDb = clamp(-2 - lowTiltDiff * 0.28 * toneFactor, -3.6, 1.2);
+    let highpassHz = Math.round(clamp(80 + lowTiltDiff * 2.2 * toneFactor, 65, 105));
+    const lowMidGainDb = clamp(-2 - lowTiltDiff * 0.28 * toneFactor + directives.warmthDb, -3.8, 1.3);
 
-    let presenceGainDb = clamp(-highTiltDiff * 0.45 * toneFactor, -2.2, 1.8);
-    let airGainDb = clamp(-highTiltDiff * 0.25 * toneFactor, -1.4, 1.0);
+    let presenceGainDb = clamp(-highTiltDiff * 0.45 * toneFactor + directives.presenceDb, -2.4, 1.8);
+    let airGainDb = clamp(-highTiltDiff * 0.25 * toneFactor + directives.airDb, -1.8, 1.0);
 
     const lra = analysis.inputLRA ?? referenceLra;
     const lraDiff = lra - referenceLra;
-    const compressorRatioOffset = clamp(lraDiff * 0.07 * dynamicsFactor, -0.35, 0.45);
-    const compressorThresholdOffsetDb = clamp(lraDiff * 0.6 * dynamicsFactor, -1.5, 1.5);
+    const compressorRatioOffset = clamp(
+      lraDiff * 0.07 * dynamicsFactor + directives.compressionBias * 0.16,
+      -0.4,
+      0.45,
+    );
+    const compressorThresholdOffsetDb = clamp(
+      lraDiff * 0.6 * dynamicsFactor + directives.compressionBias * 0.5,
+      -1.5,
+      1.5,
+    );
 
     const measuredNoiseFloor = Math.max(analysis.noiseFloorDb ?? -70, analysis.nearSpeechNoiseFloorDb ?? -90);
     const measuredSpeechThreshold =
@@ -2354,11 +2695,11 @@ const summarizeFailureReason = (error: unknown) => {
       1
     );
     const emotionalHarshnessCutDb = clamp(
-      (hotPeakFactor * 0.95 + brightFactor * 0.7) * toneFactor,
+      (hotPeakFactor * 0.95 + brightFactor * 0.7) * toneFactor + directives.deHarshDb,
       0,
-      1.6
+      2
     );
-    const topEndHarshnessCutDb = clamp(emotionalHarshnessCutDb * 0.75, 0, 1.2);
+    const topEndHarshnessCutDb = clamp(emotionalHarshnessCutDb * 0.75 + directives.deHarshDb * 0.3, 0, 1.5);
 
     const analysisConfidence = analysis.analysisConfidence ?? 0.25;
     const rawRoomScore = analysis.roomScore ?? 0;
@@ -2377,7 +2718,7 @@ const summarizeFailureReason = (error: unknown) => {
 
     const echoScore = analysis.echoScore ?? 0;
     const roomCleanupEnabled =
-      roomCleanup && (analysisConfidence >= 0.4 || echoScore >= 0.58 || roomRisk !== "low");
+      controls.roomCleanup && (analysisConfidence >= 0.4 || echoScore >= 0.58 || roomRisk !== "low");
     const instabilityScore = clamp(analysis.instabilityScore ?? 0, 0, 1);
     const clickScore = clamp(analysis.clickScore ?? 0, 0, 1);
     const lineSwingScore = clamp(analysis.lineSwingScore ?? 0, 0, 1);
@@ -2410,6 +2751,7 @@ const summarizeFailureReason = (error: unknown) => {
       1
     );
     const preserveEndings =
+      endFadeRiskScore >= 0.38 ||
       (noiseRisk === "low" &&
         (endFadeRiskScore >= 0.45 || instabilityScore >= 0.62 || lineSwingScore >= 0.42)) ||
       (midLineSagScore >= 0.52 && echoScore < 0.9);
@@ -2421,16 +2763,22 @@ const summarizeFailureReason = (error: unknown) => {
         lineSwingScore >= 0.55 ||
         !!analysis.longSparseModeEligible);
     const onsetTameStrength = clamp(
-      Math.max(onsetOvershootScore, breathSpikeRisk * 0.85) * (noiseRisk === "low" ? 1 : 0.72),
+      Math.max(onsetOvershootScore, breathSpikeRisk * 0.85) * (noiseRisk === "low" ? 1 : 0.72) +
+        directives.onsetTameBoost,
       0,
       1
     );
     const breathTameStrength = clamp(
-      breathSpikeRisk * (noiseRisk === "high" ? 0.55 : noiseRisk === "medium" ? 0.78 : 1),
+      breathSpikeRisk * (noiseRisk === "high" ? 0.55 : noiseRisk === "medium" ? 0.78 : 1) +
+        directives.breathTameBoost,
       0,
       1
     );
-    const sagRecoveryStrength = clamp(midLineSagScore * (noiseRisk === "high" ? 0.5 : 1), 0, 1);
+    const sagRecoveryStrength = clamp(
+      midLineSagScore * (noiseRisk === "high" ? 0.5 : 1) + directives.sagRecoveryBoost,
+      0,
+      1,
+    );
     const disableDynaThresholdForStability =
       noiseRisk === "low" && (preserveEndings || midLineSagScore >= 0.45 || lineSwingScore >= 0.45);
     const preferSinglePassContinuity =
@@ -2452,12 +2800,53 @@ const summarizeFailureReason = (error: unknown) => {
           (pauseNoiseRisk >= 0.24 || lineContinuityRisk >= 0.32 || sentenceJumpScore >= 0.24)) ||
         preserveEndings ||
         (analysis.pauseNoiseFloorDb ?? -120) > -60);
+    const dryness = analysis.drynessScore ?? clamp(1 - confidenceScaledRoom, 0, 1);
 
+    const plannedEchoNotchCutDb = roomCleanupEnabled
+      ? clamp(
+          echoScore *
+            (roomRisk === "high" && echoScore >= 0.68 ? 1.35 : roomRisk === "high" ? 1.02 : roomRisk === "medium" ? 0.68 : 0.42) +
+            (roomRisk === "high" ? (echoScore >= 0.72 ? 0.27 : 0.12) : 0) +
+            directives.roomCleanupBias * 0.55,
+          0,
+          1.95
+        )
+      : 0;
+    const echoRoomCleanup = buildEchoRoomCleanupDecision({
+      roomCleanupEnabled,
+      roomRisk,
+      echoScore,
+      analysisConfidence,
+      preserveEndings,
+      pauseNoiseRisk,
+      echoNotchCutDb: plannedEchoNotchCutDb,
+      endFadeRiskScore,
+      lineContinuityRisk,
+    });
+    if (echoRoomCleanup.severeEchoRoom) {
+      highpassHz = Math.max(highpassHz, 88);
+    }
+    const measuredEchoDelayMs =
+      typeof analysis.echoDelayMs === "number" && Number.isFinite(analysis.echoDelayMs)
+        ? analysis.echoDelayMs
+        : null;
+    const earlyEchoCancelStrength = deriveEarlyEchoCancelStrength({
+      severeEchoRoom: echoRoomCleanup.severeEchoRoom,
+      echoScore,
+      drynessScore: dryness,
+      echoDelayMs: measuredEchoDelayMs,
+      roomCleanupBias: directives.roomCleanupBias,
+    });
     const forceTailGateForEcho =
-      roomCleanupEnabled && roomRisk === "high" && echoScore >= 0.62 && !preserveEndings;
+      roomCleanupEnabled &&
+      roomRisk === "high" &&
+      echoScore >= 0.62 &&
+      endFadeRiskScore < 0.36 &&
+      lineContinuityRisk < 0.55 &&
+      (!preserveEndings || echoRoomCleanup.allowTailGateDuringEndingProtection);
     const useTailGate =
       roomCleanupEnabled &&
-      !preserveEndings &&
+      (!preserveEndings || echoRoomCleanup.allowTailGateDuringEndingProtection) &&
       (forceTailGateForEcho ||
         (analysisConfidence >= 0.52 && (roomRisk === "high" || (roomRisk === "medium" && echoScore >= 0.5))));
     // `useDenoise` / `denoiseStrength` are now *derived* from the same signal
@@ -2480,22 +2869,16 @@ const summarizeFailureReason = (error: unknown) => {
       0,
       1,
     );
-    const useDenoise = noiseGuard && measuredNoiseNeedsNr && denoiseStrength >= 0.26;
+    const directedDenoiseStrength = clamp(denoiseStrength + directives.denoiseBias, 0, 1);
+    const useDenoise = controls.noiseGuard && (measuredNoiseNeedsNr || directives.denoiseBias > 0.18) && directedDenoiseStrength >= 0.22;
     const tailGateStrength = !useTailGate
       ? 0
       : roomRisk === "high"
-        ? clamp(0.09 + echoScore * 0.1 + analysisConfidence * 0.06, 0.09, 0.22)
-        : clamp(0.06 + echoScore * 0.08, 0.06, 0.14);
-    const echoNotchCutDb = roomCleanupEnabled
-      ? clamp(
-          echoScore * (roomRisk === "high" ? 1.02 : roomRisk === "medium" ? 0.68 : 0.42) +
-            (roomRisk === "high" ? 0.12 : 0),
-          0,
-          1.45
-        )
-      : 0;
+        ? clamp(0.09 + echoScore * 0.1 + analysisConfidence * 0.06 + directives.roomCleanupBias * 0.04, 0.09, 0.24)
+        : clamp(0.06 + echoScore * 0.08 + directives.roomCleanupBias * 0.03, 0.06, 0.16);
+    const echoNotchCutDb = plannedEchoNotchCutDb;
 
-    const baseDynaTrim = noiseGuard ? (noiseRisk === "high" ? 3 : noiseRisk === "medium" ? 2 : 0) : 0;
+    const baseDynaTrim = controls.noiseGuard ? (noiseRisk === "high" ? 3 : noiseRisk === "medium" ? 2 : 0) : 0;
     const roomDynaTrim = roomRisk === "high" ? 1.4 : roomRisk === "medium" ? 0.7 : 0;
     const instabilityAssist =
       instabilityScore * (noiseRisk === "low" ? 0.9 : noiseRisk === "medium" ? 0.4 : 0.15) +
@@ -2507,14 +2890,13 @@ const summarizeFailureReason = (error: unknown) => {
       1
     );
 
-    const dryness = analysis.drynessScore ?? clamp(1 - confidenceScaledRoom, 0, 1);
     const blendRiskDamp = roomRisk === "high" ? 0.012 : roomRisk === "medium" ? 0.12 : 1;
     const blendEchoDamp = clamp(1 - echoScore * 0.85, 0.08, 1);
     const blendNoiseDamp = noiseRisk === "high" ? 0.22 : noiseRisk === "medium" ? 0.55 : 1;
     const blendInstabilityDamp = instabilityScore >= 0.7 ? 0.65 : 1;
     const blendConfidenceScale = clamp(0.35 + analysisConfidence * 0.65, 0.35, 1);
     const blendBase = clamp(0.018 + dryness * 0.018, 0.012, 0.036);
-    let blendAmount = sceneBlend
+    let blendAmount = controls.sceneBlend
       ? blendBase * blendRiskDamp * blendConfidenceScale * blendEchoDamp * blendNoiseDamp * blendInstabilityDamp
       : 0;
     if (roomRisk === "high" || echoScore >= 0.72) {
@@ -2551,14 +2933,20 @@ const summarizeFailureReason = (error: unknown) => {
       speechThresholdDb: measuredSpeechThreshold,
       roomRisk,
       useDenoise,
-      denoiseStrength,
+      denoiseStrength: directedDenoiseStrength,
       bandSpectrumDb: analysis.bandSpectrumDb ?? null,
       toneMatchDeltaDb,
       sibilanceScore: analysis.sibilanceScore ?? 0,
-      cinematicColorEnabled: cinematicColor,
+      cinematicColorEnabled: controls.cinematicColor,
       useTailGate,
       tailGateStrength,
       echoNotchCutDb,
+      echoDominantRoom: echoRoomCleanup.echoDominantRoom,
+      severeEchoRoom: echoRoomCleanup.severeEchoRoom,
+      allowDereverbDuringEndingProtection: echoRoomCleanup.allowDereverbDuringEndingProtection,
+      allowTailGateDuringEndingProtection: echoRoomCleanup.allowTailGateDuringEndingProtection,
+      echoDelayMs: measuredEchoDelayMs,
+      earlyEchoCancelStrength,
       echoScore,
       instabilityScore,
       clickScore,
@@ -2587,7 +2975,19 @@ const summarizeFailureReason = (error: unknown) => {
     } satisfies AdaptiveProfile;
   };
 
-  const buildTailGateFilter = (strength: number) => {
+  const buildTailGateFilter = (strength: number, severeEchoRoom = false) => {
+    if (severeEchoRoom) {
+      const thresholdDb = clamp(-52 + strength * 42, -52, -41);
+      const threshold = fromDb(thresholdDb);
+      const ratio = clamp(1.25 + strength * 4.4, 1.25, 2.25);
+      const range = clamp(0.9 - strength * 0.8, 0.68, 0.9);
+      const attack = Math.round(clamp(18 - strength * 18, 12, 20));
+      const release = Math.round(clamp(360 - strength * 420, 210, 380));
+      return `agate=mode=downward:threshold=${threshold.toFixed(5)}:ratio=${ratio.toFixed(
+        2
+      )}:range=${range.toFixed(3)}:attack=${attack}:release=${release}:makeup=1.00:detection=rms:link=average`;
+    }
+
     const thresholdDb = clamp(-58 + strength * 3.4, -58, -54.5);
     const threshold = fromDb(thresholdDb);
     const ratio = clamp(1.01 + strength * 0.5, 1.01, 1.22);
@@ -2733,7 +3133,7 @@ const summarizeFailureReason = (error: unknown) => {
     profile: AdaptiveProfile | null,
     options?: MixRenderOptions
   ) => {
-    if (!noiseGuard || !profile) return null;
+    if (!getActiveAudioReviewControls().noiseGuard || !profile) return null;
     if (options?.minimalStabilityChain || options?.sourceSafeChain || options?.disableAdaptiveNoiseReduction) return null;
     return buildAdaptiveNoiseReductionFilter(
       profile.noiseRisk,
@@ -2745,9 +3145,12 @@ const summarizeFailureReason = (error: unknown) => {
   };
 
   const buildMixFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions) => {
+    const controls = getActiveAudioReviewControls();
+    const activeLeveler = getLevelerForControls(controls);
+    const activeBreathControl = getBreathControlForControls(controls);
     const filters: string[] = [];
-    const levelerSettings = LEVELER_PRESETS[leveler];
-    const consistency = LEVELER_CONSISTENCY[leveler];
+    const levelerSettings = LEVELER_PRESETS[activeLeveler];
+    const consistency = LEVELER_CONSISTENCY[activeLeveler];
     const minimalStabilityChain = options?.minimalStabilityChain === true;
     const candidateVariant = options?.candidateVariant ?? "cinematic-stable";
     const continuitySafeMode = candidateVariant === "continuity-safe";
@@ -2755,7 +3158,8 @@ const summarizeFailureReason = (error: unknown) => {
     const sourceSafeMode = options?.sourceSafeChain === true || candidateVariant === "source-safe";
     const dyn = sourceSafeMode ? null : levelerSettings.dyna;
     const gainPlannerActive = options?.gainPlannerActive === true;
-    const roomCleanupEnabled = roomCleanup && !options?.disableRoomCleanup && !minimalStabilityChain && !sourceSafeMode;
+    const roomCleanupEnabled =
+      controls.roomCleanup && !options?.disableRoomCleanup && !minimalStabilityChain && !sourceSafeMode;
     const adaptiveNoiseReductionFilter = resolveAdaptiveNoiseReductionFilter(profile, options);
     const useAdaptiveNoiseReduction = adaptiveNoiseReductionFilter !== null;
     const instabilityScore = profile?.instabilityScore ?? 0;
@@ -2781,10 +3185,10 @@ const summarizeFailureReason = (error: unknown) => {
     const useBreathSpikeTamer =
       !minimalStabilityChain &&
       !sourceSafeMode &&
-      breathControl !== "Off" &&
+      activeBreathControl !== "Off" &&
       breathTameStrength >= (continuitySafeMode ? 0.18 : 0.24);
 
-    if (eqCleanup) {
+    if (controls.eqCleanup) {
       const highpassHz = profile?.highpassHz ?? 80;
       const lowMidGainDb = sourceSafeMode ? clamp(profile?.lowMidGainDb ?? -0.8, -1.2, 0) : (profile?.lowMidGainDb ?? -2);
       filters.push(`highpass=f=${highpassHz}`);
@@ -2794,7 +3198,7 @@ const summarizeFailureReason = (error: unknown) => {
         filters.push(adaptiveNoiseReductionFilter);
       }
     }
-    if (!eqCleanup && useAdaptiveNoiseReduction && adaptiveNoiseReductionFilter) {
+    if (!controls.eqCleanup && useAdaptiveNoiseReduction && adaptiveNoiseReductionFilter) {
       filters.push(adaptiveNoiseReductionFilter);
     }
 
@@ -2818,47 +3222,62 @@ const summarizeFailureReason = (error: unknown) => {
     // don't leave a band of files flagged "echo_roomy" but never treated.
     // Conservative upper-bound still prevents firing on sparse-dialogue
     // strict-ending-protection takes where the tail reverb is performance.
+    const endingProtectionBlocksDereverb =
+      (profile?.strictEndingProtection ?? false) &&
+      inEchoScore >= 0.75 &&
+      !(profile?.allowDereverbDuringEndingProtection ?? false);
+    const severeEchoRoom = profile?.severeEchoRoom ?? false;
     const dereverbAllowed =
       !minimalStabilityChain &&
       roomCleanupEnabled &&
-      !(profile?.strictEndingProtection && inEchoScore >= 0.75) &&
-      (inEchoScore >= 0.38 || roomRiskIsMed || inRoomScore >= 0.35);
+      !endingProtectionBlocksDereverb &&
+      (inEchoScore >= 0.32 || roomRiskIsMed || inRoomScore >= 0.3);
     if (dereverbAllowed) {
       // Strength 0..1, scales with measured echo. Now uses the ACTUAL
       // `echoScore` as the primary driver (was 0.7×echoScore + bonus) so
       // stronger rooms get proportionally stronger treatment. Caps at 1.0.
       const roomStrength = clamp(
-        inEchoScore +
-          (profile?.roomRisk === "high" ? 0.2 : profile?.roomRisk === "medium" ? 0.1 : 0),
+        inEchoScore * 1.08 +
+          (profile?.roomRisk === "high" ? 0.24 : profile?.roomRisk === "medium" ? 0.13 : 0) +
+          ((profile?.echoDominantRoom ?? false) ? 0.08 : 0) +
+          (severeEchoRoom ? 0.18 : 0),
         0,
-        1,
+        severeEchoRoom ? 1.2 : 1,
       );
       // `anlmdn` de-reverb strength scales over a wider range (0.00025 →
       // 0.00065). Stronger settings scrub more reflection smear; the
       // extended range catches the 0.5–0.8 echoScore files that were
       // still landing as `echo_roomy` in auto-review.
-      const nlmS = (0.00022 + roomStrength * 0.00028).toFixed(5);
-      filters.push(`anlmdn=s=${nlmS}:p=0.002:r=0.004`);
+      const nlmS = (0.00024 + roomStrength * (severeEchoRoom ? 0.00072 : 0.00034)).toFixed(5);
+      const nlmP = severeEchoRoom ? "0.003" : "0.002";
+      const nlmR = severeEchoRoom ? "0.010" : roomStrength >= 0.72 ? "0.006" : "0.004";
+      filters.push(`anlmdn=s=${nlmS}:p=${nlmP}:r=${nlmR}`);
 
       // Boxy-room notch — now fires at a lower strength threshold (0.25)
       // so it reaches files that were flagged echo_roomy but skipped the
       // notch before. Depth still modest.
       if (roomStrength >= 0.25) {
-        const boxyCut = -clamp(0.35 + roomStrength * 1.0, 0.35, 1.35);
+        const boxyCut = -clamp(0.35 + roomStrength * (severeEchoRoom ? 1.25 : 1.0), 0.35, severeEchoRoom ? 1.75 : 1.35);
         filters.push(`equalizer=f=280:width_type=q:width=1.1:g=${boxyCut.toFixed(2)}`);
       }
 
       // Mid-range room notch — 1 kHz "honky" band. Fires on stronger rooms.
       if (roomStrength >= 0.45) {
-        const midCut = -clamp(0.4 + (roomStrength - 0.45) * 1.15, 0.4, 1.05);
+        const midCut = -clamp(0.4 + (roomStrength - 0.45) * (severeEchoRoom ? 1.45 : 1.15), 0.4, severeEchoRoom ? 1.35 : 1.05);
         filters.push(`equalizer=f=1050:width_type=q:width=1.3:g=${midCut.toFixed(2)}`);
+      }
+      if (severeEchoRoom && roomStrength >= 0.55) {
+        const lowerRoomCut = -clamp(0.45 + (roomStrength - 0.45) * 1.45, 0.45, 1.65);
+        const upperRoomCut = -clamp(0.3 + (roomStrength - 0.5) * 1.2, 0.3, 1.2);
+        filters.push(`equalizer=f=680:width_type=q:width=1.0:g=${lowerRoomCut.toFixed(2)}`);
+        filters.push(`equalizer=f=2200:width_type=q:width=1.15:g=${upperRoomCut.toFixed(2)}`);
       }
 
       // Top-end shelf cut — now fires on medium rooms too (was high only)
       // when echoScore is high, because brightness reflection scatter lives
       // in both medium and high room ratings.
       if (roomStrength >= 0.5) {
-        const topShelf = -clamp(0.4 + (roomStrength - 0.5) * 1.0, 0.4, 1.0);
+        const topShelf = -clamp(0.4 + (roomStrength - 0.5) * 1.0, 0.4, severeEchoRoom ? 1.1 : 1.0);
         filters.push(`equalizer=f=10500:width_type=q:width=0.7:g=${topShelf.toFixed(2)}`);
       }
     }
@@ -2904,8 +3323,8 @@ const summarizeFailureReason = (error: unknown) => {
       }
     } else if (dyn) {
       let dynaF: number = dyn.f;
-      let dynaG: number = noiseGuard ? Math.max(3, dyn.g - 1) : dyn.g;
-      let dynaM: number = noiseGuard ? Math.max(3, dyn.m - 1) : dyn.m;
+      let dynaG: number = controls.noiseGuard ? Math.max(3, dyn.g - 1) : dyn.g;
+      let dynaM: number = controls.noiseGuard ? Math.max(3, dyn.m - 1) : dyn.m;
       let dynaThresholdAmp = 0;
 
       if (!minimalStabilityChain) {
@@ -2922,7 +3341,7 @@ const summarizeFailureReason = (error: unknown) => {
               dynaF = Math.round(clamp(dynaF - instabilityNorm * 80, 161, 261));
               dynaG += profile.instabilityScore * 1.8;
               dynaM += profile.instabilityScore * 1.4;
-              if (noiseGuard && profile.noiseRisk !== "low") {
+              if (controls.noiseGuard && profile.noiseRisk !== "low") {
                 const gateDb = clamp((profile.speechThresholdDb ?? -46) - 8.5, -58, -44);
                 dynaThresholdAmp = Math.max(dynaThresholdAmp, fromDb(gateDb));
               }
@@ -2932,7 +3351,7 @@ const summarizeFailureReason = (error: unknown) => {
           }
 
           // Noisy takes need slower and lower lift to avoid raising room noise in pauses.
-          if (noiseGuard) {
+          if (controls.noiseGuard) {
             if (profile.noiseRisk === "high" || (profile.noiseFloorDb ?? -70) > -46) {
               dynaF = Math.max(dynaF, 281);
               dynaG = Math.min(dynaG, 3);
@@ -2953,7 +3372,7 @@ const summarizeFailureReason = (error: unknown) => {
             dynaF = Math.round(clamp(dynaF - instabilityNorm * 48, 201, 261));
             dynaG = Math.min(7.5, dynaG + instabilityNorm * 1.2);
             dynaM = Math.min(9.5, dynaM + instabilityNorm * 1.0);
-            if (noiseGuard && profile.noiseRisk !== "low") {
+            if (controls.noiseGuard && profile.noiseRisk !== "low") {
               const speechGateDb = clamp((profile.speechThresholdDb ?? -46) - 8.2, -58, -43);
               dynaThresholdAmp = Math.max(dynaThresholdAmp, fromDb(speechGateDb));
             }
@@ -3054,32 +3473,35 @@ const summarizeFailureReason = (error: unknown) => {
         breathSpikeRisk >= 0.38 ||
         continuitySafeMode);
     const breath =
-      sourceSafeMode || breathControl === "Off"
+      sourceSafeMode || activeBreathControl === "Off"
         ? null
         : pauseSafeMode && pauseNoiseRisk >= 0.38
           ? null
         : continuityBreathProtect
-          ? BREATH_COMPAND_SAFE[breathControl === "Medium" ? "Medium" : "Light"]
-          : BREATH_COMPAND[breathControl];
+          ? BREATH_COMPAND_SAFE[activeBreathControl === "Medium" ? "Medium" : "Light"]
+          : BREATH_COMPAND[activeBreathControl];
+    const allowSevereEchoRoomGate =
+      roomCleanupEnabled && (profile?.useTailGate ?? false) && (profile?.allowTailGateDuringEndingProtection ?? false);
     const suppressContinuityGate =
-      continuitySafeMode || strictEndingProtection || lineContinuityRisk >= 0.58 || lineSwingScore >= 0.48;
+      !allowSevereEchoRoomGate &&
+      (continuitySafeMode || strictEndingProtection || lineContinuityRisk >= 0.58 || lineSwingScore >= 0.48);
     const roomGateFilter =
       roomCleanupEnabled && !suppressContinuityGate && (profile?.useTailGate ?? false)
-        ? buildTailGateFilter(profile?.tailGateStrength ?? 0.12)
+        ? buildTailGateFilter(profile?.tailGateStrength ?? 0.12, profile?.severeEchoRoom ?? false)
         : null;
     const useRoomGate = roomGateFilter !== null;
     const endingProtectedDialogue = strictEndingProtection || (profile?.preserveEndings ?? false);
     const preferFloorGuard =
       !sourceSafeMode &&
-      floorGuard &&
+      controls.floorGuard &&
       (pauseSafeMode ||
         pauseNoiseRisk >= 0.42 ||
         profile?.noiseRisk === "high" ||
-        (noiseGuard && profile?.noiseRisk === "medium"));
+        (controls.noiseGuard && profile?.noiseRisk === "medium"));
     const useFloorGuard =
       !sourceSafeMode &&
       !useRoomGate &&
-      floorGuard &&
+      controls.floorGuard &&
       (breath === null || preferFloorGuard) &&
       !(endingProtectedDialogue && profile?.noiseRisk === "low" && pauseNoiseRisk < 0.36);
     const useBreathCompand =
@@ -3101,8 +3523,8 @@ const summarizeFailureReason = (error: unknown) => {
 
     // Merge static harshness softening with smart-match tone offsets to avoid
     // competing EQ moves on the same bands.
-    const basePresenceCut = softenHarshness ? -2.0 : 0;
-    const baseAirCut = softenHarshness ? -1.1 : 0;
+    const basePresenceCut = controls.softenHarshness ? -2.0 : 0;
+    const baseAirCut = controls.softenHarshness ? -1.1 : 0;
     const harshPresenceCut = profile?.emotionalHarshnessCutDb ?? 0;
     const harshAirCut = profile?.topEndHarshnessCutDb ?? 0;
     const netPresenceGain = clamp(
@@ -3123,26 +3545,28 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push(`equalizer=f=11200:width_type=q:width=0.7:g=${topShelfCut.toFixed(2)}`);
     }
     if (!minimalStabilityChain && !sourceSafeMode && roomCleanupEnabled && (profile?.echoNotchCutDb ?? 0) >= 0.25) {
-      const echoCut = clamp(profile?.echoNotchCutDb ?? 0, 0.25, 1.25);
-      const notch1 = -clamp(echoCut, 0.25, 1.25);
+      const severeEchoNotch = profile?.severeEchoRoom ?? false;
+      const echoCut = clamp(profile?.echoNotchCutDb ?? 0, 0.25, severeEchoNotch ? 1.65 : 1.25);
+      const notch1 = -clamp(echoCut, 0.25, severeEchoNotch ? 1.65 : 1.25);
       filters.push(`equalizer=f=2450:width_type=q:width=1.35:g=${notch1.toFixed(2)}`);
       if (echoCut >= 0.55) {
-        const notch2 = -clamp(echoCut * 0.62, 0.3, 0.9);
+        const notch2 = -clamp(echoCut * 0.62, 0.3, severeEchoNotch ? 1.05 : 0.9);
         filters.push(`equalizer=f=1280:width_type=q:width=1.0:g=${notch2.toFixed(2)}`);
       }
       if (echoCut >= 0.9) {
-        const notch3 = -clamp(echoCut * 0.45, 0.25, 0.7);
+        const notch3 = -clamp(echoCut * 0.45, 0.25, severeEchoNotch ? 0.85 : 0.7);
         filters.push(`equalizer=f=3620:width_type=q:width=1.6:g=${notch3.toFixed(2)}`);
       }
     }
     if (!minimalStabilityChain && !sourceSafeMode && roomCleanupEnabled && profile?.roomRisk === "high") {
-      const roomCutFactor = clamp((profile?.echoNotchCutDb ?? 0.6) / 1.45, 0.25, 1);
-      const roomCutLow = -clamp(0.45 + roomCutFactor * 0.55, 0.45, 1.05);
-      const roomCutMid = -clamp(0.35 + roomCutFactor * 0.65, 0.35, 1.15);
+      const severeEchoRoomEq = profile?.severeEchoRoom ?? false;
+      const roomCutFactor = clamp((profile?.echoNotchCutDb ?? 0.6) / (severeEchoRoomEq ? 1.3 : 1.45), 0.25, 1);
+      const roomCutLow = -clamp(0.45 + roomCutFactor * (severeEchoRoomEq ? 0.75 : 0.55), 0.45, severeEchoRoomEq ? 1.25 : 1.05);
+      const roomCutMid = -clamp(0.35 + roomCutFactor * (severeEchoRoomEq ? 0.87 : 0.65), 0.35, severeEchoRoomEq ? 1.4 : 1.15);
       filters.push(`equalizer=f=460:width_type=q:width=0.95:g=${roomCutLow.toFixed(2)}`);
       filters.push(`equalizer=f=1650:width_type=q:width=1.2:g=${roomCutMid.toFixed(2)}`);
       if ((profile?.echoNotchCutDb ?? 0) >= 0.95) {
-        const roomCutUpperMid = -clamp(0.25 + roomCutFactor * 0.45, 0.25, 0.8);
+        const roomCutUpperMid = -clamp(0.25 + roomCutFactor * (severeEchoRoomEq ? 0.65 : 0.45), 0.25, severeEchoRoomEq ? 1 : 0.8);
         filters.push(`equalizer=f=2850:width_type=q:width=1.5:g=${roomCutUpperMid.toFixed(2)}`);
       }
     }
@@ -3417,17 +3841,169 @@ const summarizeFailureReason = (error: unknown) => {
     ffmpeg: FFmpeg,
     name: string,
     kind: OutputEntry["kind"],
-    variant: OutputEntry["variant"]
+    variant: OutputEntry["variant"],
+    processingFlow: OutputEntry["processingFlow"] = "app",
   ): Promise<OutputEntry> => {
     const bytes = await readVirtualFileBytes(ffmpeg, name);
+    const outputName = processingFlow === "app-neural-speech-enhancement-app" ? enhancedOutputName(name) : name;
+
     const blob = new Blob([bytes], { type: "audio/wav" });
     return {
-      name,
+      name: outputName,
       blob,
       size: blob.size,
       kind,
       variant,
+      processingFlow,
     };
+  };
+
+  const buildFinalPolishProfile = (
+    profile: AdaptiveProfile | null,
+    directives: AudioReviewAdaptiveDirectives,
+  ): AdaptiveProfile | null => {
+    if (!profile) return null;
+
+    const polish = clamp(0.28 + directives.finalPolishIntensity * 0.34, 0.28, 0.62);
+    const toneScale = clamp(0.34 + polish * 0.38, 0.34, 0.58);
+    const stabilityScale = clamp(0.42 + polish * 0.46, 0.42, 0.7);
+    const deHarshScale = clamp(0.5 + polish * 0.34, 0.5, 0.72);
+    const compressionScale = clamp(0.28 + polish * 0.35, 0.28, 0.5);
+
+    return {
+      ...profile,
+      lowMidGainDb: clamp(profile.lowMidGainDb * toneScale, -1.35, 0.65),
+      presenceGainDb: clamp(profile.presenceGainDb * toneScale, -1.05, 0.75),
+      airGainDb: clamp(profile.airGainDb * toneScale, -0.75, 0.55),
+      emotionalHarshnessCutDb: clamp(profile.emotionalHarshnessCutDb * deHarshScale, 0, 1.15),
+      topEndHarshnessCutDb: clamp(profile.topEndHarshnessCutDb * deHarshScale, 0, 0.85),
+      levelingNeed: clamp(profile.levelingNeed * stabilityScale, 0, 0.62),
+      emotionProtection: clamp(profile.emotionProtection * stabilityScale, 0, 0.65),
+      compressorRatioOffset: clamp(profile.compressorRatioOffset * compressionScale, -0.16, 0.22),
+      compressorThresholdOffsetDb: clamp(profile.compressorThresholdOffsetDb * compressionScale, -0.65, 0.75),
+      dynaTrim: clamp(profile.dynaTrim * 0.45, 0, 1.6),
+      useDenoise: false,
+      denoiseStrength: 0,
+      useTailGate: false,
+      tailGateStrength: 0,
+      echoNotchCutDb: clamp(profile.echoNotchCutDb * 0.55, 0, 0.72),
+      clickTameStrength: clamp(profile.clickTameStrength * stabilityScale, 0, 0.5),
+      breathTameStrength: clamp(profile.breathTameStrength * stabilityScale, 0, 0.58),
+      onsetTameStrength: clamp(profile.onsetTameStrength * stabilityScale, 0, 0.55),
+      sagRecoveryStrength: clamp(profile.sagRecoveryStrength * clamp(0.58 + polish * 0.48, 0.58, 0.82), 0, 0.78),
+      toneMatchDeltaDb: profile.toneMatchDeltaDb?.map((value) => clamp(value * toneScale, -0.75, 0.75)) ?? null,
+    };
+  };
+
+  const runNeuralSpeechEnhancementAppPass = async (
+    ffmpeg: FFmpeg,
+    targetName: string,
+    profile: AdaptiveProfile | null,
+    context: {
+      base: string;
+      detail: string;
+      candidateVariant?: CandidateVariant | null;
+    },
+  ) => {
+    let activeFfmpeg = ffmpeg;
+    const directives = getActiveAudioReviewAdaptiveDirectives();
+    const finalPolishProfile = buildFinalPolishProfile(profile, directives);
+    const inputBytes = await readVirtualFileBytes(activeFfmpeg, targetName);
+    const inputByteLength = assertUsableWavBytes(inputBytes, "App output before neural speech enhancement");
+    const tempBase = targetName.replace(/\.wav$/i, "");
+    const enhancementName = `${tempBase}_speech_enhancement_tmp.wav`;
+    const appPassName = `${tempBase}_final_polish_tmp.wav`;
+    const candidateVariant =
+      context.candidateVariant && context.candidateVariant !== "source-safe"
+        ? context.candidateVariant
+        : "continuity-safe";
+
+    setStatus(`Neural speech enhancement: ${context.base}`);
+    setActiveQueueStage(context.base, "Neural speech enhancement", context.detail);
+    appendLog(
+      `[SpeechEnhancement] ${context.base}: app output -> neural speech enhancement (${formatBytes(
+        inputByteLength,
+      )}).`,
+    );
+
+    try {
+      await safeDeleteFile(activeFfmpeg, enhancementName);
+      const result = await requestNeuralRepair(inputBytes, CLEARVOICE_SE_REQUEST, targetName);
+      const repairedBytes = await normalizeAudioBytes(result.bytes, "Neural speech enhancement");
+      const repairedByteLength = assertUsableWavBytes(repairedBytes, "Neural speech enhancement");
+      if (
+        typeof result.report?.outputBytes === "number" &&
+        result.report.outputBytes > 44 &&
+        Math.abs(result.report.outputBytes - repairedByteLength) > 44
+      ) {
+        appendLog(
+          `[SpeechEnhancement] ${context.base}: worker reported ${formatBytes(
+            result.report.outputBytes,
+          )}, browser received ${formatBytes(repairedByteLength)}; using received WAV bytes.`,
+        );
+      }
+      await activeFfmpeg.writeFile(enhancementName, repairedBytes);
+      const neuralReportDetail = result.report?.speechAware
+        ? `, speech-aware ${Math.round(result.report.activeDutyPct ?? 0)}% active, ${(
+            result.report.processedSeconds ?? 0
+          ).toFixed(1)}s processed, ${result.report.chunksProcessed ?? 0}/${result.report.chunksTotal ?? 0} chunks${
+            result.report.torchThreads ? `, ${result.report.torchThreads} torch threads` : ""
+          }`
+        : result.report?.chunksTotal
+          ? `, ${result.report.chunksProcessed ?? 0}/${result.report.chunksTotal} chunks${
+              result.report.torchThreads ? `, ${result.report.torchThreads} torch threads` : ""
+            }`
+          : "";
+      appendLog(
+        `[SpeechEnhancement] ${context.base}: enhancement pass complete (${formatBytes(repairedByteLength)}${
+          result.report?.elapsedSeconds ? `, ${result.report.elapsedSeconds.toFixed(1)}s` : ""
+        }${neuralReportDetail}).`,
+      );
+
+      setStatus(`Final app polish: ${context.base}`);
+      setActiveQueueStage(context.base, "Final app polish", `${context.detail}, subtle single pass`);
+      await safeDeleteFile(activeFfmpeg, appPassName);
+      await runMixReady(activeFfmpeg, enhancementName, appPassName, finalPolishProfile, {
+        candidateVariant,
+        forceEndingProtection: true,
+        skipSpeechSegmentation: true,
+        disableSegmentGainMatch: true,
+        disableAdaptiveNoiseReduction: true,
+      });
+
+      const passBytes = await readVirtualFileBytes(activeFfmpeg, appPassName);
+      const passByteLength = assertUsableWavBytes(passBytes, "Final app polish");
+
+      await activeFfmpeg.writeFile(targetName, passBytes);
+      appendLog(
+        `[SpeechEnhancement] ${context.base}: final app polish applied once (${formatBytes(
+          passByteLength,
+        )}; delivery uses neural enhancement + final polish).`,
+      );
+      return {
+        ffmpeg: activeFfmpeg,
+        applied: true,
+        polishPasses: 1,
+      };
+    } catch (error) {
+      appendLog(
+        `[SpeechEnhancement] ${context.base}: neural/final polish unavailable; keeping app output (${
+          error instanceof Error ? error.message : String(error)
+        }).`,
+      );
+      if (shouldResetFfmpegForError(error)) {
+        activeFfmpeg = await refreshFfmpeg(`speech enhancement failure on ${context.base}`);
+      }
+      await activeFfmpeg.writeFile(targetName, inputBytes);
+      return {
+        ffmpeg: activeFfmpeg,
+        applied: false,
+        polishPasses: 0,
+      };
+    } finally {
+      await safeDeleteFile(activeFfmpeg, enhancementName);
+      await safeDeleteFile(activeFfmpeg, appPassName);
+    }
   };
 
   const analyzeIntegratedLoudness = async (ffmpeg: FFmpeg, inputName: string) => {
@@ -3867,13 +4443,18 @@ const summarizeFailureReason = (error: unknown) => {
     }`;
 
   const buildSilenceSegmentFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions) => {
+    const controls = getActiveAudioReviewControls();
     const filters: string[] = [];
     const candidateVariant = options?.candidateVariant ?? "cinematic-stable";
     const pauseSafeMode = candidateVariant === "pause-safe";
-    if (eqCleanup) {
+    if (controls.eqCleanup) {
       filters.push(`highpass=f=${profile?.highpassHz ?? 80}`);
     }
-    if (noiseGuard && profile && (profile.pauseNoiseRisk >= 0.42 || (pauseSafeMode && profile.noiseRisk !== "low"))) {
+    if (
+      controls.noiseGuard &&
+      profile &&
+      (profile.pauseNoiseRisk >= 0.42 || (pauseSafeMode && profile.noiseRisk !== "low"))
+    ) {
       const adaptiveNoiseReduction = buildAdaptiveNoiseReductionFilter(
         profile.noiseRisk,
         profile.noiseFloorDb,
@@ -3885,11 +4466,26 @@ const summarizeFailureReason = (error: unknown) => {
         filters.push(adaptiveNoiseReduction);
       }
     }
-    if (floorGuard && profile && (profile.noiseRisk === "high" || profile.pauseNoiseRisk >= 0.38 || pauseSafeMode)) {
+    if (
+      controls.floorGuard &&
+      profile &&
+      (profile.noiseRisk === "high" || profile.pauseNoiseRisk >= 0.38 || pauseSafeMode)
+    ) {
       filters.push(profile.floorGuardFilter);
     }
-    if (roomCleanup && profile && profile.roomRisk !== "low" && !profile.preserveEndings) {
-      filters.push(buildTailGateFilter((profile.tailGateStrength ?? 0.1) * (pauseSafeMode ? 0.85 : 0.55)));
+    if (
+      controls.roomCleanup &&
+      profile &&
+      profile.roomRisk !== "low" &&
+      (!profile.preserveEndings || profile.allowTailGateDuringEndingProtection)
+    ) {
+      const segmentTailGateScale = profile.severeEchoRoom ? (pauseSafeMode ? 0.75 : 0.9) : pauseSafeMode ? 0.85 : 0.55;
+      filters.push(
+        buildTailGateFilter(
+          (profile.tailGateStrength ?? 0.1) * segmentTailGateScale,
+          profile.severeEchoRoom && profile.allowTailGateDuringEndingProtection,
+        ),
+      );
     }
     if (filters.length === 0) return null;
     return filters.join(",");
@@ -4250,7 +4846,8 @@ const summarizeFailureReason = (error: unknown) => {
     }
 
     const candidateVariant: CandidateVariant =
-      profile?.preferSinglePassContinuity ? "continuity-safe" : "cinematic-stable";
+      sourceFirstCandidateVariantRef.current ??
+      (profile?.preferSinglePassContinuity ? "continuity-safe" : "cinematic-stable");
     appendLog(
       `[LongForm] ${job.base}: ${durationSeconds.toFixed(
         0,
@@ -4285,9 +4882,18 @@ const summarizeFailureReason = (error: unknown) => {
             skipSpeechSegmentation: true,
           },
         );
+        const chunkEnhancement = await runNeuralSpeechEnhancementAppPass(ffmpeg, mixChunkName, profile, {
+          base: job.base,
+          detail: `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}, neural speech enhancement`,
+          candidateVariant,
+        });
+        ffmpeg = chunkEnhancement.ffmpeg;
+        const chunkFlow = chunkEnhancement.applied ? "app-neural-speech-enhancement-app" : "app";
 
         if (keepMixReady || loudnessConfig === null) {
-          outputEntries.push(await writeOutput(ffmpeg, mixChunkName, "mixready", "clean"));
+          outputEntries.push(
+            await writeOutput(ffmpeg, mixChunkName, "mixready", "clean", chunkFlow),
+          );
           setOutputs([...outputEntries]);
         }
 
@@ -4302,7 +4908,9 @@ const summarizeFailureReason = (error: unknown) => {
             await runBlendMixReady(ffmpeg, mixChunkName, blendChunkName, profile);
             blendRendered = true;
             if (keepMixReady || loudnessConfig === null) {
-              outputEntries.push(await writeOutput(ffmpeg, blendChunkName, "mixready", "blend"));
+              outputEntries.push(
+                await writeOutput(ffmpeg, blendChunkName, "mixready", "blend", chunkFlow),
+              );
               setOutputs([...outputEntries]);
             }
           }
@@ -4312,7 +4920,9 @@ const summarizeFailureReason = (error: unknown) => {
           setStatus(`Long-form loudness: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
           setActiveQueueStage(job.base, "Long-form loudness", `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`);
           await runLoudnorm(ffmpeg, mixChunkName, loudChunkName, loudnessConfig);
-          outputEntries.push(await writeOutput(ffmpeg, loudChunkName, "loudness", "clean"));
+          outputEntries.push(
+            await writeOutput(ffmpeg, loudChunkName, "loudness", "clean", chunkFlow),
+          );
           setOutputs([...outputEntries]);
 
           if (blendRendered && blendLoudChunkName) {
@@ -4323,7 +4933,9 @@ const summarizeFailureReason = (error: unknown) => {
               `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`,
             );
             await runLoudnorm(ffmpeg, blendChunkName, blendLoudChunkName, loudnessConfig);
-            outputEntries.push(await writeOutput(ffmpeg, blendLoudChunkName, "loudness", "blend"));
+            outputEntries.push(
+              await writeOutput(ffmpeg, blendLoudChunkName, "loudness", "blend", chunkFlow),
+            );
             setOutputs([...outputEntries]);
           }
         }
@@ -4352,7 +4964,7 @@ const summarizeFailureReason = (error: unknown) => {
     appendLog(
       `[LongForm] ${job.base}: complete. Review bundles and duplicate candidate renders were skipped to keep this PC cool and memory-bounded.`,
     );
-    return ffmpeg;
+    return { ffmpeg, chunkCount: chunks.length };
   };
 
   const safeDeleteFile = async (ffmpeg: FFmpeg, name: string) => {
@@ -4537,7 +5149,7 @@ const summarizeFailureReason = (error: unknown) => {
       leveledReady: false,
       applyChunkSeconds: null,
     };
-    if (!gainPlannerEnabled) return context;
+    if (!getActiveAudioReviewControls().gainPlannerEnabled) return context;
 
     const plan = await planGainForInput(ffmpeg, job.inputName, profile, analysis, durationSeconds);
     if (!plan) {
@@ -4590,6 +5202,9 @@ const summarizeFailureReason = (error: unknown) => {
     profile: AdaptiveProfile | null,
     durationSeconds: number | null,
   ): CandidateVariant[] => {
+    const sourceFirstVariant = sourceFirstCandidateVariantRef.current;
+    if (sourceFirstVariant) return [sourceFirstVariant];
+
     const variants: CandidateVariant[] = ["cinematic-stable", "continuity-safe"];
     // On batch-episode-length files (≥ 10 min) we skip the third variant
     // unless pause/noise evidence says it could win; long files recycle
@@ -4753,7 +5368,8 @@ const summarizeFailureReason = (error: unknown) => {
     analysis?: FileAnalysis | undefined,
     plannerContext?: PlannerRenderContext | null,
   ): Promise<RenderAttemptResult> => {
-    const hasRoomFilters = roomCleanup && !!profile && (profile.useTailGate || profile.echoNotchCutDb >= 0.25);
+    const hasRoomFilters =
+      getActiveAudioReviewControls().roomCleanup && !!profile && (profile.useTailGate || profile.echoNotchCutDb >= 0.25);
     const hasAdaptiveNoiseReduction = resolveAdaptiveNoiseReductionFilter(profile, options) !== null;
     const fallbackStrategies: Array<{ label: string; options?: MixRenderOptions }> = [{ label: "primary chain" }];
     if (hasRoomFilters) {
@@ -4803,7 +5419,7 @@ const summarizeFailureReason = (error: unknown) => {
     // variants share the same gain curve. The direct-planning branch is kept
     // defensive for any future caller that has not prepared the context.
     let plan: PlannedGain | null = plannerContext?.plan ?? null;
-    if (!plannerContext && gainPlannerEnabled) {
+    if (!plannerContext && getActiveAudioReviewControls().gainPlannerEnabled) {
       try {
         const dur = await ensureInputDuration();
         plan = await planGainForInput(ffmpeg, job.inputName, profile, analysis, dur);
@@ -5178,12 +5794,21 @@ const summarizeFailureReason = (error: unknown) => {
 
   const processFiles = async () => {
     if (!files.length) return;
+    processingControlsOverrideRef.current = null;
+    aiAdaptiveDirectivesOverrideRef.current = null;
+    sourceFirstCandidateVariantRef.current = null;
+    sourceFirstPlansByBaseRef.current = new Map();
     setLoading(true);
     setOutputs([]);
     setReviewBundles([]);
     setLogs([]);
     setFailedOptimizations([]);
     setShowFailureWarning(false);
+    setAiReviewFiles([]);
+    setAiReviewResult(null);
+    setAiReviewError(null);
+    setAiReviewModel(null);
+    setAiAutoPilotStatus(null);
     setStatus("Preparing...");
 
     try {
@@ -5194,7 +5819,6 @@ const summarizeFailureReason = (error: unknown) => {
       initializeQueueItems(jobs);
       const analysisByBase = new Map<string, FileAnalysis>();
       let batchReference: BatchReference | null = null;
-      const smartMatchEnabled = smartMatchConfig.tone > 0 || smartMatchConfig.dynamics > 0;
       const needsAnalysis = true;
 
       if (needsAnalysis) {
@@ -5244,14 +5868,39 @@ const summarizeFailureReason = (error: unknown) => {
           }
         }
 
-        if (smartMatchEnabled) {
-          batchReference = buildBatchReference(analyses);
-          if (batchReference) {
-            appendLog(
-              `Reference tone low/mid ${batchReference.lowTilt.toFixed(1)} dB, high/mid ${batchReference.highTilt.toFixed(1)} dB, LRA ${batchReference.lra.toFixed(1)}.`
-            );
+        batchReference = buildBatchReference(analyses);
+        if (batchReference) {
+          appendLog(
+            `Reference tone low/mid ${batchReference.lowTilt.toFixed(1)} dB, high/mid ${batchReference.highTilt.toFixed(1)} dB, LRA ${batchReference.lra.toFixed(1)}.`
+          );
+        } else {
+          appendLog("Reference analysis unavailable; using base processing chain.");
+        }
+
+        const sourceReviewFiles = jobs.map((job) => {
+          const sourceAnalysis = analysisByBase.get(job.base);
+          const initialProfile = buildAdaptiveProfile(sourceAnalysis, batchReference);
+          return buildAudioReviewFileInput(
+            job,
+            sourceAnalysis,
+            initialProfile,
+            estimateAudioSeconds(job.file),
+            null,
+          );
+        });
+        setAiReviewFiles(sourceReviewFiles);
+
+        if (aiAutoPilotEnabled && sourceReviewFiles.length > 0) {
+          setStatus("AI Auto Pilot: reviewing source");
+          const result = await runAiAudioReview(sourceReviewFiles, {
+            autoApply: true,
+            activateCurrentRun: true,
+            source: "source-auto",
+          });
+          if (result?.plans && result.plans.size > 0) {
+            appendLog(`[AIReview] Source-first per-audio pipeline active for ${sourceReviewFiles.length} file(s).`);
           } else {
-            appendLog("Reference analysis unavailable; using base processing chain.");
+            appendLog("[AIReview] Source-first review unavailable; continuing with current deterministic controls.");
           }
         }
       }
@@ -5312,6 +5961,10 @@ const summarizeFailureReason = (error: unknown) => {
               progress: 0,
               detail: "Fresh worker, re-running pipeline",
             });
+          }
+          const sourceFirstPlan = activateSourceFirstPlanForJob(job);
+          if (sourceFirstPlan) {
+            appendLog(`[AIReview] ${job.base}: ${sourceFirstPlan.summary}`);
           }
           await writeJobInput(ffmpeg, job);
           const profile = buildAdaptiveProfile(fileAnalysis, batchReference);
@@ -5406,7 +6059,7 @@ const summarizeFailureReason = (error: unknown) => {
           const longFormSafeMode = shouldUseLongFormSafeMode(fileDurationForVariants, longFormDurationSeconds);
 
           if (longFormSafeMode) {
-            ffmpeg = await renderLongFormSafeMode(
+            const longFormResult = await renderLongFormSafeMode(
               ffmpeg,
               job,
               profile,
@@ -5416,12 +6069,8 @@ const summarizeFailureReason = (error: unknown) => {
               outputEntries,
               speechRenderPlan?.silenceSpans ?? [],
             );
-            markQueueDone(
-              job.base,
-              `Long-form outputs ready (${
-                planLongFormChunks(longFormDurationSeconds, undefined, speechRenderPlan?.silenceSpans ?? []).length
-              } parts)`,
-            );
+            ffmpeg = longFormResult.ffmpeg;
+            markQueueDone(job.base, `Long-form outputs ready (${longFormResult.chunkCount} parts)`);
             setOutputs([...outputEntries]);
           } else {
           const sourceQcSnapshot = toReviewMetricSnapshot(fileAnalysis);
@@ -5841,9 +6490,16 @@ const summarizeFailureReason = (error: unknown) => {
               );
             }
           }
+          const enhancementResult = await runNeuralSpeechEnhancementAppPass(ffmpeg, job.mixName, profile, {
+            base: job.base,
+            detail: `File ${i + 1} of ${jobs.length}, neural speech enhancement`,
+            candidateVariant: selectedVariant,
+          });
+          ffmpeg = enhancementResult.ffmpeg;
+          const outputProcessingFlow = enhancementResult.applied ? "app-neural-speech-enhancement-app" : "app";
 
-          const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean");
           if (keepMixReady || loudnessConfig === null) {
+            const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean", outputProcessingFlow);
             outputEntries.push(mixOutput);
           }
 
@@ -5857,9 +6513,15 @@ const summarizeFailureReason = (error: unknown) => {
                 setStatus(`Blend: ${job.base} (${i + 1}/${jobs.length})`);
                 setActiveQueueStage(job.base, "Blend", `File ${i + 1} of ${jobs.length}`);
                 await runBlendMixReady(ffmpeg, job.mixName, job.blendMixName, profile);
-                const blendMixOutput = await writeOutput(ffmpeg, job.blendMixName, "mixready", "blend");
                 blendRendered = true;
                 if (keepMixReady || loudnessConfig === null) {
+                  const blendMixOutput = await writeOutput(
+                    ffmpeg,
+                    job.blendMixName,
+                    "mixready",
+                    "blend",
+                    outputProcessingFlow,
+                  );
                   outputEntries.push(blendMixOutput);
                 }
               } catch (error) {
@@ -5875,7 +6537,7 @@ const summarizeFailureReason = (error: unknown) => {
             setStatus(`Loudness clean: ${job.base} (${i + 1}/${jobs.length})`);
             setActiveQueueStage(job.base, "Loudness (clean)", `File ${i + 1} of ${jobs.length}`);
             await runLoudnorm(ffmpeg, job.mixName, cleanLoudName, loudnessConfig);
-            const loudOutput = await writeOutput(ffmpeg, cleanLoudName, "loudness", "clean");
+            const loudOutput = await writeOutput(ffmpeg, cleanLoudName, "loudness", "clean", outputProcessingFlow);
             outputEntries.push(loudOutput);
 
             if (sceneBlend && blendRendered) {
@@ -5883,7 +6545,13 @@ const summarizeFailureReason = (error: unknown) => {
               setStatus(`Loudness blend: ${job.base} (${i + 1}/${jobs.length})`);
               setActiveQueueStage(job.base, "Loudness (blend)", `File ${i + 1} of ${jobs.length}`);
               await runLoudnorm(ffmpeg, job.blendMixName, blendLoudName, loudnessConfig);
-              const blendLoudOutput = await writeOutput(ffmpeg, blendLoudName, "loudness", "blend");
+              const blendLoudOutput = await writeOutput(
+                ffmpeg,
+                blendLoudName,
+                "loudness",
+                "blend",
+                outputProcessingFlow,
+              );
               outputEntries.push(blendLoudOutput);
             }
           }
@@ -5984,6 +6652,10 @@ const summarizeFailureReason = (error: unknown) => {
       appendLog(`Error: ${err instanceof Error ? err.message : String(err)}`);
       setStatus("Failed");
     } finally {
+      processingControlsOverrideRef.current = null;
+      aiAdaptiveDirectivesOverrideRef.current = null;
+      sourceFirstCandidateVariantRef.current = null;
+      sourceFirstPlansByBaseRef.current = new Map();
       setLoading(false);
     }
   };
@@ -6060,12 +6732,14 @@ const summarizeFailureReason = (error: unknown) => {
       sceneBlend,
       keepMixReady,
       gainPlannerEnabled,
+      neuralSpeechEnhancement: true,
       reviewReranker: learnedReviewWeights.modelName,
     },
     files: manifestOutputs.map((output) => ({
       name: output.name,
       kind: output.kind,
       variant: output.variant,
+      processingFlow: output.processingFlow,
       sizeBytes: output.size,
     })),
   });
@@ -6244,13 +6918,20 @@ const summarizeFailureReason = (error: unknown) => {
     [queueItems]
   );
   const queueCounts = useMemo(
-    () => ({
-      total: queueItems.length,
-      done: queueItems.filter((item) => item.status === "done").length,
-      error: queueItems.filter((item) => item.status === "error").length,
-      working: queueItems.filter((item) => item.status === "working").length,
-      pending: queueItems.filter((item) => item.status === "pending").length,
-    }),
+    () =>
+      queueItems.reduce(
+        (counts, item) => ({
+          ...counts,
+          [item.status]: counts[item.status] + 1,
+        }),
+        {
+          total: queueItems.length,
+          done: 0,
+          error: 0,
+          working: 0,
+          pending: 0,
+        },
+      ),
     [queueItems]
   );
   const totalOutputBytes = useMemo(
@@ -6366,9 +7047,6 @@ const summarizeFailureReason = (error: unknown) => {
                   </option>
                 ))}
               </select>
-              <div className={styles.label}>
-                Balances consistency while keeping performance peaks.
-              </div>
             </div>
             <div className={styles.field}>
               <label className={styles.label}>Breath control</label>
@@ -6426,6 +7104,34 @@ const summarizeFailureReason = (error: unknown) => {
               checked={keepMixReady}
               onChange={(event) => setKeepMixReady(event.target.checked)}
               disabled={loudnessConfig === null}
+            />
+          </div>
+          <div className={styles.toggleRow}>
+            <div>
+              <strong>Neural speech enhancement</strong>
+              <div className={styles.label}>
+                Mandatory restoration pass between adaptive app processing and one subtle final polish.
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              checked={neuralSpeechEnhancementEnabled}
+              disabled
+              onChange={() => setNeuralSpeechEnhancementEnabled(true)}
+            />
+          </div>
+          <div className={styles.toggleRow}>
+            <div>
+              <strong>AI Auto Pilot</strong>
+              <div className={styles.label}>
+                Reviews original source audio first, applies a safe adaptive profile, then renders once through app, neural VO, and final app touch.
+              </div>
+              {aiAutoPilotStatus && <div className={styles.label}>{aiAutoPilotStatus}</div>}
+            </div>
+            <input
+              type="checkbox"
+              checked={aiAutoPilotEnabled}
+              onChange={(event) => setAiAutoPilotEnabled(event.target.checked)}
             />
           </div>
 
@@ -6563,7 +7269,7 @@ const summarizeFailureReason = (error: unknown) => {
           )}
 
           <div className={`${styles.controls} ${styles.sectionTop}`}>
-            <button className={styles.button} onClick={processFiles} disabled={loading || files.length === 0}>
+            <button className={styles.button} onClick={() => void processFiles()} disabled={loading || files.length === 0}>
               {loading ? "Processing..." : "Run Batch"}
             </button>
             <button
@@ -6577,6 +7283,10 @@ const summarizeFailureReason = (error: unknown) => {
                 setLogs([]);
                 setFailedOptimizations([]);
                 setShowFailureWarning(false);
+                setAiReviewFiles([]);
+                setAiReviewResult(null);
+                setAiReviewError(null);
+                setAiReviewModel(null);
                 setQueueItems([]);
                 activeQueueBaseRef.current = null;
                 activeQueueStageRef.current = "Queued";
@@ -6586,6 +7296,14 @@ const summarizeFailureReason = (error: unknown) => {
               disabled={loading}
             >
               Clear
+            </button>
+            <button
+              type="button"
+              ref={aiReviewTriggerRef}
+              className={`${styles.button} ${styles.buttonSecondary}`}
+              onClick={() => setAiReviewOpen(true)}
+            >
+              AI Review
             </button>
             <div className={styles.progress}>{status}</div>
           </div>
@@ -6759,6 +7477,9 @@ const summarizeFailureReason = (error: unknown) => {
                     <span className={styles.outputBadge}>
                       {output.variant === "blend" ? "Blend pass" : "Clean pass"}
                     </span>
+                    {output.processingFlow === "app-neural-speech-enhancement-app" && (
+                      <span className={styles.outputBadge}>Neural enhancement + app</span>
+                    )}
                     {output.kind === "mixready" ? (
                       <>
                         <span className={styles.outputBadge}>Mix-ready</span>
@@ -6832,6 +7553,158 @@ const summarizeFailureReason = (error: unknown) => {
                 Understood
               </button>
             </div>
+          </div>
+        </div>
+      )}
+      {aiReviewOpen && (
+        <div className={styles.aiReviewOverlay} role="dialog" aria-modal="true" aria-labelledby="ai-review-title">
+          <div className={styles.aiReviewModal}>
+            <div className={styles.aiReviewHeader}>
+              <div>
+                <h3 id="ai-review-title">AI Audio Review</h3>
+                <div className={styles.label}>
+                  {aiReviewFiles.length} file{aiReviewFiles.length === 1 ? "" : "s"} ready
+                  {aiReviewModel ? ` - ${aiReviewModel}` : ""}
+                </div>
+              </div>
+              <button
+                ref={aiReviewCloseRef}
+                type="button"
+                className={`${styles.button} ${styles.buttonGhost}`}
+                onClick={closeAiReview}
+              >
+                Close
+              </button>
+            </div>
+
+            <div className={styles.aiReviewActionBar}>
+              <span className={styles.aiReviewTiny}>
+                {aiReviewFiles
+                  .slice(-3)
+                  .map((file) => file.fileName)
+                  .join(", ")}
+              </span>
+              {aiReviewBusy && <span className={styles.aiReviewTiny}>Reviewing source...</span>}
+            </div>
+            {aiAutoPilotStatus && <div className={styles.aiReviewTiny}>{aiAutoPilotStatus}</div>}
+
+            {aiReviewError && (
+              <div className={styles.aiReviewError} aria-live="polite">
+                {aiReviewError}
+              </div>
+            )}
+
+            {aiReviewResult ? (
+              <div className={styles.aiReviewBody} aria-live="polite">
+                <div className={styles.aiReviewBadges}>
+                  <span className={styles.outputBadge}>{aiReviewResult.verdict.toUpperCase()}</span>
+                  <span className={styles.outputBadge}>{Math.round(aiReviewResult.confidence * 100)}% confidence</span>
+                  <span className={styles.outputBadge}>{aiReviewResult.perFileProfiles.length} per-audio profiles</span>
+                </div>
+
+                {aiReviewResult.perFileProfiles.map((fileReview) => (
+                  <div className={styles.aiReviewRecommendation} key={`${fileReview.base}-${fileReview.fileName}`}>
+                    <div className={styles.aiReviewRecommendationTop}>
+                      <strong>{fileReview.fileName}</strong>
+                      <span>{fileReview.recommendedProfile.selectedVariant}</span>
+                    </div>
+                    <div className={styles.aiReviewRecommendationTop}>
+                      <span>{fileReview.recommendedProfile.name}</span>
+                      <span>{Math.round(fileReview.confidence * 100)}% file confidence</span>
+                    </div>
+                    <div className={styles.aiReviewProfileGrid}>
+                      <span>Match: {fileReview.recommendedProfile.smartMatchMode}</span>
+                      <span>Leveler: {fileReview.recommendedProfile.leveler}</span>
+                      <span>Breath: {fileReview.recommendedProfile.breathControl}</span>
+                      <span>Warmth: {formatSigned(fileReview.adaptiveDirectives.warmthDb, 1)} dB</span>
+                      <span>Presence: {formatSigned(fileReview.adaptiveDirectives.presenceDb, 1)} dB</span>
+                      <span>Air: {formatSigned(fileReview.adaptiveDirectives.airDb, 1)} dB</span>
+                      <span>Sag: {formatSigned(fileReview.adaptiveDirectives.sagRecoveryBoost, 2)}</span>
+                      <span>De-harsh: {formatSigned(fileReview.adaptiveDirectives.deHarshDb, 1)} dB</span>
+                      <span>Polish: single pass {Math.round(fileReview.adaptiveDirectives.finalPolishIntensity * 100)}%</span>
+                      <span>Room: {fileReview.recommendedProfile.roomCleanup ? "on" : "off"}</span>
+                      <span>Harshness: {fileReview.recommendedProfile.softenHarshness ? "soften" : "normal"}</span>
+                      <span>Color: {fileReview.recommendedProfile.cinematicColor ? "on" : "off"}</span>
+                    </div>
+                    <p>{fileReview.summary}</p>
+                    {fileReview.recommendedProfile.notes && <p>{fileReview.recommendedProfile.notes}</p>}
+                  </div>
+                ))}
+
+                {aiReviewResult.profileRationale.length > 0 && (
+                  <div className={styles.aiReviewSection}>
+                    <strong>Profile Rationale</strong>
+                    <ul>
+                      {aiReviewResult.profileRationale.map((item, index) => (
+                        <li key={`${item}-${index}`}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {aiReviewResult.adjustments.length > 0 && (
+                  <div className={styles.aiReviewSection}>
+                    <strong>Adjustments</strong>
+                    <div className={styles.aiReviewList}>
+                      {aiReviewResult.adjustments.map((adjustment, index) => (
+                        <div className={styles.aiReviewListItem} key={`${adjustment.control}-${index}`}>
+                          <div className={styles.aiReviewListTop}>
+                            <span>{adjustment.control}</span>
+                            <span>{adjustment.risk}</span>
+                          </div>
+                          <div>{adjustment.recommendation}</div>
+                          <small>{adjustment.why}</small>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {aiReviewResult.findings.length > 0 && (
+                  <div className={styles.aiReviewSection}>
+                    <strong>Findings</strong>
+                    <div className={styles.aiReviewList}>
+                      {aiReviewResult.findings.map((finding, index) => (
+                        <div className={styles.aiReviewListItem} key={`${finding.fileName}-${finding.issue}-${index}`}>
+                          <div className={styles.aiReviewListTop}>
+                            <span>{finding.fileName}</span>
+                            <span>{finding.severity}</span>
+                          </div>
+                          <div>{finding.issue}</div>
+                          <small>{finding.evidence}</small>
+                          <small>{finding.action}</small>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className={styles.aiReviewColumns}>
+                  <div className={styles.aiReviewSection}>
+                    <strong>Guardrails</strong>
+                    <ul>
+                      {aiReviewResult.guardrails.map((item, index) => (
+                        <li key={`${item}-${index}`}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className={styles.aiReviewSection}>
+                    <strong>Listening Checks</strong>
+                    <ul>
+                      {aiReviewResult.nextListeningChecks.map((item, index) => (
+                        <li key={`${item}-${index}`}>{item}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className={styles.aiReviewEmpty}>
+                {aiReviewFiles.length === 0
+                  ? "Run a WAV batch first. The reviewer uses original source metrics and the pre-render adaptive profile."
+                  : "No AI review yet."}
+              </div>
+            )}
           </div>
         </div>
       )}

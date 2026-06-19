@@ -113,6 +113,20 @@
   color: var(--text);
 }
 
+.select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 18px) calc(50% - 2px), calc(100% - 12px) calc(50% - 2px);
+  background-repeat: no-repeat;
+  background-size: 6px 6px, 6px 6px;
+  padding-right: 38px;
+}
+
+.select::-ms-expand {
+  display: none;
+}
+
 .optionGrid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -128,6 +142,10 @@
   border-radius: 12px;
   background: var(--panel);
   border: 1px solid var(--stroke);
+}
+
+.optionGrid + .toggleRow {
+  margin-top: 8px;
 }
 
 .toggleRow + .toggleRow {
@@ -468,6 +486,153 @@
   line-height: 1.45;
 }
 
+.aiReviewOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  background: rgba(2, 4, 10, 0.76);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+
+.aiReviewModal {
+  width: min(820px, 100%);
+  max-height: min(760px, calc(100vh - 36px));
+  overflow: auto;
+  border: 1px solid rgba(110, 214, 198, 0.2);
+  border-radius: 8px;
+  background: #10131a;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.48);
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.aiReviewHeader,
+.aiReviewActionBar,
+.aiReviewBadges,
+.aiReviewRecommendationTop,
+.aiReviewListTop {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.aiReviewHeader h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.aiReviewActionBar {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.aiReviewTiny {
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.aiReviewError {
+  border: 1px solid rgba(255, 120, 120, 0.36);
+  background: rgba(255, 120, 120, 0.1);
+  border-radius: 8px;
+  padding: 10px;
+  color: #ffd2d2;
+  font-size: 0.88rem;
+}
+
+.aiReviewBody {
+  display: grid;
+  gap: 12px;
+}
+
+.aiReviewBadges {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.aiReviewRecommendation,
+.aiReviewSection,
+.aiReviewEmpty {
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 12px;
+}
+
+.aiReviewRecommendation p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.aiReviewRecommendationTop span,
+.aiReviewListTop span:last-child {
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+.aiReviewProfileGrid {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.aiReviewProfileGrid span {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 7px 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.aiReviewList {
+  margin-top: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.aiReviewListItem {
+  display: grid;
+  gap: 5px;
+  border-radius: 8px;
+  padding: 9px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.aiReviewListItem small {
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.aiReviewColumns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.aiReviewSection ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  line-height: 1.45;
+  font-size: 0.88rem;
+}
+
+.aiReviewEmpty {
+  color: var(--muted);
+}
+
 .warningOverlay {
   position: fixed;
   inset: 0;
@@ -540,5 +705,14 @@
 
   .panel {
     grid-template-columns: 1fr;
+  }
+
+  .aiReviewColumns {
+    grid-template-columns: 1fr;
+  }
+
+  .aiReviewHeader {
+    align-items: stretch;
+    flex-direction: column;
   }
 }

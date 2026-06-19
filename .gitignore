@@ -3,7 +3,10 @@
 # dependencies
 /node_modules
 /.venv-audio-splitter
+/.venv-neural
 /.audio-separator-models
+/checkpoints
+/_qctest
 /.pnp
 .pnp.*
 .yarn/*
@@ -28,12 +31,17 @@
 *.pem
 /VO example/
 /Audio split example/
+/stuck audio/
+/vo example new/
+/vo test/
+/vo need fix/
 
 # debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+tmp-next-dev.*.log
 
 # env files (can opt-in for committing if needed)
 .env*
