@@ -138,6 +138,40 @@ test("end-fade scoring rises when the last word drops away before silence", () =
   assert.ok(fadedTail.endFadeRiskScore > protectedTail.endFadeRiskScore + 0.6);
 });
 
+test("end-edge dip metric catches a short final-phoneme level drop", () => {
+  const steadyEnding = analyzeSections([
+    { frames: 100, fromDb: -78 },
+    { frames: 160, fromDb: -27 },
+    { frames: 30, fromDb: -78 },
+  ]);
+  const dippedEnding = analyzeSections([
+    { frames: 100, fromDb: -78 },
+    { frames: 145, fromDb: -27 },
+    { frames: 15, fromDb: -33 },
+    { frames: 30, fromDb: -78 },
+  ]);
+
+  assert.ok(
+    steadyEnding.endEdgeDipDb < 2.0,
+    `steady ending should stay below warning level, got ${steadyEnding.endEdgeDipDb.toFixed(1)} dB`,
+  );
+  assert.ok(dippedEnding.endEdgeDipDb > 4.5, `dipped ending should expose a short edge dip, got ${dippedEnding.endEdgeDipDb.toFixed(1)} dB`);
+});
+
+test("end-edge dip metric keeps damaged speech tails in the measured tail", () => {
+  const damagedTail = analyzeSections([
+    { frames: 100, fromDb: -78 },
+    { frames: 145, fromDb: -27 },
+    { frames: 15, fromDb: -39 },
+    { frames: 30, fromDb: -78 },
+  ]);
+
+  assert.ok(
+    damagedTail.endEdgeDipDb > 9,
+    `damaged speech tail should not be trimmed out before scoring, got ${damagedTail.endEdgeDipDb.toFixed(1)} dB`,
+  );
+});
+
 test("pause-noise scoring rises when long silences stay lifted", () => {
   const quietPauses = analyzeSections([
     { frames: 120, fromDb: -80 },
@@ -233,6 +267,89 @@ test("sentence-jump scoring rises when grouped lines land at different body leve
   ]);
 
   assert.ok(jumpy.sentenceJumpScore > protectedTail.sentenceJumpScore + 0.45);
+});
+
+test("cold-open scoring measures quiet heads against later dialogue body", () => {
+  const dipped = analyzeSections([
+    { frames: 100, fromDb: -78 },
+    { frames: 110, fromDb: -34 },
+    { frames: 24, fromDb: -78 },
+    { frames: 110, fromDb: -34 },
+    { frames: 28, fromDb: -78 },
+    { frames: 150, fromDb: -30 },
+    { frames: 32, fromDb: -78 },
+    { frames: 150, fromDb: -30 },
+    { frames: 100, fromDb: -78 },
+  ]);
+
+  assert.ok(
+    Math.abs(dipped.coldOpenDipDb - 4) < 0.35,
+    `expected ~4 dB cold-open dip, got ${dipped.coldOpenDipDb}`,
+  );
+  assert.ok(
+    Math.abs(dipped.coldOpenRiskScore - 0.75) < 0.12,
+    `expected ~0.75 cold-open risk, got ${dipped.coldOpenRiskScore}`,
+  );
+});
+
+test("cold-open scoring stays near zero for flat dialogue heads", () => {
+  const flat = analyzeSections([
+    { frames: 100, fromDb: -78 },
+    { frames: 110, fromDb: -30 },
+    { frames: 24, fromDb: -78 },
+    { frames: 110, fromDb: -30 },
+    { frames: 28, fromDb: -78 },
+    { frames: 150, fromDb: -30 },
+    { frames: 32, fromDb: -78 },
+    { frames: 150, fromDb: -30 },
+    { frames: 100, fromDb: -78 },
+  ]);
+
+  assert.ok(Math.abs(flat.coldOpenDipDb) < 0.35, `expected flat cold-open dip, got ${flat.coldOpenDipDb}`);
+  assert.equal(flat.coldOpenRiskScore, 0);
+});
+
+test("cold-open scoring trims first-run edges before comparing to the later body", () => {
+  const edgedHeads = analyzeSections([
+    { frames: 100, fromDb: -78 },
+    { frames: 10, fromDb: -42 },
+    { frames: 35, fromDb: -30 },
+    { frames: 10, fromDb: -42 },
+    { frames: 24, fromDb: -78 },
+    { frames: 10, fromDb: -42 },
+    { frames: 35, fromDb: -30 },
+    { frames: 10, fromDb: -42 },
+    { frames: 24, fromDb: -78 },
+    { frames: 10, fromDb: -42 },
+    { frames: 35, fromDb: -30 },
+    { frames: 10, fromDb: -42 },
+    { frames: 32, fromDb: -78 },
+    { frames: 150, fromDb: -30 },
+    { frames: 100, fromDb: -78 },
+  ]);
+
+  assert.ok(
+    edgedHeads.coldOpenDipDb < 1,
+    `edge-only first-run dips should not trigger a cold-open warning, got ${edgedHeads.coldOpenDipDb}`,
+  );
+  assert.equal(edgedHeads.coldOpenRiskScore, 0);
+});
+
+test("cold-open scoring includes short opening words", () => {
+  const shortOpener = analyzeSections([
+    { frames: 80, fromDb: -78 },
+    { frames: 28, fromDb: -34 },
+    { frames: 18, fromDb: -78 },
+    { frames: 100, fromDb: -27 },
+    { frames: 20, fromDb: -78 },
+    { frames: 100, fromDb: -27 },
+    { frames: 80, fromDb: -78 },
+  ]);
+
+  assert.ok(
+    shortOpener.coldOpenDipDb > 5,
+    `short opening words should contribute to cold-open scoring, got ${shortOpener.coldOpenDipDb.toFixed(1)} dB`,
+  );
 });
 
 test("sparse sentence-jump scoring still rises when isolated lines land at different levels", () => {

@@ -10,6 +10,7 @@ export const REVIEW_WEIGHT_STORAGE_KEY = "vo-leveler-review-weights-v1";
 export const REVIEW_ISSUE_TAGS = [
   "timing_shift",
   "level_uneven",
+  "cold_open_dip",
   "pause_noise_lift",
   "too_compressed",
   "harsh_sibilance",
@@ -22,6 +23,16 @@ export const REVIEW_ISSUE_TAGS = [
 export type ReviewIssueTag = (typeof REVIEW_ISSUE_TAGS)[number];
 export type ReviewVerdict = "pass" | "fail";
 export type ReviewCandidateRole = "winner" | "challenger";
+
+export const HIGH_VALUE_CORRECTIVE_ISSUE_TAGS = [
+  "cold_open_dip",
+  "endings_damaged",
+  "harsh_sibilance",
+  "too_compressed",
+  "level_uneven",
+] as const satisfies readonly ReviewIssueTag[];
+
+const highValueCorrectiveIssueTagSet = new Set<ReviewIssueTag>(HIGH_VALUE_CORRECTIVE_ISSUE_TAGS);
 
 export const REVIEW_FEATURE_KEYS = [
   "baseline_total",
@@ -70,6 +81,8 @@ export type ReviewMetricSnapshot = {
   instabilityScore: number | null;
   lineSwingScore: number | null;
   sentenceJumpScore: number | null;
+  coldOpenDipDb: number | null;
+  coldOpenRiskScore: number | null;
   breathSpikeRisk: number | null;
   pauseNoiseRisk: number | null;
   compressionScore: number | null;
@@ -80,6 +93,7 @@ export type ReviewMetricSnapshot = {
   onsetOvershootScore: number | null;
   midLineSagScore: number | null;
   endFadeRiskScore: number | null;
+  endEdgeDipDb: number | null;
   sibilanceScore: number | null;
 };
 
@@ -87,11 +101,14 @@ export type ReviewMetricDelta = {
   overallRisk: number | null;
   instabilityScore: number | null;
   sentenceJumpScore: number | null;
+  coldOpenDipDb: number | null;
+  coldOpenRiskScore: number | null;
   pauseNoiseRisk: number | null;
   compressionScore: number | null;
   clickScore: number | null;
   echoScore: number | null;
   endFadeRiskScore: number | null;
+  endEdgeDipDb: number | null;
   sibilanceScore: number | null;
   pauseNoiseFloorDb: number | null;
   noiseContrastDb: number | null;
@@ -245,6 +262,21 @@ export type AutoReviewResult = {
   challengerAssessment: AutoReviewCandidateAssessment | null;
 };
 
+export const shouldAttemptCorrectivePassForAssessment = (
+  assessment: Pick<AutoReviewCandidateAssessment, "failCount" | "warnCount" | "issueTags">,
+  gateReasons: readonly string[] = [],
+) =>
+  gateReasons.length > 0 ||
+  assessment.failCount > 0 ||
+  assessment.warnCount >= 2 ||
+  (assessment.warnCount === 1 &&
+    assessment.issueTags.some((tag) => highValueCorrectiveIssueTagSet.has(tag)));
+
+export const resolveCorrectiveMaxFilesPerBatch = (fileCount: number) => {
+  const safeFileCount = Number.isFinite(fileCount) ? Math.max(0, fileCount) : 0;
+  return Math.max(2, Math.ceil(safeFileCount * 0.4));
+};
+
 type MetricSource = Partial<ReviewMetricSnapshot> | null | undefined;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
@@ -285,6 +317,8 @@ export const toReviewMetricSnapshot = (source: MetricSource): ReviewMetricSnapsh
     instabilityScore: source.instabilityScore ?? null,
     lineSwingScore: source.lineSwingScore ?? null,
     sentenceJumpScore: source.sentenceJumpScore ?? null,
+    coldOpenDipDb: source.coldOpenDipDb ?? null,
+    coldOpenRiskScore: source.coldOpenRiskScore ?? null,
     breathSpikeRisk: source.breathSpikeRisk ?? null,
     pauseNoiseRisk: source.pauseNoiseRisk ?? null,
     compressionScore: source.compressionScore ?? null,
@@ -295,6 +329,7 @@ export const toReviewMetricSnapshot = (source: MetricSource): ReviewMetricSnapsh
     onsetOvershootScore: source.onsetOvershootScore ?? null,
     midLineSagScore: source.midLineSagScore ?? null,
     endFadeRiskScore: source.endFadeRiskScore ?? null,
+    endEdgeDipDb: source.endEdgeDipDb ?? null,
     sibilanceScore: source.sibilanceScore ?? null,
   };
 };
@@ -308,11 +343,14 @@ export const buildReviewMetricDelta = (
     overallRisk: diffNullable(candidate.overallRisk, source.overallRisk),
     instabilityScore: diffNullable(candidate.instabilityScore, source.instabilityScore),
     sentenceJumpScore: diffNullable(candidate.sentenceJumpScore, source.sentenceJumpScore),
+    coldOpenDipDb: diffNullable(candidate.coldOpenDipDb, source.coldOpenDipDb),
+    coldOpenRiskScore: diffNullable(candidate.coldOpenRiskScore, source.coldOpenRiskScore),
     pauseNoiseRisk: diffNullable(candidate.pauseNoiseRisk, source.pauseNoiseRisk),
     compressionScore: diffNullable(candidate.compressionScore, source.compressionScore),
     clickScore: diffNullable(candidate.clickScore, source.clickScore),
     echoScore: diffNullable(candidate.echoScore, source.echoScore),
     endFadeRiskScore: diffNullable(candidate.endFadeRiskScore, source.endFadeRiskScore),
+    endEdgeDipDb: diffNullable(candidate.endEdgeDipDb, source.endEdgeDipDb),
     sibilanceScore: diffNullable(candidate.sibilanceScore, source.sibilanceScore),
     pauseNoiseFloorDb: diffNullable(candidate.pauseNoiseFloorDb, source.pauseNoiseFloorDb),
     noiseContrastDb: diffNullable(candidate.noiseContrastDb, source.noiseContrastDb),
@@ -542,6 +580,20 @@ export const scoreCandidateWithLearnedWeights = (input: {
     gateReasons.push("ending-damage");
   }
 
+  const candidateEndEdgeDipDb = safeNumber(input.candidateQc?.endEdgeDipDb);
+  const sourceEndEdgeDipDb = safeNumber(input.sourceQc?.endEdgeDipDb);
+  const endEdgeDipDeltaDb = safeNumber(qcDelta?.endEdgeDipDb);
+  const createdSevereEndEdgeDip =
+    candidateEndEdgeDipDb >= 6 ||
+    (candidateEndEdgeDipDb >= 4.5 &&
+      (sourceEndEdgeDipDb < 3.5 || endEdgeDipDeltaDb >= 1));
+  if (createdSevereEndEdgeDip) {
+    hardGatePenalty +=
+      Math.max(1, candidateEndEdgeDipDb - 3.5, endEdgeDipDeltaDb) *
+      weights.penaltyWeights.endingDamage;
+    gateReasons.push("end-edge-dip");
+  }
+
   const sourceRegression =
     Math.max(0, safeNumber(qcDelta?.overallRisk) - weights.gateThresholds.maxOverallRiskDelta) / 0.08 +
     Math.max(0, safeNumber(qcDelta?.instabilityScore) - weights.gateThresholds.maxInstabilityDelta) / 0.06 +
@@ -761,6 +813,21 @@ const buildCandidateAssessment = (
     )} / ${formatPercent(delta?.sentenceJumpScore)}.`,
   });
 
+  const coldOpenDipDb = safeNumber(qc?.coldOpenDipDb);
+  const coldOpenDipDeltaDb = safeNumber(delta?.coldOpenDipDb);
+  pushAssessmentCheck(findings, issueTags, {
+    id: "cold-open",
+    label: "Cold-Open Level Dip",
+    tag: "cold_open_dip",
+    fail: coldOpenDipDb >= 3,
+    warn: coldOpenDipDb >= 1.5 || coldOpenDipDeltaDb >= 0.75,
+    failSeverity: "major",
+    warnSeverity: "major",
+    detail: `Cold-open dip ${formatDb(qc?.coldOpenDipDb)} (${formatSignedDb(
+      coldOpenDipDeltaDb,
+    )} vs source), risk ${formatPercent(qc?.coldOpenRiskScore)}.`,
+  });
+
   const pauseFloorLift = safeNumber(delta?.pauseNoiseFloorDb);
   pushAssessmentCheck(findings, issueTags, {
     id: "pause-bed",
@@ -823,6 +890,24 @@ const buildCandidateAssessment = (
     )}), onset ${formatPercent(qc?.onsetOvershootScore)}, mid-line sag ${formatPercent(
       qc?.midLineSagScore,
     )}.`,
+  });
+
+  const endEdgeDipDb = safeNumber(qc?.endEdgeDipDb);
+  const endEdgeDipDeltaDb = safeNumber(delta?.endEdgeDipDb);
+  const severeEndEdgeDip =
+    endEdgeDipDb >= 6 ||
+    (endEdgeDipDb >= 4.5 && endEdgeDipDeltaDb >= 1);
+  pushAssessmentCheck(findings, issueTags, {
+    id: "end-edge-dip",
+    label: "End-Edge Level Dip",
+    tag: "endings_damaged",
+    fail: severeEndEdgeDip,
+    warn: endEdgeDipDb >= 4 || (endEdgeDipDb >= 2.5 && endEdgeDipDeltaDb >= 1),
+    failSeverity: "major",
+    warnSeverity: "major",
+    detail: `End-edge dip ${formatDb(qc?.endEdgeDipDb)} (${formatSignedDb(
+      endEdgeDipDeltaDb,
+    )} vs source).`,
   });
 
   pushAssessmentCheck(findings, issueTags, {

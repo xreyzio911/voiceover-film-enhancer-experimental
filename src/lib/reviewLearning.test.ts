@@ -9,8 +9,10 @@ import {
   fitLearnedReviewWeights,
   parseLearnedReviewWeights,
   parseReviewDecisionJsonl,
+  resolveCorrectiveMaxFilesPerBatch,
   scoreCandidateWithLearnedWeights,
   serializeReviewDecisionJsonl,
+  shouldAttemptCorrectivePassForAssessment,
   toReviewMetricSnapshot,
   type AlignmentMetrics,
   type ReviewBundleManifest,
@@ -221,6 +223,7 @@ test("scoreCandidateWithLearnedWeights applies hard gates for timing, peak, and 
     candidateQc: toReviewMetricSnapshot({
       inputTP: -0.8,
       endFadeRiskScore: 0.92,
+      endEdgeDipDb: 5.2,
       overallRisk: 0.5,
       instabilityScore: 0.42,
       sentenceJumpScore: 0.31,
@@ -248,6 +251,7 @@ test("scoreCandidateWithLearnedWeights applies hard gates for timing, peak, and 
   assert.ok(ranking.gateReasons.includes("timing-offset"));
   assert.ok(ranking.gateReasons.includes("peak-violation"));
   assert.ok(ranking.gateReasons.includes("ending-damage"));
+  assert.ok(ranking.gateReasons.includes("end-edge-dip"));
   assert.ok(ranking.gateReasons.includes("source-regression"));
   assert.ok(ranking.rankingScore > ranking.baselineTotal);
 });
@@ -332,6 +336,47 @@ test("scoreCandidateWithLearnedWeights does not hard-gate inherited ending risk"
   });
 
   assert.ok(!ranking.gateReasons.includes("ending-damage"));
+});
+
+test("shouldAttemptCorrectivePassForAssessment uses fail, high-value WARN, multi-WARN, and gate triggers", () => {
+  const buildAssessment = (overrides: {
+    failCount?: number;
+    warnCount?: number;
+    issueTags?: Array<
+      "other" | "cold_open_dip" | "endings_damaged" | "harsh_sibilance" | "too_compressed" | "level_uneven"
+    >;
+  }) => ({
+    failCount: overrides.failCount ?? 0,
+    warnCount: overrides.warnCount ?? 0,
+    issueTags: overrides.issueTags ?? [],
+  });
+
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(buildAssessment({ warnCount: 1, issueTags: ["other"] })),
+    false,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(buildAssessment({ warnCount: 1, issueTags: ["harsh_sibilance"] })),
+    true,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(buildAssessment({ warnCount: 1, issueTags: ["endings_damaged"] })),
+    true,
+  );
+  assert.equal(
+    shouldAttemptCorrectivePassForAssessment(buildAssessment({ warnCount: 2, issueTags: ["other"] })),
+    true,
+  );
+  assert.equal(shouldAttemptCorrectivePassForAssessment(buildAssessment({ failCount: 1 })), true);
+  assert.equal(shouldAttemptCorrectivePassForAssessment(buildAssessment({}), ["peak-violation"]), true);
+});
+
+test("resolveCorrectiveMaxFilesPerBatch keeps a two-file floor and forty percent ceiling", () => {
+  assert.equal(resolveCorrectiveMaxFilesPerBatch(1), 2);
+  assert.equal(resolveCorrectiveMaxFilesPerBatch(4), 2);
+  assert.equal(resolveCorrectiveMaxFilesPerBatch(5), 2);
+  assert.equal(resolveCorrectiveMaxFilesPerBatch(6), 3);
+  assert.equal(resolveCorrectiveMaxFilesPerBatch(20), 8);
 });
 
 test("review decision JSONL round-trips", () => {
@@ -464,4 +509,138 @@ test("autoReviewBundle flags technical defects and prefers the cleaner challenge
   assert.ok(auto.issueTags.includes("too_compressed"));
   assert.ok(auto.issueTags.includes("endings_damaged"));
   assert.match(auto.note, /Selected output verdict: FAIL/);
+});
+
+test("autoReviewBundle warns when rendered cold-open dip worsens versus source", () => {
+  const manifest = buildManifest("bundle-cold-open-warn");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  manifest.source.qc = toReviewMetricSnapshot({
+    ...manifest.source.qc,
+    coldOpenDipDb: 0.7,
+  });
+  winner.qc = toReviewMetricSnapshot({
+    ...winner.qc,
+    coldOpenDipDb: 1.6,
+    instabilityScore: 0.18,
+    sentenceJumpScore: 0.12,
+  });
+  winner.sourceComparison.qcDelta = buildReviewMetricDelta(manifest.source.qc, winner.qc);
+
+  const auto = autoReviewBundle(manifest);
+  const coldOpenCheck = auto.selectedAssessment.findings.find((finding) => finding.id === "cold-open");
+
+  assert.equal(coldOpenCheck?.status, "warn");
+  assert.ok(auto.issueTags.includes("cold_open_dip"));
+  assert.match(coldOpenCheck?.detail ?? "", /cold-open/i);
+});
+
+test("autoReviewBundle triggers correction for a persistent rendered cold-open dip", () => {
+  const manifest = buildManifest("bundle-cold-open-persistent");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  manifest.source.qc = toReviewMetricSnapshot({
+    ...manifest.source.qc,
+    coldOpenDipDb: 3.2,
+  });
+  winner.qc = toReviewMetricSnapshot({
+    ...winner.qc,
+    coldOpenDipDb: 3.2,
+    instabilityScore: 0.18,
+    sentenceJumpScore: 0.12,
+  });
+  winner.sourceComparison.qcDelta = buildReviewMetricDelta(manifest.source.qc, winner.qc);
+
+  const auto = autoReviewBundle(manifest);
+  const coldOpenCheck = auto.selectedAssessment.findings.find((finding) => finding.id === "cold-open");
+
+  assert.equal(coldOpenCheck?.status, "fail");
+  assert.ok(auto.issueTags.includes("cold_open_dip"));
+  assert.equal(shouldAttemptCorrectivePassForAssessment(auto.selectedAssessment), true);
+});
+
+test("autoReviewBundle warns on a newly worse short end-edge dip", () => {
+  const manifest = buildManifest("bundle-end-edge-warn");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  manifest.source.qc = toReviewMetricSnapshot({
+    ...manifest.source.qc,
+    endEdgeDipDb: 0.4,
+  });
+  winner.qc = toReviewMetricSnapshot({
+    ...winner.qc,
+    endFadeRiskScore: 0.12,
+    endEdgeDipDb: 3.0,
+    instabilityScore: 0.18,
+    sentenceJumpScore: 0.12,
+  });
+  winner.sourceComparison.qcDelta = buildReviewMetricDelta(manifest.source.qc, winner.qc);
+
+  const auto = autoReviewBundle(manifest);
+  const endEdgeCheck = auto.selectedAssessment.findings.find((finding) => finding.id === "end-edge-dip");
+
+  assert.equal(endEdgeCheck?.status, "warn");
+  assert.ok(auto.issueTags.includes("endings_damaged"));
+  assert.match(endEdgeCheck?.detail ?? "", /End-edge dip 3\.0 dB/);
+});
+
+test("autoReviewBundle fails and triggers correction on a severe rendered end-edge dip", () => {
+  const manifest = buildManifest("bundle-end-edge-fail");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  manifest.source.qc = toReviewMetricSnapshot({
+    ...manifest.source.qc,
+    endEdgeDipDb: 0.4,
+  });
+  winner.qc = toReviewMetricSnapshot({
+    ...winner.qc,
+    endFadeRiskScore: 0.12,
+    endEdgeDipDb: 5.2,
+    instabilityScore: 0.18,
+    sentenceJumpScore: 0.12,
+  });
+  winner.sourceComparison.qcDelta = buildReviewMetricDelta(manifest.source.qc, winner.qc);
+
+  const auto = autoReviewBundle(manifest);
+  const endEdgeCheck = auto.selectedAssessment.findings.find((finding) => finding.id === "end-edge-dip");
+
+  assert.equal(endEdgeCheck?.status, "fail");
+  assert.equal(auto.finalVerdict, "fail");
+  assert.ok(auto.issueTags.includes("endings_damaged"));
+  assert.equal(shouldAttemptCorrectivePassForAssessment(auto.selectedAssessment), true);
+});
+
+test("autoReviewBundle fails when rendered cold-open dip is severe and newly worse", () => {
+  const manifest = buildManifest("bundle-cold-open-fail");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  manifest.source.qc = toReviewMetricSnapshot({
+    ...manifest.source.qc,
+    coldOpenDipDb: 1.0,
+  });
+  winner.qc = toReviewMetricSnapshot({
+    ...winner.qc,
+    coldOpenDipDb: 3.1,
+    instabilityScore: 0.18,
+    sentenceJumpScore: 0.12,
+  });
+  winner.sourceComparison.qcDelta = buildReviewMetricDelta(manifest.source.qc, winner.qc);
+
+  const auto = autoReviewBundle(manifest);
+  const coldOpenCheck = auto.selectedAssessment.findings.find((finding) => finding.id === "cold-open");
+
+  assert.equal(coldOpenCheck?.status, "fail");
+  assert.equal(auto.finalVerdict, "fail");
+  assert.ok(auto.issueTags.includes("cold_open_dip"));
+  assert.match(coldOpenCheck?.detail ?? "", /3\.1 dB/);
 });

@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { analyzeFloatSamples, buildSpeechMask } from "./audioQc.ts";
 import {
+  applyKWeighting,
   applyGainCurveToSamples,
   emitSendcmdScript,
   planGainCurve,
@@ -15,6 +16,7 @@ const FRAME_MS = 10;
 const FRAME_SAMPLES = (SAMPLE_RATE * FRAME_MS) / 1000;
 
 const dbToLin = (db: number) => Math.pow(10, db / 20);
+const gainDbAtFrame = (curve: Float32Array, frame: number) => 20 * Math.log10(curve[frame] + 1e-9);
 
 const synthesizeTake = (
   spans: Array<{ startSec: number; endSec: number; rmsDb: number }>,
@@ -68,7 +70,348 @@ const frameDbForSamples = (samples: Float32Array) => {
   return frameDb;
 };
 
+const rmsDbForSamples = (samples: Float32Array) => {
+  let sum = 0;
+  for (const sample of samples) sum += sample * sample;
+  return 10 * Math.log10(sum / Math.max(1, samples.length) + 1e-30);
+};
+
+const makeTone = (frequencyHz: number, gain: number, seconds = 2) => {
+  const samples = new Float32Array(Math.round(SAMPLE_RATE * seconds));
+  for (let i = 0; i < samples.length; i += 1) {
+    samples[i] = Math.sin((2 * Math.PI * frequencyHz * i) / SAMPLE_RATE) * gain;
+  }
+  return samples;
+};
+
 describe("gainPlanner", () => {
+  it("uses K-weighted frame energy to align boomy and bright voices with equal perceived loudness", () => {
+    const lowUnit = makeTone(100, 1);
+    const highUnit = makeTone(3000, 1);
+    const lowWeightedDb = rmsDbForSamples(applyKWeighting(lowUnit, SAMPLE_RATE));
+    const highWeightedDb = rmsDbForSamples(applyKWeighting(highUnit, SAMPLE_RATE));
+    const lowVoice = makeTone(100, dbToLin(-18));
+    const highVoice = makeTone(3000, dbToLin(-18 + lowWeightedDb - highWeightedDb));
+    const run = { startFrame: 0, endFrame: Math.floor(lowVoice.length / FRAME_SAMPLES) };
+    const baseInput = {
+      speechRuns: [run],
+      noiseFloorDb: -80,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+    };
+
+    const lowPlainPlan = planGainCurve({
+      ...baseInput,
+      frameDb: frameDbForSamples(lowVoice),
+    });
+    const highPlainPlan = planGainCurve({
+      ...baseInput,
+      frameDb: frameDbForSamples(highVoice),
+    });
+    const lowWeightedFrameDb = frameDbForSamples(applyKWeighting(lowVoice, SAMPLE_RATE));
+    const highWeightedFrameDb = frameDbForSamples(applyKWeighting(highVoice, SAMPLE_RATE));
+    const lowWeightedPlan = planGainCurve({
+      ...baseInput,
+      frameDb: frameDbForSamples(lowVoice),
+      loudnessFrameDb: lowWeightedFrameDb,
+    });
+    const highWeightedPlan = planGainCurve({
+      ...baseInput,
+      frameDb: frameDbForSamples(highVoice),
+      loudnessFrameDb: highWeightedFrameDb,
+    });
+
+    const plainGapDb = Math.abs(lowPlainPlan.runs[0].plannedGainDb - highPlainPlan.runs[0].plannedGainDb);
+    const weightedGapDb = Math.abs(lowWeightedPlan.runs[0].plannedGainDb - highWeightedPlan.runs[0].plannedGainDb);
+
+    assert.ok(plainGapDb > 3, `plain RMS should diverge by several dB, got ${plainGapDb.toFixed(2)} dB`);
+    assert.ok(weightedGapDb < 0.5, `K-weighted planner gap should stay tight, got ${weightedGapDb.toFixed(2)} dB`);
+  });
+
+  it("does not create an end-edge dip when a sibilant ending is only hot in the K-weighted envelope", () => {
+    const totalFrames = 180;
+    const run = { startFrame: 20, endFrame: 150 };
+    const tailStart = run.endFrame - 15;
+    const rawFrameDb = new Array<number>(totalFrames).fill(-78);
+    const loudnessFrameDb = [...rawFrameDb];
+    const samples = new Float32Array(totalFrames * FRAME_SAMPLES);
+
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+      rawFrameDb[frame] = -24;
+      loudnessFrameDb[frame] = frame >= tailStart ? -20.5 : -24;
+      const hz = frame >= tailStart ? 6200 : 240;
+      const start = frame * FRAME_SAMPLES;
+      const amp = dbToLin(-24) * Math.SQRT2;
+      for (let sample = 0; sample < FRAME_SAMPLES; sample += 1) {
+        const sampleIndex = start + sample;
+        samples[sampleIndex] = Math.sin((2 * Math.PI * hz * sampleIndex) / SAMPLE_RATE) * amp;
+      }
+    }
+
+    const plan = planGainCurve({
+      frameDb: rawFrameDb,
+      loudnessFrameDb,
+      speechRuns: [run],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      samples,
+      sampleRate: SAMPLE_RATE,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      peakCeilingDb: -3,
+    });
+
+    const bodyGainDb = gainDbAtFrame(plan.gainCurve, 70);
+    const endEdgeGains = Array.from({ length: 20 }, (_, index) => gainDbAtFrame(plan.gainCurve, run.endFrame - 20 + index));
+    const worstEndDipDb = bodyGainDb - Math.min(...endEdgeGains);
+
+    assert.ok(
+      worstEndDipDb < 1,
+      `sibilant ending should hold level to the last phoneme; worst dip ${worstEndDipDb.toFixed(2)} dB vs body ${bodyGainDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("keeps speech-run boundaries tied to the raw envelope when K-weighted loudness rises at the tail", () => {
+    const rawFrameDb = new Array<number>(220).fill(-78);
+    const loudnessFrameDb = [...rawFrameDb];
+    for (let frame = 50; frame < 150; frame += 1) {
+      rawFrameDb[frame] = frame >= 120 ? -68 : -31;
+      loudnessFrameDb[frame] = frame >= 120 ? -31 : -31;
+    }
+    const rawRuns = speechRunsFromMask(buildSpeechMask(rawFrameDb, -78, { frameMs: FRAME_MS }));
+    const kRuns = speechRunsFromMask(buildSpeechMask(loudnessFrameDb, -78, { frameMs: FRAME_MS }));
+
+    assert.notDeepEqual(kRuns, rawRuns, "fixture must prove the K envelope would shift speech boundaries");
+
+    const plan = planGainCurve({
+      frameDb: rawFrameDb,
+      loudnessFrameDb,
+      speechRuns: rawRuns,
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.2,
+    });
+
+    assert.deepEqual(
+      plan.runs.map(({ startFrame, endFrame }) => ({ startFrame, endFrame })),
+      rawRuns,
+      "planner runs must preserve the raw-mask boundaries instead of the K-weighted tail",
+    );
+  });
+
+  it("keeps residual loud-run correction in the K-weighted loudness domain", () => {
+    const frameDb = new Array<number>(180).fill(-78);
+    const loudnessFrameDb = new Array<number>(180).fill(-78);
+    const run = { startFrame: 20, endFrame: 150 };
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+      frameDb[frame] = -16;
+      loudnessFrameDb[frame] = -22;
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechRuns: [run],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.2,
+      speechSpikeTaming: 0.8,
+    });
+
+    const bodyGainDb = gainDbAtFrame(plan.gainCurve, 70);
+
+    assert.equal(plan.sustainedLoudClusterCount, 0);
+    assert.ok(Math.abs(bodyGainDb) < 0.35, `K-weighted target is already met; residual pass should not cut ${bodyGainDb.toFixed(2)} dB`);
+  });
+
+  it("honors the speech-spike floor even when the caller passes zero", () => {
+    const frameDb = new Array<number>(180).fill(-78);
+    const run = { startFrame: 20, endFrame: 150 };
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) frameDb[frame] = -2;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [run],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0,
+      speechSpikeTaming: 0,
+    });
+
+    assert.ok(plan.sustainedLoudClusterCount >= 1, "explicit zero should not bypass the residual spike floor");
+  });
+
+  it("keeps the speech-spike floor in sparse consistent takes", () => {
+    const speechRuns = [
+      { startFrame: 10, endFrame: 50 },
+      { startFrame: 70, endFrame: 110 },
+      { startFrame: 130, endFrame: 170 },
+      { startFrame: 190, endFrame: 230 },
+    ];
+    const frameDb = new Array<number>(250).fill(-78);
+    for (const run of speechRuns) {
+      for (let frame = run.startFrame; frame < run.endFrame; frame += 1) frameDb[frame] = -2;
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0,
+      speechSpikeTaming: 0,
+    });
+
+    assert.ok(
+      plan.sustainedLoudClusterCount >= speechRuns.length,
+      `sparse-take guard should keep residual spike checks active, got ${plan.sustainedLoudClusterCount}`,
+    );
+  });
+
+  it("lifts quiet cold-open short high-crest runs to the later dialogue anchor", () => {
+    const speechRuns = [
+      { startFrame: 20, endFrame: 55 },
+      { startFrame: 90, endFrame: 190 },
+      { startFrame: 225, endFrame: 325 },
+      { startFrame: 360, endFrame: 460 },
+      { startFrame: 495, endFrame: 595 },
+      { startFrame: 630, endFrame: 730 },
+    ];
+    const frameDb = new Array(780).fill(-78);
+    for (const [index, run] of speechRuns.entries()) {
+      const bodyDb = index === 0 ? -34 : -26;
+      for (let frame = run.startFrame; frame < run.endFrame; frame += 1) frameDb[frame] = bodyDb;
+    }
+    frameDb[speechRuns[0].startFrame] = -12;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns,
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      minGainDb: -14,
+      maxGainDb: 14,
+      instabilityHint: 0.4,
+    });
+
+    const firstRun = plan.runs[0];
+    assert.equal(firstRun.runClass, "body-speech");
+    const firstAppliedBodyDb = firstRun.meanDb + firstRun.plannedGainDb;
+    const laterAppliedBodies = plan.runs.slice(3).map((run) => run.meanDb + run.plannedGainDb).sort((a, b) => a - b);
+    const laterAnchorDb = laterAppliedBodies[Math.floor(laterAppliedBodies.length / 2)];
+
+    assert.ok(
+      firstAppliedBodyDb >= laterAnchorDb - 1.5,
+      `quiet opener should land near later anchor: first ${firstAppliedBodyDb.toFixed(1)} dB vs anchor ${laterAnchorDb.toFixed(1)} dB`,
+    );
+  });
+
+  it("bounds cold-open lift and still supports short files with a later anchor", () => {
+    const buildPlan = (runCount: number) => {
+      const speechRuns: Array<{ startFrame: number; endFrame: number }> = [];
+      let cursor = 20;
+      const totalFrames = cursor + runCount * 110 + 80;
+      const frameDb = new Array(totalFrames).fill(-78);
+      const samples = new Float32Array(totalFrames * FRAME_SAMPLES);
+      for (let index = 0; index < runCount; index += 1) {
+        const run = { startFrame: cursor, endFrame: cursor + 80 };
+        speechRuns.push(run);
+        const bodyDb = index === 0 ? -30 : -26;
+        for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+          frameDb[frame] = bodyDb;
+          const start = frame * FRAME_SAMPLES;
+          for (let sample = 0; sample < FRAME_SAMPLES; sample += 1) {
+            const sampleIndex = start + sample;
+            samples[sampleIndex] = Math.sin((2 * Math.PI * 240 * sampleIndex) / SAMPLE_RATE) * dbToLin(bodyDb) * Math.SQRT2;
+          }
+          if (index < 3 && (frame - run.startFrame) % 4 === 0) {
+            samples[start + 10] = dbToLin(-14.5);
+          }
+        }
+        cursor += 110;
+      }
+      return planGainCurve({
+        frameDb,
+        speechRuns,
+        noiseFloorDb: -78,
+        speechThresholdDb: -55,
+        pauseNoiseRisk: 0.05,
+        frameMs: FRAME_MS,
+        samples,
+        sampleRate: SAMPLE_RATE,
+        targetDb: -22,
+        sourceTargetBlend: 0,
+        minGainDb: -14,
+        maxGainDb: 14,
+        instabilityHint: 0.4,
+      });
+    };
+
+    const lifted = buildPlan(8);
+    assert.ok(lifted.coldOpenLiftCount >= 1, `expected cold-open lift, got ${lifted.coldOpenLiftCount}`);
+    assert.ok(
+      lifted.coldOpenLiftMaxDb <= 5,
+      `cold-open lift must stay capped at 5 dB, got ${lifted.coldOpenLiftMaxDb.toFixed(2)} dB`,
+    );
+
+    const shortTake = buildPlan(3);
+    assert.ok(shortTake.coldOpenLiftCount >= 1, `expected short-take cold-open lift, got ${shortTake.coldOpenLiftCount}`);
+
+    const tooFewBodies = buildPlan(2);
+    assert.equal(tooFewBodies.coldOpenLiftCount, 0);
+    assert.equal(tooFewBodies.coldOpenLiftMaxDb, 0);
+  });
+
+  it("starts file-head speech at body gain instead of the expander floor", () => {
+    const frameDb = new Array(220).fill(-78);
+    for (let frame = 0; frame < 140; frame += 1) frameDb[frame] = -28;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 0, endFrame: 140 }],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.2,
+    });
+
+    const frameZeroGainDb = 20 * Math.log10(plan.gainCurve[0] + 1e-9);
+    const bodyGainDb = 20 * Math.log10(plan.gainCurve[40] + 1e-9);
+
+    assert.ok(
+      Math.abs(frameZeroGainDb - bodyGainDb) < 0.2,
+      `frame 0 gain should equal body gain, got ${frameZeroGainDb.toFixed(2)} vs ${bodyGainDb.toFixed(2)} dB`,
+    );
+  });
+
   it("caps severe hot openers against later dialogue while preserving normal emphasis", () => {
     const speechRuns = [
       { startFrame: 20, endFrame: 120 },
@@ -336,8 +679,13 @@ describe("run classification", () => {
     // 1.5 s dialogue body at -22 dB (frames 100..249, stable throughout —
     // max ≈ body so crest ≈ 12 dB → body-speech).
     for (let i = 0; i < 150; i += 1) frameDb.push(-22);
-    // 0.3 s silence
+    // 0.3 s silence + two more normal body runs so the gasp is no longer
+    // treated as a protected cold-open run.
     for (let i = 0; i < 30; i += 1) frameDb.push(-70);
+    for (let i = 0; i < 100; i += 1) frameDb.push(-22);
+    for (let i = 0; i < 30; i += 1) frameDb.push(-70);
+    for (let i = 0; i < 100; i += 1) frameDb.push(-22);
+    for (let i = 0; i < 140; i += 1) frameDb.push(-70);
     // 0.25 s gasp: 25 frames. 2 frames at 0 dB (gasp "puff"), 23 frames
     // at -25 dB (quiet post-puff tail). Body mean ≈ -11 dB, max = 0 dB,
     // estimated peak = 0 + 12 = +12 dB → crest ≈ 23 dB → transient-breath.
@@ -348,7 +696,9 @@ describe("run classification", () => {
 
     const speechRuns = [
       { startFrame: 100, endFrame: 250 }, // dialogue (1.5 s)
-      { startFrame: 280, endFrame: 305 }, // gasp (250 ms)
+      { startFrame: 280, endFrame: 380 }, // dialogue (1.0 s)
+      { startFrame: 410, endFrame: 510 }, // dialogue (1.0 s)
+      { startFrame: 650, endFrame: 675 }, // gasp (250 ms)
     ];
     const plan = planGainCurve({
       frameDb,
@@ -360,19 +710,19 @@ describe("run classification", () => {
       targetDb: -22,
     });
 
-    assert.equal(plan.runs.length, 2);
+    assert.equal(plan.runs.length, 4);
     assert.equal(plan.runs[0].runClass, "body-speech");
     assert.equal(
-      plan.runs[1].runClass,
+      plan.runs[3].runClass,
       "transient-breath",
-      `gasp should classify as breath (crest=${plan.runs[1].crestDb.toFixed(1)} dB, len=${(plan.runs[1].endFrame - plan.runs[1].startFrame) * 10} ms)`,
+      `gasp should classify as breath (crest=${plan.runs[3].crestDb.toFixed(1)} dB, len=${(plan.runs[3].endFrame - plan.runs[3].startFrame) * 10} ms)`,
     );
     assert.equal(plan.breathRunCount, 1);
 
     // Breath runs use a tighter ±6 dB clamp AND a lower target (breathTarget
     // = targetDb - 2.5 = -24.5). Whatever the gasp body RMS came out to,
     // the planned gain must stay within [-6, 6].
-    const gaspGain = plan.runs[1].plannedGainDb;
+    const gaspGain = plan.runs[3].plannedGainDb;
     assert.ok(
       gaspGain <= 6 && gaspGain >= -6,
       `gasp gain must stay in tight breath clamp, got ${gaspGain.toFixed(2)} dB`,
@@ -785,13 +1135,18 @@ describe("ramp placement", () => {
       `last body frame ${bodyLastDb.toFixed(2)} dB should be close to mid ${bodyMidDb.toFixed(2)} dB (no release-duck)`,
     );
 
-    // Just before the run (frame 99 → t = 0.99 s, 10 ms before run start)
-    // should still be mid-attack, not at full body gain. Expander floor is
-    // much lower, so it's between those two.
+    // Phase-1 cold-open protection completes the first-run attack before
+    // the detected start, so the last few pre-run frames are already at body
+    // gain while deeper pre-roll remains below body.
     const attackEdgeDb = 20 * Math.log10(plan.gainCurve[99] + 1e-9);
     assert.ok(
-      attackEdgeDb < bodyFirstDb,
-      `attack edge ${attackEdgeDb.toFixed(2)} dB should be below body first ${bodyFirstDb.toFixed(2)} dB`,
+      Math.abs(attackEdgeDb - bodyFirstDb) < 0.3,
+      `attack edge ${attackEdgeDb.toFixed(2)} dB should be at body first ${bodyFirstDb.toFixed(2)} dB`,
+    );
+    const attackPreRollDb = 20 * Math.log10(plan.gainCurve[92] + 1e-9);
+    assert.ok(
+      attackPreRollDb < bodyFirstDb,
+      `deeper attack pre-roll ${attackPreRollDb.toFixed(2)} dB should be below body first ${bodyFirstDb.toFixed(2)} dB`,
     );
 
     // Deep in the post-run silence (frame 299 → 2.99 s, well past 500 ms

@@ -12,11 +12,20 @@
 
 export const SPECTRUM_BANDS_HZ = [60, 120, 250, 500, 1000, 2000, 4000, 8000] as const;
 export type SpectrumBandsHz = typeof SPECTRUM_BANDS_HZ;
+export const HOUSE_TONE_BLEND = 0.35;
+export const CINEMATIC_VO_REFERENCE_DB = [-28, -23, -21, -22, -23, -21.5, -20.5, -24] as const;
+
+export const DE_ESSER_PLACEMENTS = {
+  lowCenter: { mainHz: 5800, secondaryHz: 8200 },
+  balanced: { mainHz: 6500, secondaryHz: 9000 },
+  highCenter: { mainHz: 7200, secondaryHz: 9800 },
+} as const;
 
 /** Width of each band in octaves. 1.0 = one octave wide, centered on band Hz. */
 const DEFAULT_BAND_WIDTH_OCT = 0.7;
 const FRAME_MS = 20;
 const HOP_MS = 20;
+export const DEFAULT_MAX_SPECTRUM_FRAMES = 1600;
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -45,6 +54,23 @@ const buildBandFilters = (sampleRate: number, bands: readonly number[], widthOct
   });
 };
 
+export const resolveSpectrumFrameBudget = (
+  sampleCount: number,
+  sampleRate: number,
+  options?: { maxFrames?: number; frameStride?: number },
+) => {
+  const frameSize = Math.max(32, Math.round((sampleRate * FRAME_MS) / 1000));
+  const hopSize = Math.max(1, Math.round((sampleRate * HOP_MS) / 1000));
+  const totalFrames = sampleCount >= frameSize ? Math.floor((sampleCount - frameSize) / hopSize) + 1 : 0;
+  const maxFrames = Math.max(1, Math.floor(options?.maxFrames ?? DEFAULT_MAX_SPECTRUM_FRAMES));
+  const frameStride =
+    typeof options?.frameStride === "number" && Number.isFinite(options.frameStride) && options.frameStride > 0
+      ? Math.max(1, Math.floor(options.frameStride))
+      : Math.max(1, Math.ceil(totalFrames / maxFrames));
+  const framesToVisit = totalFrames === 0 ? 0 : Math.ceil(totalFrames / frameStride);
+  return { frameSize, hopSize, totalFrames, frameStride, framesToVisit };
+};
+
 /**
  * Compute per-band average energy (dB) across the entire signal.
  * Returns one number per band in SPECTRUM_BANDS_HZ order.
@@ -52,13 +78,12 @@ const buildBandFilters = (sampleRate: number, bands: readonly number[], widthOct
 export const computeLogBandSpectrumDb = (
   samples: Float32Array,
   sampleRate: number,
-  options?: { bands?: readonly number[]; widthOct?: number },
+  options?: { bands?: readonly number[]; widthOct?: number; maxFrames?: number; frameStride?: number },
 ): number[] => {
   const bandsHz = options?.bands ?? SPECTRUM_BANDS_HZ;
   const widthOct = options?.widthOct ?? DEFAULT_BAND_WIDTH_OCT;
   const filters = buildBandFilters(sampleRate, bandsHz, widthOct);
-  const frameSize = Math.max(32, Math.round((sampleRate * FRAME_MS) / 1000));
-  const hopSize = Math.max(1, Math.round((sampleRate * HOP_MS) / 1000));
+  const { frameSize, hopSize, totalFrames, frameStride } = resolveSpectrumFrameBudget(samples.length, sampleRate, options);
 
   // Hann window for modest leakage suppression.
   const window = new Float32Array(frameSize);
@@ -69,7 +94,8 @@ export const computeLogBandSpectrumDb = (
   const bandSumPower = new Array<number>(filters.length).fill(0);
   let framesCounted = 0;
 
-  for (let frameStart = 0; frameStart + frameSize <= samples.length; frameStart += hopSize) {
+  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += frameStride) {
+    const frameStart = frameIndex * hopSize;
     // Skip near-silent frames so background hiss doesn't dominate the median.
     let rms = 0;
     for (let i = 0; i < frameSize; i += 1) {
@@ -128,6 +154,17 @@ export const computeSibilanceScore = (bandDb: number[]): number => {
   return clamp((ratio + 1) / 9, 0, 1); // 0 at ratio=-1dB, 1 at ratio=+8dB
 };
 
+export const resolveDeEsserBands = (bandDb: number[]) => {
+  if (bandDb.length < 8) return DE_ESSER_PLACEMENTS.balanced;
+  const body = (bandDb[4] + bandDb[5]) / 2;
+  const lowSibilance = bandDb[6] - body;
+  const highSibilance = bandDb[7] - body;
+  const centerBiasDb = highSibilance - lowSibilance;
+  if (centerBiasDb >= 2) return DE_ESSER_PLACEMENTS.highCenter;
+  if (centerBiasDb <= -2) return DE_ESSER_PLACEMENTS.lowCenter;
+  return DE_ESSER_PLACEMENTS.balanced;
+};
+
 /**
  * Build a per-band corrective EQ delta (in dB) that nudges `fileDb` toward `referenceDb`.
  * Output is one delta per band, clamped to +/- maxDb.
@@ -135,16 +172,46 @@ export const computeSibilanceScore = (bandDb: number[]): number => {
 export const computeToneMatchDeltaDb = (
   fileDb: number[],
   referenceDb: number[],
-  maxDb = 3,
+  optionsOrMaxDb:
+    | number
+    | {
+        maxDb?: number;
+        houseBlend?: number;
+        houseReferenceDb?: readonly number[];
+        priorityBandCount?: number;
+        priorityMaxDb?: number;
+      } = 3,
 ): number[] => {
   const n = Math.min(fileDb.length, referenceDb.length);
+  const options = typeof optionsOrMaxDb === "number" ? { maxDb: optionsOrMaxDb } : optionsOrMaxDb;
+  const maxDb = options.maxDb ?? 3;
+  const houseBlend = clamp(options.houseBlend ?? 0, 0, 1);
+  const houseReferenceDb = options.houseReferenceDb ?? CINEMATIC_VO_REFERENCE_DB;
+  const priorityBandCount = Math.max(0, Math.floor(options.priorityBandCount ?? (houseBlend > 0 ? 2 : 0)));
+  const priorityMaxDb = options.priorityMaxDb ?? Math.max(maxDb, 3);
+  const effectiveReferenceDb = referenceDb.slice(0, n).map((value, index) => {
+    const houseValue = houseReferenceDb[index];
+    return typeof houseValue === "number" && Number.isFinite(houseValue)
+      ? value * (1 - houseBlend) + houseValue * houseBlend
+      : value;
+  });
   // Normalize out the mean difference (that's a loudness offset, not tone).
   const meanFile = fileDb.slice(0, n).reduce((a, b) => a + b, 0) / n;
-  const meanRef = referenceDb.slice(0, n).reduce((a, b) => a + b, 0) / n;
+  const meanRef = effectiveReferenceDb.reduce((a, b) => a + b, 0) / n;
   const offset = meanRef - meanFile;
-  const out = new Array<number>(n);
+  const raw = new Array<number>(n);
   for (let i = 0; i < n; i += 1) {
-    out[i] = clamp(referenceDb[i] - fileDb[i] - offset, -maxDb, maxDb);
+    raw[i] = effectiveReferenceDb[i] - fileDb[i] - offset;
   }
-  return out;
+  const priorityIndexes = new Set(
+    raw
+      .map((value, index) => ({ value: Math.abs(value), index }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, priorityBandCount)
+      .map((item) => item.index),
+  );
+  return raw.map((value, index) => {
+    const cap = priorityIndexes.has(index) ? priorityMaxDb : maxDb;
+    return clamp(value, -cap, cap);
+  });
 };

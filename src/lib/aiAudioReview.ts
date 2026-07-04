@@ -19,11 +19,15 @@ export type AudioReviewControls = {
 };
 
 export type AudioReviewMetricSnapshot = {
+  integratedLufs: number | null;
   instabilityScore: number | null;
   lineSwingScore: number | null;
   sentenceJumpScore: number | null;
+  coldOpenDipDb: number | null;
+  coldOpenRiskScore: number | null;
   midLineSagScore: number | null;
   endFadeRiskScore: number | null;
+  endEdgeDipDb: number | null;
   onsetOvershootScore: number | null;
   breathSpikeRisk: number | null;
   pauseNoiseRisk: number | null;
@@ -37,6 +41,7 @@ export type AudioReviewMetricSnapshot = {
   dynamicRangeDb: number | null;
   speechDutyCyclePct: number | null;
   speechSegmentCount: number | null;
+  bandSpectrumDb: number[] | null;
 };
 
 export type AudioReviewProfileSnapshot = {
@@ -71,6 +76,14 @@ export type AudioReviewSelectedCandidate = {
   variant: string;
   reason: string | null;
   processingFlow: string | null;
+  qc: AudioReviewMetricSnapshot | null;
+  qcDelta: Record<string, number | null> | null;
+  alignment: {
+    durationDeltaSec: number | null;
+    estimatedOffsetSec: number | null;
+    confidence: number | null;
+  } | null;
+  issueTags: string[];
   score: {
     stability: number | null;
     pause: number | null;
@@ -91,6 +104,7 @@ export type AudioReviewFileInput = {
 
 export type AudioReviewRequestPayload = {
   generatedAt: string;
+  reviewStage: "source" | "post-render";
   controls: AudioReviewControls;
   files: AudioReviewFileInput[];
 };
@@ -122,6 +136,9 @@ export type AudioReviewAdaptiveDirectives = {
   roomCleanupBias: number;
   compressionBias: number;
   finalPolishIntensity: number;
+  targetLoudnessBiasDb: number;
+  levelerBias: number;
+  headGuardBoost: number;
 };
 
 export type AudioReviewRecommendedProfile = {
@@ -215,12 +232,16 @@ export type GeminiAudioReviewRequest = {
   body: GeminiAudioReviewBody;
 };
 
-const metricKeys: Array<keyof AudioReviewMetricSnapshot> = [
+const metricKeys: Array<Exclude<keyof AudioReviewMetricSnapshot, "bandSpectrumDb">> = [
+  "integratedLufs",
   "instabilityScore",
   "lineSwingScore",
   "sentenceJumpScore",
+  "coldOpenDipDb",
+  "coldOpenRiskScore",
   "midLineSagScore",
   "endFadeRiskScore",
+  "endEdgeDipDb",
   "onsetOvershootScore",
   "breathSpikeRisk",
   "pauseNoiseRisk",
@@ -273,17 +294,20 @@ const AUDIO_REVIEW_RECOMMENDED_PROFILE_SCHEMA = {
 const AUDIO_REVIEW_ADAPTIVE_DIRECTIVES_SCHEMA = {
   type: "object",
   properties: {
-    warmthDb: { type: "number", minimum: -1.2, maximum: 1.2 },
-    presenceDb: { type: "number", minimum: -1.2, maximum: 1.2 },
-    airDb: { type: "number", minimum: -0.9, maximum: 0.9 },
-    deHarshDb: { type: "number", minimum: 0, maximum: 1.2 },
-    sagRecoveryBoost: { type: "number", minimum: -0.1, maximum: 0.45 },
-    onsetTameBoost: { type: "number", minimum: -0.1, maximum: 0.45 },
-    breathTameBoost: { type: "number", minimum: -0.1, maximum: 0.45 },
-    denoiseBias: { type: "number", minimum: -0.1, maximum: 0.45 },
-    roomCleanupBias: { type: "number", minimum: -0.1, maximum: 0.45 },
-    compressionBias: { type: "number", minimum: -0.45, maximum: 0.45 },
+    warmthDb: { type: "number", minimum: -1.8, maximum: 1.8 },
+    presenceDb: { type: "number", minimum: -1.8, maximum: 1.8 },
+    airDb: { type: "number", minimum: -1.2, maximum: 1.2 },
+    deHarshDb: { type: "number", minimum: 0, maximum: 1.8 },
+    sagRecoveryBoost: { type: "number", minimum: -0.15, maximum: 0.7 },
+    onsetTameBoost: { type: "number", minimum: -0.15, maximum: 0.7 },
+    breathTameBoost: { type: "number", minimum: -0.15, maximum: 0.7 },
+    denoiseBias: { type: "number", minimum: -0.15, maximum: 0.7 },
+    roomCleanupBias: { type: "number", minimum: -0.15, maximum: 0.7 },
+    compressionBias: { type: "number", minimum: -0.6, maximum: 0.6 },
     finalPolishIntensity: { type: "number", minimum: 0, maximum: 1 },
+    targetLoudnessBiasDb: { type: "number", minimum: -1.5, maximum: 1.5 },
+    levelerBias: { type: "number", minimum: -0.5, maximum: 0.5 },
+    headGuardBoost: { type: "number", minimum: 0, maximum: 1 },
   },
   required: [
     "warmthDb",
@@ -297,6 +321,9 @@ const AUDIO_REVIEW_ADAPTIVE_DIRECTIVES_SCHEMA = {
     "roomCleanupBias",
     "compressionBias",
     "finalPolishIntensity",
+    "targetLoudnessBiasDb",
+    "levelerBias",
+    "headGuardBoost",
   ],
 } as const;
 
@@ -393,7 +420,7 @@ The app pipeline you are reviewing:
 
 Primary quality target: actors recorded with different microphones and settings should converge toward the same rich, smooth, balanced, crystal-clear, cinematic house tone while preserving actor identity and performance intent.
 
-Known problem to hunt: rare mid-sentence shallow-volume dips that recover later, plus occasional harsh or sharp VO. Prioritize line continuity, mid-line sag, sentence jump, sibilance, over-compression, and bright presence/air risks. Recommend subtle changes only; never propose extreme EQ, heavy compression, or fully replacing the actor's voice.
+Known problem to hunt: cold-open dips where the first few words sit below the later dialogue body, rare mid-sentence shallow-volume dips that recover later, plus occasional harsh or sharp VO. Prioritize coldOpenDipDb, line continuity, mid-line sag, sentence jump, sibilance, over-compression, and bright presence/air risks. Recommend subtle changes only; never propose extreme EQ, heavy compression, or fully replacing the actor's voice.
 
 You must return one perFileProfiles entry for every input file. Each file needs its own recommendedProfile and adaptiveDirectives. Do not collapse the batch into one shared profile; use the batch only as a house-tone reference. Use adaptiveDirectives as bounded micro-intents for the adaptive DSP: warmth/presence/air bias, de-harshing, sag recovery, onset/breath taming, denoise/room bias, compression bias, and single-pass final polish intensity. These are expert nudges, not raw filter graphs.
 
@@ -450,6 +477,9 @@ export const DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES: AudioReviewAdaptiveDirect
   roomCleanupBias: 0,
   compressionBias: 0,
   finalPolishIntensity: 0.5,
+  targetLoudnessBiasDb: 0,
+  levelerBias: 0,
+  headGuardBoost: 0,
 };
 
 const boolOrFalse = (value: unknown) => value === true;
@@ -462,43 +492,43 @@ const stringEnum = <T extends string>(value: unknown, allowed: readonly T[], fal
 const boundedNumber = (value: unknown, fallback: number, min: number, max: number) =>
   clamp(finiteOrNull(value) ?? fallback, min, max);
 
-const normalizeAdaptiveDirectives = (value: unknown): AudioReviewAdaptiveDirectives => {
+export const normalizeAdaptiveDirectives = (value: unknown): AudioReviewAdaptiveDirectives => {
   const record = isRecord(value) ? value : {};
   return {
-    warmthDb: boundedNumber(record.warmthDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.warmthDb, -1.2, 1.2),
-    presenceDb: boundedNumber(record.presenceDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.presenceDb, -1.2, 1.2),
-    airDb: boundedNumber(record.airDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.airDb, -0.9, 0.9),
-    deHarshDb: boundedNumber(record.deHarshDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.deHarshDb, 0, 1.2),
+    warmthDb: boundedNumber(record.warmthDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.warmthDb, -1.8, 1.8),
+    presenceDb: boundedNumber(record.presenceDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.presenceDb, -1.8, 1.8),
+    airDb: boundedNumber(record.airDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.airDb, -1.2, 1.2),
+    deHarshDb: boundedNumber(record.deHarshDb, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.deHarshDb, 0, 1.8),
     sagRecoveryBoost: boundedNumber(
       record.sagRecoveryBoost,
       DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.sagRecoveryBoost,
-      -0.1,
-      0.45,
+      -0.15,
+      0.7,
     ),
     onsetTameBoost: boundedNumber(
       record.onsetTameBoost,
       DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.onsetTameBoost,
-      -0.1,
-      0.45,
+      -0.15,
+      0.7,
     ),
     breathTameBoost: boundedNumber(
       record.breathTameBoost,
       DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.breathTameBoost,
-      -0.1,
-      0.45,
+      -0.15,
+      0.7,
     ),
-    denoiseBias: boundedNumber(record.denoiseBias, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.denoiseBias, -0.1, 0.45),
+    denoiseBias: boundedNumber(record.denoiseBias, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.denoiseBias, -0.15, 0.7),
     roomCleanupBias: boundedNumber(
       record.roomCleanupBias,
       DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.roomCleanupBias,
-      -0.1,
-      0.45,
+      -0.15,
+      0.7,
     ),
     compressionBias: boundedNumber(
       record.compressionBias,
       DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.compressionBias,
-      -0.45,
-      0.45,
+      -0.6,
+      0.6,
     ),
     finalPolishIntensity: boundedNumber(
       record.finalPolishIntensity,
@@ -506,6 +536,14 @@ const normalizeAdaptiveDirectives = (value: unknown): AudioReviewAdaptiveDirecti
       0,
       1,
     ),
+    targetLoudnessBiasDb: boundedNumber(
+      record.targetLoudnessBiasDb,
+      DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.targetLoudnessBiasDb,
+      -1.5,
+      1.5,
+    ),
+    levelerBias: boundedNumber(record.levelerBias, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.levelerBias, -0.5, 0.5),
+    headGuardBoost: boundedNumber(record.headGuardBoost, DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES.headGuardBoost, 0, 1),
   };
 };
 
@@ -530,10 +568,12 @@ const normalizeControls = (value: unknown): AudioReviewControls | null => {
 
 const normalizeMetrics = (value: unknown): AudioReviewMetricSnapshot => {
   const record = isRecord(value) ? value : {};
-  return metricKeys.reduce((acc, key) => {
+  const metrics = metricKeys.reduce((acc, key) => {
     acc[key] = finiteOrNull(record[key]);
     return acc;
   }, {} as AudioReviewMetricSnapshot);
+  metrics.bandSpectrumDb = finiteNumberArray(record.bandSpectrumDb, 8);
+  return metrics;
 };
 
 const normalizeProfile = (value: unknown): AudioReviewProfileSnapshot | null => {
@@ -569,6 +609,13 @@ const normalizeProfile = (value: unknown): AudioReviewProfileSnapshot | null => 
 
 const normalizeSelectedCandidate = (value: unknown): AudioReviewSelectedCandidate | null => {
   if (!isRecord(value)) return null;
+  const alignment = isRecord(value.alignment)
+    ? {
+        durationDeltaSec: finiteOrNull(value.alignment.durationDeltaSec),
+        estimatedOffsetSec: finiteOrNull(value.alignment.estimatedOffsetSec),
+        confidence: finiteOrNull(value.alignment.confidence),
+      }
+    : null;
   const score = isRecord(value.score)
     ? {
         stability: finiteOrNull(value.score.stability),
@@ -582,9 +629,76 @@ const normalizeSelectedCandidate = (value: unknown): AudioReviewSelectedCandidat
     variant: cleanString(value.variant, "unknown", 60),
     reason: cleanString(value.reason, "", 180) || null,
     processingFlow: cleanString(value.processingFlow, "", 80) || null,
+    qc: normalizeMetrics(value.qc),
+    qcDelta: isRecord(value.qcDelta)
+      ? Object.fromEntries(Object.entries(value.qcDelta).map(([key, item]) => [key, finiteOrNull(item)]))
+      : null,
+    alignment,
+    issueTags: stringArray(value.issueTags, 10, 80),
     score,
   };
 };
+
+const directiveDeltaKeys: Array<keyof AudioReviewAdaptiveDirectives> = [
+  "warmthDb",
+  "presenceDb",
+  "airDb",
+  "deHarshDb",
+  "sagRecoveryBoost",
+  "onsetTameBoost",
+  "breathTameBoost",
+  "denoiseBias",
+  "roomCleanupBias",
+  "compressionBias",
+  "targetLoudnessBiasDb",
+  "levelerBias",
+  "headGuardBoost",
+];
+
+export const CORRECTIVE_DIRECTIVE_MAP: Record<string, Partial<AudioReviewAdaptiveDirectives>> = {
+  cold_open_dip: { headGuardBoost: 0.5, targetLoudnessBiasDb: 0.35 },
+  harsh_sibilance: { deHarshDb: 0.6, airDb: -0.25, presenceDb: -0.15 },
+  too_compressed: { compressionBias: -0.35, finalPolishIntensity: -0.2, levelerBias: -0.25 },
+  pause_noise_lift: { denoiseBias: 0.3 },
+  echo_roomy: { roomCleanupBias: 0.35 },
+  level_uneven: { levelerBias: 0.35, sagRecoveryBoost: 0.25 },
+  endings_damaged: { sagRecoveryBoost: -0.15, compressionBias: -0.2, finalPolishIntensity: -0.25 },
+  clicks_artifacts: { onsetTameBoost: 0.25, breathTameBoost: 0.15 },
+};
+
+export const mergeAudioReviewAdaptiveDirectives = (
+  base: AudioReviewAdaptiveDirectives,
+  delta: Partial<AudioReviewAdaptiveDirectives>,
+) =>
+  normalizeAdaptiveDirectives({
+    ...base,
+    ...Object.fromEntries(
+      Object.entries(delta).map(([key, value]) => [
+        key,
+        typeof value === "number" && Number.isFinite(value)
+          ? (base[key as keyof AudioReviewAdaptiveDirectives] ?? 0) + value
+          : value,
+      ]),
+    ),
+  });
+
+export const buildCorrectiveDirectivesForIssueTags = (issueTags: string[]) => {
+  let merged: AudioReviewAdaptiveDirectives = { ...DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES };
+  for (const tag of issueTags) {
+    const delta = CORRECTIVE_DIRECTIVE_MAP[tag];
+    if (delta) {
+      merged = mergeAudioReviewAdaptiveDirectives(merged, delta);
+    }
+  }
+  return merged;
+};
+
+export const hasNonTrivialAdaptiveDirectives = (
+  directives: AudioReviewAdaptiveDirectives,
+  baseline: AudioReviewAdaptiveDirectives = DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES,
+) =>
+  directiveDeltaKeys.some((key) => Math.abs((directives[key] ?? 0) - (baseline[key] ?? 0)) >= 0.05) ||
+  Math.abs(directives.finalPolishIntensity - baseline.finalPolishIntensity) >= 0.15;
 
 export const normalizeAudioReviewRequest = (value: unknown): AudioReviewRequestPayload | null => {
   if (!isRecord(value)) return null;
@@ -613,6 +727,7 @@ export const normalizeAudioReviewRequest = (value: unknown): AudioReviewRequestP
 
   return {
     generatedAt: cleanString(value.generatedAt, new Date().toISOString(), 80),
+    reviewStage: stringEnum(value.reviewStage, ["source", "post-render"] as const, "source"),
     controls,
     files,
   };
@@ -630,6 +745,7 @@ export const splitAudioReviewPayloadForGemini = (
   for (let index = 0; index < normalized.files.length; index += AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST) {
     chunks.push({
       generatedAt: normalized.generatedAt,
+      reviewStage: normalized.reviewStage,
       controls: normalized.controls,
       files: normalized.files.slice(index, index + AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST),
     });
@@ -643,21 +759,33 @@ export const buildAudioReviewUserPrompt = (payload: AudioReviewRequestPayload) =
     throw new Error("Invalid audio review payload.");
   }
 
+  const isPostRender = normalized.reviewStage === "post-render";
   return [
-    "Review this source-first VO batch before rendering and recommend the safest processing profile.",
+    isPostRender
+      ? "Review this already-rendered VO batch and recommend one bounded corrective pass only where rendered evidence justifies it."
+      : "Review this source-first VO batch before rendering and recommend the safest processing profile.",
     "",
-    "Required source-first pipeline: per-audio AI review -> per-file adaptive profile -> one app pass -> one subtle final app polish -> result.",
+    isPostRender
+      ? "Required corrective pipeline: rendered QC evidence -> per-file corrective adaptiveDirectives -> one app re-render -> learned ranker keeps the corrective only if it is materially better."
+      : "Required source-first pipeline: per-audio AI review -> per-file adaptive profile -> one app pass -> one subtle final app polish -> result.",
     "App pipeline reminder: source analysis metrics -> per-file AI profile selection -> adaptive profile -> speech-aware gain planner -> one AI-selected render variant -> one subtle final app polish -> loudness delivery.",
     "Neural speech enhancement is temporarily off. Always set neuralSpeechEnhancement to off. Do not recommend ClearVoice, neural repair, neural worker setup, neural bypass logic, neural strength changes, or neural retry behavior.",
-    "Candidate reranking is temporarily off. Pick exactly one selectedVariant from source evidence before render; do not ask for challenger renders, learned reranking, review bundles, or post-render winner selection.",
+    isPostRender
+      ? "Candidate reranking is allowed only between the selected render and one corrective render. Do not ask for more challengers or iterative loops."
+      : "Candidate reranking is temporarily off. Pick exactly one selectedVariant from source evidence before render; do not ask for challenger renders, learned reranking, review bundles, or post-render winner selection.",
     "Return exactly one perFileProfiles item per input file, preserving each fileName and base exactly as provided. Every file can choose a different selectedVariant, controls, and adaptiveDirectives.",
     "House tone target: use the batch reference and profile toneMatchDeltaDb to pull different mics toward the same rich, smooth, balanced bass/treble profile without extreme EQ or voice identity shifts.",
-    "Main failure priorities: mid-sentence shallow-volume dips, line swing, mid-line sag, sentence jumps, harsh sibilance, over-bright presence/air, over-compression, and room/echo that makes actors sound unmatched.",
+    "Main failure priorities: cold-open dips in the first spoken words, mid-sentence shallow-volume dips, line swing, mid-line sag, sentence jumps, harsh sibilance, over-bright presence/air, over-compression, and room/echo that makes actors sound unmatched.",
     "Adaptive safeguards to respect: sagRecoveryStrength, preserveEndings, onsetTameStrength, breathTameStrength, echoNotchCutDb, denoiseStrength, and useTailGate are subtle app controls; do not recommend stacking all of them unless the metrics justify it.",
-    "perFileProfiles[].adaptiveDirectives are bounded expert nudges beyond presets. Keep them subtle: prefer +/-0.2 to +/-0.5 moves, reserve larger moves for strong evidence, and make finalPolishIntensity a single-pass finishing strength, not an iteration request.",
+    isPostRender
+      ? "perFileProfiles[].adaptiveDirectives are absolute final corrective settings for one retry, not deltas. Return the complete bounded final values to use when selectedCandidate.qc, qcDelta, alignment, or issueTags show a real defect."
+      : "perFileProfiles[].adaptiveDirectives are bounded expert nudges beyond presets. Keep them subtle: prefer +/-0.2 to +/-0.5 moves, reserve larger moves for strong evidence, and make finalPolishIntensity a single-pass finishing strength, not an iteration request.",
+    "Directive effects: targetLoudnessBiasDb offsets the speech planner target in dB; levelerBias adjusts leveler/compressor adaptation; headGuardBoost strengthens only the cold-open guard.",
     "Detail rules: every summary, finding, adjustment, guardrail, and listening check should say why it matters using source metrics or profile fields, what app-side action to take, and what audible/QC result should prove it worked.",
     "Recommendation rules: choose the profile and one selectedVariant from source evidence before render, keep parameter changes subtle, preserve actor identity, prefer objective gates over taste, and call out listening checks when the metrics cannot prove a problem.",
-    "The selectedCandidate field may be null because this review happens before the app render. Do not require finished output metrics to make a source-first recommendation.",
+    isPostRender
+      ? "The selectedCandidate field contains rendered output QC, deltas, alignment, and issue tags. Use that evidence; do not invent audio details beyond the metrics."
+      : "The selectedCandidate field may be null because this review happens before the app render. Do not require finished output metrics to make a source-first recommendation.",
     "",
     "Current batch payload:",
     JSON.stringify(normalized, null, 2),

@@ -99,3 +99,89 @@ Latest state at handoff: both pass successfully.
 - SSO is optional but recommended for lower auth maintenance.
 - If using SSO, access can be restricted to one account or a strict allowlist.
 - Username/password auth is possible but has higher maintenance/security overhead than SSO.
+
+---
+
+# Session Summary (2026-07-02)
+
+## Cinematic VO Upgrade
+
+- Added cold-open QC metrics (`coldOpenDipDb`, `coldOpenRiskScore`) across source analysis, candidate QC logs, AI review snapshots, and auto-review WARN/FAIL checks.
+- Fixed cold-open planner behavior:
+  - opener speech is protected from breath/fragment misclassification unless strong sample-backed transient evidence exists,
+  - quiet first dialogue runs can lift toward the later dialogue anchor within bounded caps,
+  - first-run attack ramps complete before the detected opener so the first phoneme does not start at the expander floor.
+- Added exact-duration head priming for stateful ffmpeg chains on single-pass renders, segment zero, and final app polish, with duration verification and unprimed fallback.
+- Added K-weighted planner frame energy so boomy and bright voices converge by perceived loudness instead of plain RMS.
+- Added batch mix-ready loudness alignment over completed clean outputs, median-anchored and capped at +/-2 dB, skipped for loudness-normalized delivery paths.
+- Hardened tone matching with a fixed cinematic VO house-curve blend and adaptive de-esser band placement from measured spectrum.
+- Expanded AI adaptive directives with bounded `targetLoudnessBiasDb`, `levelerBias`, and `headGuardBoost`, plus wider safe ranges for tone, de-harshing, noise/room, and compression nudges.
+- Added post-render review support and exactly one bounded corrective render for flagged files. Corrective output is kept only if it passes hard gates and beats the original by the learned-ranker margin; otherwise the original is retained.
+
+## Guardrails Preserved
+
+- Audio Splitter files were not modified.
+- Neural speech enhancement remains disabled by default and constrained to the existing off path.
+- Corrective and head-prime stages fail closed to the existing render behavior.
+
+## Verification
+
+- Phase gates were run after each implementation phase:
+  - `npm run lint`
+  - `npm run build`
+  - `npm run test:audio-qc`
+- The audio-QC suite now includes `batchLoudnessAlign.test.ts` and `spectrum.test.ts`; latest counted run passed 122 tests with 1 skipped worker smoke test.
+- Manual listening/corpus spot-checks were not run in this pass because no specific real audio corpus was selected for the implementation run.
+
+---
+
+# Session Summary (2026-07-02)
+
+## Cinematic VO Review Fixes
+
+- Priority 1: Split gain-planner raw and K-weighted domains so speech masks, run classification, peak guards, and ending guards stay on raw envelope data while target/gain/micro-ride use optional K-weighted loudness. Added WARN-only `endEdgeDipDb` coverage for short final-phoneme dips that `endFadeRiskScore` did not isolate.
+- Priority 2: Reworked batch mix-ready loudness alignment so MEMFS holds only the current file during measurement and only the current input/output pair during render. Each file is deleted before moving to the next, and the worker recycles through `refreshFfmpeg` after cumulative processed audio crosses `BATCH_AUDIO_RECYCLE_SECONDS`.
+- Priority 3: Tightened corrective triggers to any FAIL, two or more WARNs, one high-value WARN (`cold_open_dip`, `harsh_sibilance`, `too_compressed`, `level_uneven`), or hard gates. Added `resolveCorrectiveMaxFilesPerBatch(jobs.length) = max(2, ceil(jobs.length * 0.4))` plus budget/skip logs.
+- Priority 4: Made `coldOpenDipDb` measure the first `COLD_OPEN_RUN_COUNT` run bodies with the same edge-trimmed body logic used for later dialogue, removing edge-only cold-open false positives without retuning thresholds.
+- Priority 5: Updated post-render Gemini guidance so `adaptiveDirectives` are absolute final corrective values, not deltas. The deterministic `CORRECTIVE_DIRECTIVE_MAP` remains delta-on-base.
+
+## Constants And Evidence
+
+- `PLANNER_K_TARGET_OFFSET_DB = 0.0`: mixed-formant speech fixtures with -4/0/+4 dB high-frequency tilt measured +0.15/-0.04/-0.44 dB raw body shift after the raw/K split, within the +/-0.5 dB pre-K baseline.
+- `BATCH_AUDIO_RECYCLE_SECONDS = 2400`: batch align now writes, measures, deletes, and optionally recycles per file before planning; render alignment writes input, renders output, reads/replaces the `OutputEntry`, deletes both temp files, then moves to the next file.
+- `CORRECTIVE_MAX_FILES_PER_BATCH = max(2, ceil(jobs.length * 0.4))`: exhausted-budget files skip before Gemini post-render review or corrective render, with trigger details logged.
+- Corrective adoption remains ranker-gated: one corrective render max, hard gates must pass, and the corrective must beat the original by `CORRECTIVE_WIN_MARGIN`.
+
+## Verification
+
+- Per-priority gates were run after each fix: `npm run lint`, `npm run build`, `npm run test:audio-qc`.
+- Latest counted run before final closeout: `npm run test:audio-qc` passed 131 tests total, 130 pass, 1 skipped optional worker smoke test.
+
+## Listening Checklist
+
+- A/B the first three spoken runs for each actor: confirm the opening no longer dips down, spikes, then stabilizes.
+- Check bright/sibilant line endings: final consonants should stay audible without a new end-edge dip or over-bright tail.
+- Check boomy versus bright actors in the same batch: perceived dialogue body should converge without flattening performance dynamics.
+- Check batches with three or more flagged files: corrective renders should appear only for clear FAIL/high-value WARN/hard-gate cases and stop at the logged budget.
+- Check any Gemini corrective pass: returned directive values should behave as final absolute settings, while deterministic fallback corrections remain additive deltas from the active base.
+
+---
+
+# Session Summary (2026-07-03)
+
+## Oracle Review Closeout
+
+- Ran the requested first Oracle review over the uncommitted VO upgrade context, applied the release-blocking and high-priority recommendations, then ran the requested second Oracle review.
+- Second Oracle blockers addressed:
+  - Review bundles now fail closed for blend, loudness, and multi-file batch-alignment paths so stale `winner.wav` artifacts are not emitted.
+  - Scene-blend `amix` now uses dry-track duration as the output authority to keep strict duration gates stable.
+  - Sparse clean-take spike shaping was split from the residual loud-cluster safety floor so explicit zeroes cannot bypass safety.
+  - Severe end-edge dips now hard-gate ranking, fail auto-review, and trigger corrective eligibility through `endings_damaged`.
+  - Long-form chunk outputs are staged locally and committed to the UI only after all required parts and variants pass duration and true-peak gates.
+
+## Final Verification
+
+- `npm run test:audio-qc` passed 140 tests total: 139 pass, 1 optional worker smoke skipped.
+- `npm run lint` passed.
+- `npm run build` passed.
+- `git diff --check` passed with only LF-to-CRLF working-copy warnings.

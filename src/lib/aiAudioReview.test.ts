@@ -3,10 +3,13 @@ import test from "node:test";
 import {
   AUDIO_REVIEW_FILES_PER_GEMINI_REQUEST,
   buildAudioReviewControlPatch,
+  buildCorrectiveDirectivesForIssueTags,
   buildSourceFirstAudioReviewPlan,
   buildAudioReviewUserPrompt,
   buildGeminiAudioReviewRequest,
+  hasNonTrivialAdaptiveDirectives,
   mergeChunkedAudioReviewResults,
+  normalizeAdaptiveDirectives,
   normalizeAudioReviewRequest,
   parseGeminiAudioReviewText,
   splitAudioReviewPayloadForGemini,
@@ -30,6 +33,7 @@ const baseControls = {
 
 const reviewPayload = {
   generatedAt: "2026-06-19T00:00:00.000Z",
+  reviewStage: "source" as const,
   controls: baseControls,
   files: [
     {
@@ -37,6 +41,7 @@ const reviewPayload = {
       base: "actor_a",
       durationSeconds: 42.5,
       source: {
+        integratedLufs: -23.4,
         instabilityScore: 0.28,
         lineSwingScore: 0.61,
         sentenceJumpScore: 0.37,
@@ -55,6 +60,7 @@ const reviewPayload = {
         dynamicRangeDb: 13.4,
         speechDutyCyclePct: 48,
         speechSegmentCount: 12,
+        bandSpectrumDb: [-30, -24, -22, -22, -23, -22, -20, -24],
       },
       profile: {
         highpassHz: 78,
@@ -230,9 +236,12 @@ test("merges chunked Gemini review results in original file order with worst ver
       breathTameBoost: 0,
       denoiseBias: 0,
       roomCleanupBias: 0,
-      compressionBias: 0,
-      finalPolishIntensity: 0.5,
-    },
+        compressionBias: 0,
+        finalPolishIntensity: 0.5,
+        targetLoudnessBiasDb: 0,
+        levelerBias: 0,
+        headGuardBoost: 0,
+      },
     profileRationale: [`Actor ${fileIndex} rationale.`],
     guardrails: [`Actor ${fileIndex} guardrail.`],
     nextListeningChecks: [`Actor ${fileIndex} check.`],
@@ -343,7 +352,10 @@ test("parses Gemini JSON review and clamps unsafe confidence values", () => {
             "denoiseBias": 0.8,
             "roomCleanupBias": 1.4,
             "compressionBias": -1.5,
-            "finalPolishIntensity": 1.3
+            "finalPolishIntensity": 1.3,
+            "targetLoudnessBiasDb": 2.5,
+            "levelerBias": -1.1,
+            "headGuardBoost": 1.4
           },
           "profileRationale": ["Line continuity dominates."],
           "guardrails": ["Reject if harshness increases."],
@@ -382,17 +394,20 @@ test("parses Gemini JSON review and clamps unsafe confidence values", () => {
   assert.equal(parsed.perFileProfiles[0].recommendedProfile.selectedVariant, "continuity-safe");
   assert.equal(parsed.perFileProfiles[0].recommendedProfile.neuralSpeechEnhancement, "off");
   assert.deepEqual(parsed.perFileProfiles[0].adaptiveDirectives, {
-    warmthDb: 1.2,
-    presenceDb: -1.2,
-    airDb: -0.9,
-    deHarshDb: 1.2,
-    sagRecoveryBoost: 0.45,
-    onsetTameBoost: -0.1,
-    breathTameBoost: 0.45,
-    denoiseBias: 0.45,
-    roomCleanupBias: 0.45,
-    compressionBias: -0.45,
+    warmthDb: 1.8,
+    presenceDb: -1.6,
+    airDb: -1.2,
+    deHarshDb: 1.8,
+    sagRecoveryBoost: 0.7,
+    onsetTameBoost: -0.15,
+    breathTameBoost: 0.7,
+    denoiseBias: 0.7,
+    roomCleanupBias: 0.7,
+    compressionBias: -0.6,
     finalPolishIntensity: 1,
+    targetLoudnessBiasDb: 1.5,
+    levelerBias: -0.5,
+    headGuardBoost: 1,
   });
   assert.equal(parsed.adjustments.length, 1);
   assert.equal(parsed.findings[0].severity, "high");
@@ -433,7 +448,10 @@ test("parses Gemini review with a missing comma between adjacent array strings",
             "denoiseBias": 0.1,
             "roomCleanupBias": 0.2,
             "compressionBias": -0.15,
-            "finalPolishIntensity": 0.7
+            "finalPolishIntensity": 0.7,
+            "targetLoudnessBiasDb": 0,
+            "levelerBias": 0,
+            "headGuardBoost": 0
           },
           "profileRationale": [
             "midLineSagScore 0.52 needs continuity-safe recovery"
@@ -493,7 +511,10 @@ test("builds a bounded automatic control patch from Gemini profile recommendatio
             "denoiseBias": 0,
             "roomCleanupBias": 0,
             "compressionBias": 0,
-            "finalPolishIntensity": 0.5
+            "finalPolishIntensity": 0.5,
+            "targetLoudnessBiasDb": 0,
+            "levelerBias": 0,
+            "headGuardBoost": 0
           },
           "profileRationale": ["Line continuity risk is high."],
           "guardrails": ["Rerun once only."],
@@ -573,7 +594,10 @@ test("builds separate source-first render plans from per-file Gemini recommendat
             "denoiseBias": 0.1,
             "roomCleanupBias": 0.2,
             "compressionBias": -0.2,
-            "finalPolishIntensity": 0.85
+            "finalPolishIntensity": 0.85,
+            "targetLoudnessBiasDb": 0.2,
+            "levelerBias": 0.1,
+            "headGuardBoost": 0.4
           },
           "profileRationale": ["Pause noise dominates the source."],
           "guardrails": ["Render the selected variant once."],
@@ -607,7 +631,10 @@ test("builds separate source-first render plans from per-file Gemini recommendat
             "denoiseBias": 0,
             "roomCleanupBias": 0.3,
             "compressionBias": 0.12,
-            "finalPolishIntensity": 0.6
+            "finalPolishIntensity": 0.6,
+            "targetLoudnessBiasDb": -0.1,
+            "levelerBias": 0.2,
+            "headGuardBoost": 0
           },
           "profileRationale": ["Line continuity dominates."],
           "guardrails": ["Keep warmth subtle."],
@@ -668,6 +695,9 @@ test("builds separate source-first render plans from per-file Gemini recommendat
     roomCleanupBias: 0.2,
     compressionBias: -0.2,
     finalPolishIntensity: 0.85,
+    targetLoudnessBiasDb: 0.2,
+    levelerBias: 0.1,
+    headGuardBoost: 0.4,
   });
   assert.match(plan.summary, /source-first/i);
   assert.equal(secondPlan.selectedVariant, "continuity-safe");
@@ -676,4 +706,74 @@ test("builds separate source-first render plans from per-file Gemini recommendat
   assert.equal(secondPlan.adaptiveDirectives.warmthDb, 0.7);
   assert.equal(secondPlan.adaptiveDirectives.finalPolishIntensity, 0.6);
   assert.notDeepEqual(secondPlan.adaptiveDirectives, plan.adaptiveDirectives);
+});
+
+test("post-render prompt uses selected candidate evidence and permits one bounded corrective pass", () => {
+  const prompt = buildAudioReviewUserPrompt({
+    ...reviewPayload,
+    reviewStage: "post-render",
+    files: [
+      {
+        ...reviewPayload.files[0],
+        selectedCandidate: {
+          variant: "cinematic-stable",
+          reason: "selected render",
+          processingFlow: "app-final-polish",
+          qc: {
+            ...reviewPayload.files[0].source,
+            integratedLufs: -23.8,
+            coldOpenDipDb: 3.2,
+            coldOpenRiskScore: 0.55,
+            bandSpectrumDb: [-30, -24, -22, -22, -23, -22, -20, -24],
+          },
+          qcDelta: { coldOpenDipDb: 1.8, sibilanceScore: 0.1 },
+          alignment: { durationDeltaSec: 0.01, estimatedOffsetSec: 0.02, confidence: 0.7 },
+          issueTags: ["cold_open_dip"],
+          score: { stability: 0.2, pause: 0.1, compression: 0.12, echo: 0.05, total: 170 },
+        },
+      },
+    ],
+  });
+
+  assert.match(prompt, /already-rendered VO batch/i);
+  assert.match(prompt, /one bounded corrective pass/i);
+  assert.match(prompt, /absolute final corrective settings/i);
+  assert.match(prompt, /not deltas/i);
+  assert.doesNotMatch(prompt, /corrective deltas/i);
+  assert.match(prompt, /selectedCandidate field contains rendered output QC/i);
+  assert.match(prompt, /headGuardBoost/i);
+});
+
+test("post-render Gemini adaptive directives normalize as absolute final values", () => {
+  const directives = normalizeAdaptiveDirectives({
+    finalPolishIntensity: 0.25,
+    headGuardBoost: 0.2,
+    compressionBias: -0.15,
+  });
+
+  assert.equal(directives.finalPolishIntensity, 0.25);
+  assert.equal(directives.headGuardBoost, 0.2);
+  assert.equal(directives.compressionBias, -0.15);
+});
+
+test("deterministic corrective directive map produces non-trivial bounded deltas", () => {
+  const directives = buildCorrectiveDirectivesForIssueTags([
+    "cold_open_dip",
+    "harsh_sibilance",
+    "too_compressed",
+  ]);
+
+  assert.equal(directives.headGuardBoost, 0.5);
+  assert.equal(directives.deHarshDb, 0.6);
+  assert.equal(directives.compressionBias, -0.35);
+  assert.equal(directives.finalPolishIntensity, 0.3);
+  assert.equal(directives.levelerBias, -0.25);
+  assert.equal(hasNonTrivialAdaptiveDirectives(directives), true);
+});
+
+test("deterministic ending corrections reduce final polish instead of increasing it", () => {
+  const directives = buildCorrectiveDirectivesForIssueTags(["endings_damaged"]);
+
+  assert.equal(directives.compressionBias, -0.2);
+  assert.equal(directives.finalPolishIntensity, 0.25);
 });

@@ -2,6 +2,14 @@
 
 export const AUDIO_QC_FRAME_MS = 10;
 const AUDIO_QC_FLOOR_DB = -120;
+const COLD_OPEN_HEAD_MS = 2500;
+const COLD_OPEN_RUN_COUNT = 3;
+const COLD_OPEN_WARN_DB = 1.5;
+const COLD_OPEN_FLAG_DB = 2.5;
+const COLD_OPEN_RISK_FLOOR_DB = 1.0;
+const COLD_OPEN_RISK_SPAN_DB = 4.0;
+const END_EDGE_TAIL_MS = 150;
+const END_EDGE_BODY_MS = 450;
 
 export type AudioQcMetrics = {
   peakDb: number | null;
@@ -21,8 +29,11 @@ export type AudioQcMetrics = {
   onsetOvershootScore: number;
   midLineSagScore: number;
   endFadeRiskScore: number;
+  endEdgeDipDb: number;
   lineSwingScore: number;
   sentenceJumpScore: number;
+  coldOpenDipDb: number;
+  coldOpenRiskScore: number;
   breathSpikeRisk: number;
   pauseNoiseRisk: number;
   compressionScore: number;
@@ -277,6 +288,22 @@ const meanSlice = (values: number[], start: number, end: number) => {
   return sum / (safeEnd - safeStart);
 };
 
+const powerMeanDbSlice = (values: number[], start: number, end: number) => {
+  const safeStart = Math.max(0, start);
+  const safeEnd = Math.min(values.length, end);
+  if (safeEnd <= safeStart) return null;
+  let sumPower = 0;
+  let count = 0;
+  for (let index = safeStart; index < safeEnd; index += 1) {
+    const value = values[index];
+    if (!Number.isFinite(value)) continue;
+    sumPower += Math.pow(10, value / 10);
+    count += 1;
+  }
+  if (count === 0) return null;
+  return 10 * Math.log10(sumPower / count + 1e-30);
+};
+
 const computeLineSwingScore = (
   frameDb: number[],
   speechRuns: FrameRun[]
@@ -364,6 +391,93 @@ const computeSentenceJumpScore = (
   return clamp(percentile(jumps, sparseMode ? 80 : 75) ?? 0, 0, 1);
 };
 
+const computeEdgeTrimmedRunBodyDb = (frameDb: number[], run: FrameRun) => {
+  const runFrames = run.end - run.start;
+  if (runFrames < 12) return null;
+  const edgeTrimFrames =
+    runFrames < 55
+      ? Math.max(1, Math.min(4, Math.floor(runFrames * 0.1)))
+      : Math.max(6, Math.min(18, Math.floor(runFrames * 0.14)));
+  const bodyStart = Math.min(run.end - 1, run.start + edgeTrimFrames);
+  const bodyEnd = Math.max(bodyStart + 1, run.end - edgeTrimFrames);
+  return powerMeanDbSlice(frameDb, bodyStart, bodyEnd) ?? powerMeanDbSlice(frameDb, run.start, run.end);
+};
+
+const computeColdOpenMetrics = (
+  frameDb: number[],
+  speechRuns: FrameRun[],
+  frameMs: number,
+) => {
+  if (speechRuns.length < 2) {
+    return { coldOpenDipDb: 0, coldOpenRiskScore: 0 };
+  }
+
+  const maxHeadFrames = Math.max(1, Math.round(COLD_OPEN_HEAD_MS / frameMs));
+  const runLimit = Math.min(COLD_OPEN_RUN_COUNT, Math.max(1, speechRuns.length - 1));
+  const headBodyDb: number[] = [];
+  let remainingHeadFrames = maxHeadFrames;
+  let headWindowEndFrame = speechRuns[0].start;
+
+  for (let runIndex = 0; runIndex < runLimit && remainingHeadFrames > 0; runIndex += 1) {
+    const run = speechRuns[runIndex];
+    const takeFrames = Math.min(run.end - run.start, remainingHeadFrames);
+    const bodyDb = computeEdgeTrimmedRunBodyDb(frameDb, { start: run.start, end: run.start + takeFrames });
+    if (bodyDb !== null) headBodyDb.push(bodyDb);
+    remainingHeadFrames -= takeFrames;
+    headWindowEndFrame = run.start + takeFrames;
+  }
+
+  if (headBodyDb.length === 0) {
+    return { coldOpenDipDb: 0, coldOpenRiskScore: 0 };
+  }
+
+  const headSpeechDb = Math.min(...headBodyDb);
+  if (!Number.isFinite(headSpeechDb)) {
+    return { coldOpenDipDb: 0, coldOpenRiskScore: 0 };
+  }
+
+  const bodyMeans: number[] = [];
+  for (const run of speechRuns) {
+    if (run.start < headWindowEndFrame) continue;
+    const bodyDb = computeEdgeTrimmedRunBodyDb(frameDb, run);
+    if (bodyDb !== null) bodyMeans.push(bodyDb);
+  }
+
+  const bodySpeechDb = median(bodyMeans);
+  if (bodySpeechDb === null) {
+    return { coldOpenDipDb: 0, coldOpenRiskScore: 0 };
+  }
+
+  const coldOpenDipDb = bodySpeechDb - headSpeechDb;
+  const coldOpenRiskScore = clamp((coldOpenDipDb - COLD_OPEN_RISK_FLOOR_DB) / COLD_OPEN_RISK_SPAN_DB, 0, 1);
+  return { coldOpenDipDb, coldOpenRiskScore };
+};
+
+const computeEndEdgeDipDb = (
+  frameDb: number[],
+  speechRuns: FrameRun[],
+  frameMs: number,
+) => {
+  const tailFrames = Math.max(3, Math.round(END_EDGE_TAIL_MS / frameMs));
+  const bodyFrames = Math.max(tailFrames, Math.round(END_EDGE_BODY_MS / frameMs));
+  const minRunFrames = tailFrames + Math.max(8, Math.round(120 / frameMs));
+  let worstDipDb = 0;
+
+  for (const run of speechRuns) {
+    const runFrames = run.end - run.start;
+    if (runFrames < minRunFrames) continue;
+    const tailStart = Math.max(run.start, run.end - tailFrames);
+    const bodyEnd = Math.max(run.start + 1, tailStart);
+    const bodyStart = Math.max(run.start, bodyEnd - bodyFrames);
+    const bodyDb = powerMeanDbSlice(frameDb, bodyStart, bodyEnd);
+    const tailDb = powerMeanDbSlice(frameDb, tailStart, run.end);
+    if (bodyDb === null || tailDb === null) continue;
+    worstDipDb = Math.max(worstDipDb, bodyDb - tailDb);
+  }
+
+  return Math.max(0, worstDipDb);
+};
+
 export const buildFlagsAndRecommendations = (
   metrics: Pick<
     AudioQcMetrics,
@@ -378,6 +492,7 @@ export const buildFlagsAndRecommendations = (
     | "clipPct"
     | "lineSwingScore"
     | "sentenceJumpScore"
+    | "coldOpenDipDb"
     | "breathSpikeRisk"
   >
 ): AudioQcAdvice => {
@@ -402,6 +517,14 @@ export const buildFlagsAndRecommendations = (
   if (metrics.sentenceJumpScore >= 0.34) {
     flags.push("Sentence-to-sentence level mismatch detected.");
     recommendations.push("Prefer continuity-safe single-pass leveling when grouped lines do not sit evenly.");
+  }
+
+  if (metrics.coldOpenDipDb >= COLD_OPEN_FLAG_DB) {
+    flags.push("cold_open_dip: first speech runs sit below the later dialogue body.");
+    recommendations.push("Lift and recheck the first few spoken words against the later body level.");
+  } else if (metrics.coldOpenDipDb >= COLD_OPEN_WARN_DB) {
+    flags.push("Cold-open level dip warning.");
+    recommendations.push("Verify that the opening words do not tuck under the later dialogue body.");
   }
 
   if (metrics.onsetOvershootScore >= 0.38) {
@@ -479,8 +602,11 @@ export const analyzeFrameAudio = (
       onsetOvershootScore: 0,
       midLineSagScore: 0,
       endFadeRiskScore: 0,
+      endEdgeDipDb: 0,
       lineSwingScore: 0,
       sentenceJumpScore: 0,
+      coldOpenDipDb: 0,
+      coldOpenRiskScore: 0,
       breathSpikeRisk: 0,
       pauseNoiseRisk: 0,
       compressionScore: 0,
@@ -635,8 +761,10 @@ export const analyzeFrameAudio = (
   const onsetOvershootScore = clamp(percentile(onsetEventScores, 75) ?? 0, 0, 1);
   const midLineSagScore = clamp(percentile(midSagEventScores, 75) ?? 0, 0, 1);
   const endFadeRiskScore = clamp(percentile(endFadeEventScores, 75) ?? 0, 0, 1);
+  const endEdgeDipDb = computeEndEdgeDipDb(frameDb, speechRuns, frameMs);
   const lineSwingScore = computeLineSwingScore(frameDb, speechRuns);
   const sentenceJumpScore = computeSentenceJumpScore(frameDb, speechRuns, frameMs, speechDutyCyclePct);
+  const { coldOpenDipDb, coldOpenRiskScore } = computeColdOpenMetrics(frameDb, speechRuns, frameMs);
 
   const breathSpikeEventScores: number[] = [];
   for (const pauseFrame of nearSpeechPauseFrames) {
@@ -850,8 +978,11 @@ export const analyzeFrameAudio = (
     onsetOvershootScore,
     midLineSagScore,
     endFadeRiskScore,
+    endEdgeDipDb,
     lineSwingScore,
     sentenceJumpScore,
+    coldOpenDipDb,
+    coldOpenRiskScore,
     breathSpikeRisk,
     pauseNoiseRisk,
     compressionScore,

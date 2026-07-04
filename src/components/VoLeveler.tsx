@@ -6,6 +6,7 @@ import JSZip from "jszip";
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { analyzeFloatSamples, buildSpeechMask, type AudioQcMetrics } from "../lib/audioQc";
 import {
+  applyKWeighting,
   applyGainCurveToSamples,
   planGainCurve,
   speechRunsFromMask,
@@ -26,11 +27,14 @@ import {
   DEFAULT_LEARNED_REVIEW_WEIGHTS,
   REVIEW_BUNDLE_SCHEMA_VERSION,
   REVIEW_WEIGHT_STORAGE_KEY,
+  autoReviewBundle,
   buildReviewMetricDelta,
   estimateAlignmentMetrics,
   interleavedToMono,
   parseLearnedReviewWeights,
+  resolveCorrectiveMaxFilesPerBatch,
   scoreCandidateWithLearnedWeights,
+  shouldAttemptCorrectivePassForAssessment,
   toReviewMetricSnapshot,
   type AlignmentMetrics,
   type CandidateRankingBreakdown,
@@ -43,8 +47,11 @@ import {
   computeLogBandSpectrumDb,
   computeSibilanceScore,
   computeToneMatchDeltaDb,
+  HOUSE_TONE_BLEND,
+  resolveDeEsserBands,
   SPECTRUM_BANDS_HZ,
 } from "../lib/spectrum";
+import { planBatchLoudnessAlignment } from "../lib/batchLoudnessAlign";
 import { decodeWav, encodeWavFloat32 } from "../lib/webAudioRender";
 import { queueBrowserDownload, triggerBrowserDownload } from "../lib/downloadBlob";
 import { estimateVoZipBytes, planVoZipExportParts } from "../lib/downloadPolicy";
@@ -63,7 +70,14 @@ import type {
   AudioReviewSelectedCandidate,
   SourceFirstAudioReviewPlan,
 } from "../lib/aiAudioReview";
-import { DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES, buildSourceFirstAudioReviewPlan } from "../lib/aiAudioReview";
+import {
+  DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES,
+  buildCorrectiveDirectivesForIssueTags,
+  buildSourceFirstAudioReviewPlan,
+  hasNonTrivialAdaptiveDirectives,
+  mergeAudioReviewAdaptiveDirectives,
+  normalizeAdaptiveDirectives,
+} from "../lib/aiAudioReview";
 import {
   buildEchoRoomCleanupDecision,
   deriveEarlyEchoCancelStrength,
@@ -188,6 +202,12 @@ const WATCHDOG_BASE_SECONDS = 90;
 const AUTO_LOAD_LOCAL_REVIEW_WEIGHTS = false;
 const WATCHDOG_DURATION_FACTOR = 4;
 const LIMITER_FILTER = "alimiter=limit=-2dB:level=disabled";
+const HEAD_PRIME_ENABLED = true;
+const HEAD_PRIME_SECONDS = 1.0;
+const HEAD_PRIME_DURATION_TOLERANCE_SECONDS = 0.05;
+const POST_RENDER_REVIEW_MAX_REQUESTS = 6;
+const MAX_CORRECTIVE_PASSES = 1;
+const CORRECTIVE_WIN_MARGIN = 25;
 const FATAL_FFMPEG_PATTERN = /memory access out of bounds|runtimeerror/i;
 const IMPORTANT_LOG_PATTERN = /error|failed|invalid|aborted|out of bounds/i;
 
@@ -200,6 +220,11 @@ const IMPORTANT_LOG_PATTERN = /error|failed|invalid|aborted|out of bounds/i;
  */
 const GAIN_PLANNER_ANALYSIS_SAMPLE_RATE = 16000;
 const GAIN_PLANNER_FRAME_MS = 10;
+const PLANNER_K_WEIGHTING = true;
+// Mixed-formant speech fixtures with -4/0/+4 dB high-frequency tilt measured
+// +0.15/-0.04/-0.44 dB raw body shift after the raw/K split, so no absolute
+// target compensation is needed to stay within the +/-0.5 dB pre-K baseline.
+const PLANNER_K_TARGET_OFFSET_DB = 0.0;
 /**
  * Memory guard. Even at 16 kHz mono Float32 a 2-hour file would be ~460 MB,
  * which will OOM the WASM heap. Beyond this we fail/retry instead of
@@ -307,6 +332,11 @@ const estimateAudioSeconds = (file: File): number => {
   return file.size / 96000;
 };
 
+const estimatePcmF32MonoWavSeconds = (byteLength: number): number => {
+  if (!Number.isFinite(byteLength) || byteLength <= 44) return 0;
+  return (byteLength - 44) / (48000 * 4);
+};
+
 /**
  * A failure is "recoverable" if a fresh ffmpeg worker would plausibly
  * succeed on the same input. WASM out-of-bounds, filter-init failures,
@@ -327,6 +357,10 @@ type OutputEntry = {
   kind: "mixready" | "loudness";
   variant: "clean" | "blend";
   processingFlow: "app" | "app-final-polish" | "app-neural-speech-enhancement-app";
+  sourceBase?: string;
+  sourceName?: string;
+  partIndex?: number;
+  partTotal?: number;
 };
 
 type ReviewBundleAsset = {
@@ -397,6 +431,8 @@ type FileAnalysis = {
   instabilityScore: number | null;
   lineSwingScore: number | null;
   sentenceJumpScore: number | null;
+  coldOpenDipDb: number | null;
+  coldOpenRiskScore: number | null;
   breathSpikeRisk: number | null;
   pauseNoiseRisk: number | null;
   compressionScore: number | null;
@@ -409,6 +445,7 @@ type FileAnalysis = {
   onsetOvershootScore: number | null;
   midLineSagScore: number | null;
   endFadeRiskScore: number | null;
+  endEdgeDipDb: number | null;
   analysisWindowCount: number | null;
   analysisWindowsAttempted: number | null;
   analysisWindowsSucceeded: number | null;
@@ -441,6 +478,7 @@ type AdaptiveProfile = {
   emotionProtection: number;
   compressorRatioOffset: number;
   compressorThresholdOffsetDb: number;
+  levelerBias: number;
   dynaTrim: number;
   floorGuardFilter: string;
   noiseRisk: NoiseRisk;
@@ -552,6 +590,8 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   instabilityScore: null,
   lineSwingScore: null,
   sentenceJumpScore: null,
+  coldOpenDipDb: null,
+  coldOpenRiskScore: null,
   breathSpikeRisk: null,
   pauseNoiseRisk: null,
   compressionScore: null,
@@ -564,6 +604,7 @@ const createEmptyAnalysis = (): FileAnalysis => ({
   onsetOvershootScore: null,
   midLineSagScore: null,
   endFadeRiskScore: null,
+  endEdgeDipDb: null,
   analysisWindowCount: null,
   analysisWindowsAttempted: null,
   analysisWindowsSucceeded: null,
@@ -1163,13 +1204,19 @@ const summarizeFailureReason = (error: unknown) => {
     };
   };
 
-  const buildDurationOnlyAlignmentMetrics = (durationSec: number | null): AlignmentMetrics => {
-    const safeDurationSec = durationSec && Number.isFinite(durationSec) ? durationSec : 0;
+  const buildDurationOnlyAlignmentMetrics = (
+    sourceDurationSec: number | null,
+    candidateDurationSec: number | null,
+  ): AlignmentMetrics => {
+    const safeSourceDurationSec = sourceDurationSec && Number.isFinite(sourceDurationSec) ? sourceDurationSec : 0;
+    const safeCandidateDurationSec =
+      candidateDurationSec && Number.isFinite(candidateDurationSec) ? candidateDurationSec : safeSourceDurationSec;
+    const durationDeltaSec = safeCandidateDurationSec - safeSourceDurationSec;
     return {
-      durationSourceSec: safeDurationSec,
-      durationCandidateSec: safeDurationSec,
-      durationDeltaSec: 0,
-      durationDeltaPct: 0,
+      durationSourceSec: safeSourceDurationSec,
+      durationCandidateSec: safeCandidateDurationSec,
+      durationDeltaSec,
+      durationDeltaPct: safeSourceDurationSec > 1e-6 ? (durationDeltaSec / safeSourceDurationSec) * 100 : 0,
       estimatedOffsetSec: 0,
       confidence: 0,
     };
@@ -1227,11 +1274,15 @@ const summarizeFailureReason = (error: unknown) => {
     isBreathControl(controls.breathControl) ? controls.breathControl : breathControl;
 
   const toAudioReviewMetricSnapshot = (analysis: FileAnalysis | null | undefined): AudioReviewMetricSnapshot => ({
+    integratedLufs: reviewNumber(analysis?.inputI),
     instabilityScore: reviewNumber(analysis?.instabilityScore),
     lineSwingScore: reviewNumber(analysis?.lineSwingScore),
     sentenceJumpScore: reviewNumber(analysis?.sentenceJumpScore),
+    coldOpenDipDb: reviewNumber(analysis?.coldOpenDipDb),
+    coldOpenRiskScore: reviewNumber(analysis?.coldOpenRiskScore),
     midLineSagScore: reviewNumber(analysis?.midLineSagScore),
     endFadeRiskScore: reviewNumber(analysis?.endFadeRiskScore),
+    endEdgeDipDb: reviewNumber(analysis?.endEdgeDipDb),
     onsetOvershootScore: reviewNumber(analysis?.onsetOvershootScore),
     breathSpikeRisk: reviewNumber(analysis?.breathSpikeRisk),
     pauseNoiseRisk: reviewNumber(analysis?.pauseNoiseRisk),
@@ -1245,6 +1296,7 @@ const summarizeFailureReason = (error: unknown) => {
     dynamicRangeDb: reviewNumber(analysis?.dynamicRangeDb),
     speechDutyCyclePct: reviewNumber(analysis?.speechDutyCyclePct),
     speechSegmentCount: reviewNumber(analysis?.speechSegmentCount),
+    bandSpectrumDb: reviewNumberArray(analysis?.bandSpectrumDb, 8),
   });
 
   const toAudioReviewProfileSnapshot = (profile: AdaptiveProfile | null): AudioReviewProfileSnapshot | null => {
@@ -1293,6 +1345,39 @@ const summarizeFailureReason = (error: unknown) => {
     selectedCandidate,
   });
 
+  const buildSelectedCandidateReviewInput = (
+    artifact: CandidateReviewArtifact,
+    reason: string | null,
+    processingFlow: OutputEntry["processingFlow"],
+    issueTags: string[] = [],
+  ): AudioReviewSelectedCandidate => ({
+    variant: artifact.label,
+    reason,
+    processingFlow,
+    qc: toAudioReviewMetricSnapshot(artifact.analysis),
+    qcDelta: artifact.qcDelta as Record<string, number | null> | null,
+    alignment: {
+      durationDeltaSec: reviewNumber(artifact.alignment.durationDeltaSec),
+      estimatedOffsetSec: reviewNumber(artifact.alignment.estimatedOffsetSec),
+      confidence: reviewNumber(artifact.alignment.confidence),
+    },
+    issueTags,
+    score: {
+      stability: reviewNumber(artifact.scoredScore.stability),
+      pause: reviewNumber(artifact.scoredScore.pause),
+      compression: reviewNumber(artifact.scoredScore.compression),
+      echo: reviewNumber(artifact.scoredScore.echo),
+      total: reviewNumber(artifact.scoredScore.rankingScore ?? artifact.scoredScore.total),
+    },
+  });
+
+  const adaptiveDirectiveDeltaFromDefault = (directives: AudioReviewAdaptiveDirectives) =>
+    Object.fromEntries(
+      (Object.keys(DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES) as Array<keyof AudioReviewAdaptiveDirectives>).map(
+        (key) => [key, directives[key] - DEFAULT_AUDIO_REVIEW_ADAPTIVE_DIRECTIVES[key]],
+      ),
+    ) as Partial<AudioReviewAdaptiveDirectives>;
+
   const applyAiReviewProfiles = (
     review: AudioReviewResult,
     source: "manual" | "source-auto",
@@ -1320,7 +1405,12 @@ const summarizeFailureReason = (error: unknown) => {
 
   const runAiAudioReview = async (
     reviewFiles: AudioReviewFileInput[],
-    options: { autoApply?: boolean; activateCurrentRun?: boolean; source?: "manual" | "source-auto" } = {},
+    options: {
+      autoApply?: boolean;
+      activateCurrentRun?: boolean;
+      source?: "manual" | "source-auto" | "post-render";
+      reviewStage?: "source" | "post-render";
+    } = {},
   ) => {
     if (aiReviewBusy || reviewFiles.length === 0) return null;
     setAiReviewBusy(true);
@@ -1334,7 +1424,8 @@ const summarizeFailureReason = (error: unknown) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           generatedAt: new Date().toISOString(),
-          controls: audioReviewControls,
+          reviewStage: options.reviewStage ?? (options.source === "post-render" ? "post-render" : "source"),
+          controls: getActiveAudioReviewControls(),
           files: reviewFiles,
         }),
       });
@@ -1354,7 +1445,7 @@ const summarizeFailureReason = (error: unknown) => {
         )}% confidence).`,
       );
       const plans = options.autoApply
-        ? applyAiReviewProfiles(payload.review, options.source ?? "manual", {
+        ? applyAiReviewProfiles(payload.review, options.source === "source-auto" ? "source-auto" : "manual", {
             activateCurrentRun: options.activateCurrentRun,
           })
         : null;
@@ -1404,6 +1495,10 @@ const summarizeFailureReason = (error: unknown) => {
     earlyRunCapCount: number;
     /** Largest early-dialogue cap in dB. */
     earlyRunMaxReductionDb: number;
+    /** Early dialogue runs lifted toward later dialogue body. */
+    coldOpenLiftCount: number;
+    /** Largest cold-open lift applied in dB. */
+    coldOpenLiftMaxDb: number;
     /** Effective intra-run micro-ride range in dB. Diagnostic. */
     microRideDb: number;
   };
@@ -1461,18 +1556,25 @@ const summarizeFailureReason = (error: unknown) => {
         1,
         Math.round((GAIN_PLANNER_ANALYSIS_SAMPLE_RATE * GAIN_PLANNER_FRAME_MS) / 1000),
       );
-      const frameCount = Math.floor(samples.length / frameSamples);
-      const frameDb = new Array<number>(frameCount);
-      for (let f = 0; f < frameCount; f += 1) {
-        let sum = 0;
-        const start = f * frameSamples;
-        for (let i = 0; i < frameSamples; i += 1) {
-          const v = samples[start + i];
-          sum += v * v;
+      const buildFrameDb = (envelopeSamples: Float32Array) => {
+        const frameCount = Math.floor(envelopeSamples.length / frameSamples);
+        const frameDb = new Array<number>(frameCount);
+        for (let f = 0; f < frameCount; f += 1) {
+          let sum = 0;
+          const start = f * frameSamples;
+          for (let i = 0; i < frameSamples; i += 1) {
+            const v = envelopeSamples[start + i];
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / frameSamples);
+          frameDb[f] = rms <= 0 ? -120 : 20 * Math.log10(rms);
         }
-        const rms = Math.sqrt(sum / frameSamples);
-        frameDb[f] = rms <= 0 ? -120 : 20 * Math.log10(rms);
-      }
+        return frameDb;
+      };
+      const frameDb = buildFrameDb(samples);
+      const loudnessFrameDb = PLANNER_K_WEIGHTING
+        ? buildFrameDb(applyKWeighting(samples, GAIN_PLANNER_ANALYSIS_SAMPLE_RATE))
+        : undefined;
 
       const noiseFloorDb =
         profile?.noiseFloorDb ?? analysis?.pauseNoiseFloorDb ?? analysis?.noiseFloorDb ?? -70;
@@ -1511,6 +1613,13 @@ const summarizeFailureReason = (error: unknown) => {
       );
       const sparseSpeech = (analysis?.speechDutyCyclePct ?? 100) < 10 || (analysis?.speechSegmentCount ?? 999) <= 6;
       const plannerMaxGainDb = 14 + cleanBoostHeadroom * (sparseSpeech ? 4 : 2);
+      const directives = getActiveAudioReviewAdaptiveDirectives();
+      const headGuardBoost = clamp(directives.headGuardBoost, 0, 1);
+      const plannerTargetDb = clamp(
+        -22 + directives.targetLoudnessBiasDb + (PLANNER_K_WEIGHTING ? PLANNER_K_TARGET_OFFSET_DB : 0),
+        -23.5,
+        -20.5,
+      );
 
       const mask = buildSpeechMask(frameDb, noiseFloorDb, { frameMs: GAIN_PLANNER_FRAME_MS });
       const speechRuns: PlannerSpeechRun[] = speechRunsFromMask(mask);
@@ -1518,6 +1627,7 @@ const summarizeFailureReason = (error: unknown) => {
 
       const plan = planGainCurve({
         frameDb,
+        loudnessFrameDb,
         speechRuns,
         noiseFloorDb,
         speechThresholdDb,
@@ -1525,9 +1635,11 @@ const summarizeFailureReason = (error: unknown) => {
         frameMs: GAIN_PLANNER_FRAME_MS,
         samples,
         sampleRate: GAIN_PLANNER_ANALYSIS_SAMPLE_RATE,
-        targetDb: -22,
+        targetDb: plannerTargetDb,
         sourceTargetBlend: 0.1,
         maxGainDb: plannerMaxGainDb,
+        coldOpenLiftToleranceDb: 1.5 - headGuardBoost * 0.5,
+        coldOpenLiftMaxDb: 5 + headGuardBoost * 1.5,
         peakCeilingDb: -3,
         instabilityHint,
         speechSpikeTaming,
@@ -1549,6 +1661,8 @@ const summarizeFailureReason = (error: unknown) => {
         sustainedLoudMaxReductionDb: plan.sustainedLoudMaxReductionDb,
         earlyRunCapCount: plan.earlyRunCapCount,
         earlyRunMaxReductionDb: plan.earlyRunMaxReductionDb,
+        coldOpenLiftCount: plan.coldOpenLiftCount,
+        coldOpenLiftMaxDb: plan.coldOpenLiftMaxDb,
         microRideDb: plan.microRideDb,
       };
     } finally {
@@ -1748,6 +1862,8 @@ const summarizeFailureReason = (error: unknown) => {
     instabilityScore: null,
     lineSwingScore: null,
     sentenceJumpScore: null,
+    coldOpenDipDb: null,
+    coldOpenRiskScore: null,
     breathSpikeRisk: null,
     pauseNoiseRisk: null,
     compressionScore: null,
@@ -1760,6 +1876,7 @@ const summarizeFailureReason = (error: unknown) => {
     onsetOvershootScore: null,
     midLineSagScore: null,
     endFadeRiskScore: null,
+    endEdgeDipDb: null,
   } satisfies Partial<FileAnalysis>;
 
   const mapQcMetricsToEnvelopeMetrics = (metrics: AudioQcMetrics) => ({
@@ -1778,6 +1895,8 @@ const summarizeFailureReason = (error: unknown) => {
     instabilityScore: metrics.instabilityScore,
     lineSwingScore: metrics.lineSwingScore,
     sentenceJumpScore: metrics.sentenceJumpScore,
+    coldOpenDipDb: metrics.coldOpenDipDb,
+    coldOpenRiskScore: metrics.coldOpenRiskScore,
     breathSpikeRisk: metrics.breathSpikeRisk,
     pauseNoiseRisk: metrics.pauseNoiseRisk,
     compressionScore: metrics.compressionScore,
@@ -1790,6 +1909,7 @@ const summarizeFailureReason = (error: unknown) => {
     onsetOvershootScore: metrics.onsetOvershootScore,
     midLineSagScore: metrics.midLineSagScore,
     endFadeRiskScore: metrics.endFadeRiskScore,
+    endEdgeDipDb: metrics.endEdgeDipDb,
   });
 
   const computeEnvelopeMetrics = (samples: Float32Array) => {
@@ -2227,6 +2347,8 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.drynessScore = envelope.drynessScore;
       analysis.instabilityScore = envelope.instabilityScore;
       analysis.lineSwingScore = envelope.lineSwingScore;
+      analysis.coldOpenDipDb = envelope.coldOpenDipDb;
+      analysis.coldOpenRiskScore = envelope.coldOpenRiskScore;
       analysis.pauseNoiseRisk = envelope.pauseNoiseRisk;
       analysis.compressionScore = envelope.compressionScore;
       analysis.overallRisk = envelope.overallRisk;
@@ -2238,6 +2360,7 @@ const summarizeFailureReason = (error: unknown) => {
       analysis.onsetOvershootScore = envelope.onsetOvershootScore;
       analysis.midLineSagScore = envelope.midLineSagScore;
       analysis.endFadeRiskScore = envelope.endFadeRiskScore;
+      analysis.endEdgeDipDb = envelope.endEdgeDipDb;
       analysis.bandSpectrumDb = envelope.bandSpectrumDb;
       analysis.sibilanceScore = envelope.sibilanceScore;
     } finally {
@@ -2284,6 +2407,8 @@ const summarizeFailureReason = (error: unknown) => {
     aggregated.instabilityScore = weightedMetric(windowAnalyses, (a) => a.instabilityScore, 80);
     aggregated.lineSwingScore = weightedMetric(windowAnalyses, (a) => a.lineSwingScore, 82);
     aggregated.sentenceJumpScore = weightedMetric(windowAnalyses, (a) => a.sentenceJumpScore, 85);
+    aggregated.coldOpenDipDb = baseAnalysis.coldOpenDipDb;
+    aggregated.coldOpenRiskScore = baseAnalysis.coldOpenRiskScore;
     aggregated.breathSpikeRisk = weightedMetric(windowAnalyses, (a) => a.breathSpikeRisk, 85);
     aggregated.pauseNoiseRisk = weightedMetric(windowAnalyses, (a) => a.pauseNoiseRisk, 80);
     aggregated.compressionScore = weightedMetric(windowAnalyses, (a) => a.compressionScore, 70);
@@ -2292,6 +2417,7 @@ const summarizeFailureReason = (error: unknown) => {
     aggregated.onsetOvershootScore = weightedMetric(windowAnalyses, (a) => a.onsetOvershootScore, 85);
     aggregated.midLineSagScore = weightedMetric(windowAnalyses, (a) => a.midLineSagScore, 80);
     aggregated.endFadeRiskScore = weightedMetric(windowAnalyses, (a) => a.endFadeRiskScore, 85);
+    aggregated.endEdgeDipDb = weightedMetric(windowAnalyses, (a) => a.endEdgeDipDb, 85);
     aggregated.speechDutyCyclePct =
       speechMapStats?.speechDutyCyclePct ?? weightedMetric(windowAnalyses, (a) => a.speechDutyCyclePct, 50);
     aggregated.speechSegmentCount =
@@ -2633,23 +2759,24 @@ const summarizeFailureReason = (error: unknown) => {
     const dynamicsFactor = smartDynamicsEnabled ? activeSmartMatchConfig.dynamics : 0;
 
     let highpassHz = Math.round(clamp(80 + lowTiltDiff * 2.2 * toneFactor, 65, 105));
-    const lowMidGainDb = clamp(-2 - lowTiltDiff * 0.28 * toneFactor + directives.warmthDb, -3.8, 1.3);
+    const lowMidGainDb = clamp(-2 - lowTiltDiff * 0.28 * toneFactor + directives.warmthDb, -3.8, 1.6);
 
-    let presenceGainDb = clamp(-highTiltDiff * 0.45 * toneFactor + directives.presenceDb, -2.4, 1.8);
-    let airGainDb = clamp(-highTiltDiff * 0.25 * toneFactor + directives.airDb, -1.8, 1.0);
+    let presenceGainDb = clamp(-highTiltDiff * 0.45 * toneFactor + directives.presenceDb, -2.8, 2.2);
+    let airGainDb = clamp(-highTiltDiff * 0.25 * toneFactor + directives.airDb, -2.0, 1.3);
 
     const lra = analysis.inputLRA ?? referenceLra;
     const lraDiff = lra - referenceLra;
     const compressorRatioOffset = clamp(
-      lraDiff * 0.07 * dynamicsFactor + directives.compressionBias * 0.16,
+      lraDiff * 0.07 * dynamicsFactor + directives.compressionBias * 0.3,
       -0.4,
       0.45,
     );
     const compressorThresholdOffsetDb = clamp(
-      lraDiff * 0.6 * dynamicsFactor + directives.compressionBias * 0.5,
+      lraDiff * 0.6 * dynamicsFactor + directives.compressionBias * 0.8,
       -1.5,
       1.5,
     );
+    const levelerBias = clamp(directives.levelerBias, -0.5, 0.5);
 
     const measuredNoiseFloor = Math.max(analysis.noiseFloorDb ?? -70, analysis.nearSpeechNoiseFloorDb ?? -90);
     const measuredSpeechThreshold =
@@ -2685,9 +2812,9 @@ const summarizeFailureReason = (error: unknown) => {
     const emotionalHarshnessCutDb = clamp(
       (hotPeakFactor * 0.95 + brightFactor * 0.7) * toneFactor + directives.deHarshDb,
       0,
-      2
+      2.2
     );
-    const topEndHarshnessCutDb = clamp(emotionalHarshnessCutDb * 0.75 + directives.deHarshDb * 0.3, 0, 1.5);
+    const topEndHarshnessCutDb = clamp(emotionalHarshnessCutDb * 0.75 + directives.deHarshDb * 0.3, 0, 1.8);
 
     const analysisConfidence = analysis.analysisConfidence ?? 0.25;
     const rawRoomScore = analysis.roomScore ?? 0;
@@ -2898,7 +3025,12 @@ const summarizeFailureReason = (error: unknown) => {
     // Compute per-band tone delta vs the batch reference (if we have both).
     const toneMatchDeltaDb =
       reference?.bandSpectrumDb && reference.anchorCount >= 3 && analysis.bandSpectrumDb
-        ? computeToneMatchDeltaDb(analysis.bandSpectrumDb, reference.bandSpectrumDb, 2.5)
+        ? computeToneMatchDeltaDb(analysis.bandSpectrumDb, reference.bandSpectrumDb, {
+            maxDb: 2.5,
+            houseBlend: HOUSE_TONE_BLEND,
+            priorityBandCount: 2,
+            priorityMaxDb: 3,
+          })
         : null;
 
     return {
@@ -2912,6 +3044,7 @@ const summarizeFailureReason = (error: unknown) => {
       emotionProtection,
       compressorRatioOffset,
       compressorThresholdOffsetDb,
+      levelerBias,
       dynaTrim,
       floorGuardFilter: noiseRisk === "high" ? FLOOR_GUARD_STRONG : FLOOR_GUARD,
       noiseRisk,
@@ -3162,6 +3295,8 @@ const summarizeFailureReason = (error: unknown) => {
     const breathSpikeRisk = profile?.breathSpikeRisk ?? 0;
     const breathTameStrength = profile?.breathTameStrength ?? 0;
     const pauseNoiseRisk = profile?.pauseNoiseRisk ?? 0;
+    const levelerBias = minimalStabilityChain ? 0 : clamp(profile?.levelerBias ?? 0, -0.5, 0.5);
+    const levelerAdaptationScale = 1 + levelerBias * 0.2;
     const useClickTamer =
       !minimalStabilityChain &&
       !sourceSafeMode &&
@@ -3303,8 +3438,8 @@ const summarizeFailureReason = (error: unknown) => {
         const gateDb = clamp((profile?.speechThresholdDb ?? -44) - 6, -56, -38);
         const gateAmp = fromDb(gateDb);
         const safetyF = 161;
-        const safetyG = 3;
-        const safetyM = 5;
+        const safetyG = toOddInt(3 * levelerAdaptationScale, 3, 9);
+        const safetyM = toOddInt(5 * levelerAdaptationScale, 3, 11);
         filters.push(
           `dynaudnorm=f=${safetyF}:g=${safetyG}:m=${safetyM}:t=${clamp(gateAmp, fromDb(-60), fromDb(-34)).toFixed(5)}`,
         );
@@ -3445,6 +3580,8 @@ const summarizeFailureReason = (error: unknown) => {
         dynaThresholdAmp = 0;
       }
 
+      dynaG *= levelerAdaptationScale;
+      dynaM *= levelerAdaptationScale;
       const dynaGInt = toOddInt(dynaG, 3, 301);
       const dynaMValue = toOddInt(dynaM, 3, 301);
       const dynaThreshold =
@@ -3571,7 +3708,7 @@ const summarizeFailureReason = (error: unknown) => {
       for (const { g, hz } of ranked) {
         // Narrow bells in mids, wider shelves at edges.
         const widthQ = hz <= 250 || hz >= 4000 ? 0.9 : 1.1;
-        filters.push(`equalizer=f=${hz}:width_type=q:width=${widthQ}:g=${clamp(g, -2.5, 2.5).toFixed(2)}`);
+        filters.push(`equalizer=f=${hz}:width_type=q:width=${widthQ}:g=${clamp(g, -3, 3).toFixed(2)}`);
       }
     }
 
@@ -3597,8 +3734,9 @@ const summarizeFailureReason = (error: unknown) => {
       const depthNorm = clamp((sibilanceScore - 0.4) / 0.6, 0, 1);
       const mainCut = -clamp(1.2 + depthNorm * 2.8, 1.2, 4);
       const secondaryCut = -clamp(0.6 + depthNorm * 1.8, 0.6, 2.4);
-      filters.push(`equalizer=f=6500:width_type=q:width=1.4:g=${mainCut.toFixed(2)}`);
-      filters.push(`equalizer=f=9000:width_type=q:width=1.2:g=${secondaryCut.toFixed(2)}`);
+      const deEsserBands = resolveDeEsserBands(profile?.bandSpectrumDb ?? []);
+      filters.push(`equalizer=f=${deEsserBands.mainHz}:width_type=q:width=1.4:g=${mainCut.toFixed(2)}`);
+      filters.push(`equalizer=f=${deEsserBands.secondaryHz}:width_type=q:width=1.2:g=${secondaryCut.toFixed(2)}`);
     }
 
     const thresholdBase = parseFloat(levelerSettings.compressor.threshold.replace("dB", ""));
@@ -3732,7 +3870,7 @@ const summarizeFailureReason = (error: unknown) => {
     }
 
     const compMix = clamp(
-      0.9 +
+      (0.9 +
         levelingNeed * 0.07 -
         emotionProtection * 0.24 -
         roomRelax * 0.08 -
@@ -3745,7 +3883,8 @@ const summarizeFailureReason = (error: unknown) => {
         breathTameStrength * 0.04 -
         (strictEndingProtection ? 0.06 : 0) -
         (continuitySafeMode ? 0.06 : 0) -
-        (pauseSafeMode ? 0.04 : 0),
+        (pauseSafeMode ? 0.04 : 0)) *
+        levelerAdaptationScale,
       0.58,
       0.95
     );
@@ -3821,7 +3960,7 @@ const summarizeFailureReason = (error: unknown) => {
         3
       )}:attack=10:release=180:makeup=1.00:detection=rms:link=average[wet]`,
       `[dry]volume=${dryGain.toFixed(4)}[dryv]`,
-      "[dryv][wet]amix=inputs=2:normalize=0,alimiter=limit=-2dB:level=disabled",
+      "[dryv][wet]amix=inputs=2:duration=first:normalize=0,alimiter=limit=-2dB:level=disabled",
     ].join(";");
   };
 
@@ -3831,6 +3970,7 @@ const summarizeFailureReason = (error: unknown) => {
     kind: OutputEntry["kind"],
     variant: OutputEntry["variant"],
     processingFlow: OutputEntry["processingFlow"] = "app",
+    metadata: Pick<OutputEntry, "sourceBase" | "sourceName" | "partIndex" | "partTotal"> = {},
   ): Promise<OutputEntry> => {
     const bytes = await readVirtualFileBytes(ffmpeg, name);
     const outputName = processingFlow === "app-neural-speech-enhancement-app" ? enhancedOutputName(name) : name;
@@ -3843,6 +3983,7 @@ const summarizeFailureReason = (error: unknown) => {
       kind,
       variant,
       processingFlow,
+      ...metadata,
     };
   };
 
@@ -3869,6 +4010,7 @@ const summarizeFailureReason = (error: unknown) => {
       emotionProtection: clamp(profile.emotionProtection * stabilityScale, 0, 0.65),
       compressorRatioOffset: clamp(profile.compressorRatioOffset * compressionScale, -0.16, 0.22),
       compressorThresholdOffsetDb: clamp(profile.compressorThresholdOffsetDb * compressionScale, -0.65, 0.75),
+      levelerBias: clamp(profile.levelerBias * compressionScale, -0.25, 0.25),
       dynaTrim: clamp(profile.dynaTrim * 0.45, 0, 1.6),
       useDenoise: false,
       denoiseStrength: 0,
@@ -4053,31 +4195,42 @@ const summarizeFailureReason = (error: unknown) => {
       ...options,
       gainPlannerActive,
     });
-    resetLogBuffer();
-    await execOrThrow(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-filter_threads",
-        "1",
-        "-y",
-        "-i",
-        chainInput,
-        "-af",
-        filterChain,
-        "-ar",
-        "48000",
-        "-ac",
-        "1",
-        "-c:a",
-        "pcm_f32le",
-        outputName,
-      ],
-      "Mix-ready render",
-    );
+    const runUnprimed = async () => {
+      resetLogBuffer();
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-filter_threads",
+          "1",
+          "-y",
+          "-i",
+          chainInput,
+          "-af",
+          filterChain,
+          "-ar",
+          "48000",
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_f32le",
+          outputName,
+        ],
+        "Mix-ready render",
+      );
+    };
+    await renderWithHeadPriming(ffmpeg, {
+      inputName: chainInput,
+      outputName,
+      filterChain,
+      options,
+      expectedDurationSec: null,
+      contextLabel: `Mix-ready ${sanitizeBase(outputName)}`,
+      unprimed: runUnprimed,
+    });
   };
 
   const runMixReadyRange = async (
@@ -4145,6 +4298,93 @@ const summarizeFailureReason = (error: unknown) => {
     return parseDurationSeconds(logText);
   };
 
+  const shouldUseHeadPriming = (options: MixRenderOptions | undefined, expectedDurationSec: number | null) =>
+    HEAD_PRIME_ENABLED &&
+    !options?.minimalStabilityChain &&
+    (expectedDurationSec === null || expectedDurationSec < GAIN_PLANNER_MAX_DURATION_SECONDS);
+
+  const renderWithHeadPriming = async (
+    ffmpeg: FFmpeg,
+    input: {
+      inputName: string;
+      outputName: string;
+      filterChain: string | null;
+      options?: MixRenderOptions;
+      inputReadArgs?: string[];
+      expectedDurationSec: number | null;
+      contextLabel: string;
+      postPrimeFilterChain?: string | null;
+      unprimed: () => Promise<void>;
+    },
+  ) => {
+    if (!shouldUseHeadPriming(input.options, input.expectedDurationSec)) {
+      await input.unprimed();
+      return;
+    }
+
+    const primeSeconds = HEAD_PRIME_SECONDS.toFixed(3);
+    const baseFilter = input.filterChain?.trim() || "anull";
+    const postPrimeFilter = input.postPrimeFilterChain?.trim();
+    const filterComplex = [
+      `[0:a]atrim=0:${primeSeconds},areverse[headprime]`,
+      `[headprime][0:a]concat=n=2:v=0:a=1[primed]`,
+      `[primed]${baseFilter},atrim=start=${primeSeconds},asetpts=PTS-STARTPTS${
+        postPrimeFilter ? `,${postPrimeFilter}` : ""
+      }[out]`,
+    ].join(";");
+
+    try {
+      resetLogBuffer();
+      await execOrThrow(
+        ffmpeg,
+        [
+          "-hide_banner",
+          "-nostdin",
+          "-threads",
+          "1",
+          "-filter_threads",
+          "1",
+          "-y",
+          ...(input.inputReadArgs ?? []),
+          "-i",
+          input.inputName,
+          "-filter_complex",
+          filterComplex,
+          "-map",
+          "[out]",
+          "-ar",
+          "48000",
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_f32le",
+          input.outputName,
+        ],
+        `${input.contextLabel} head-primed render`,
+      );
+
+      const expectedDurationSec =
+        input.expectedDurationSec ?? (await probeInputDurationSeconds(ffmpeg, input.inputName));
+      const renderedDurationSec = await probeInputDurationSeconds(ffmpeg, input.outputName);
+      if (
+        expectedDurationSec !== null &&
+        renderedDurationSec !== null &&
+        Math.abs(renderedDurationSec - expectedDurationSec) > HEAD_PRIME_DURATION_TOLERANCE_SECONDS
+      ) {
+        throw new Error(
+          `duration delta ${(renderedDurationSec - expectedDurationSec).toFixed(3)}s exceeds ${HEAD_PRIME_DURATION_TOLERANCE_SECONDS.toFixed(
+            2,
+          )}s`,
+        );
+      }
+      appendLog(`[HeadPrime] ${input.contextLabel}: primed first ${HEAD_PRIME_SECONDS.toFixed(1)}s.`);
+    } catch (error) {
+      appendLog(`[HeadPrime] fallback ${input.contextLabel}: ${describeError(error)}.`);
+      await safeDeleteFile(ffmpeg, input.outputName);
+      await input.unprimed();
+    }
+  };
+
   const runMixReadySegmented = async (
     ffmpeg: FFmpeg,
     inputName: string,
@@ -4188,35 +4428,51 @@ const summarizeFailureReason = (error: unknown) => {
         const segmentName = `${tempBase}_seg_${index + 1}.wav`;
         segmentNames.push(segmentName);
 
-        resetLogBuffer();
-        await execOrThrow(
-      ffmpeg,
-      [
-        "-hide_banner",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-filter_threads",
-        "1",
-        "-y",
-        "-ss",
-        start.toFixed(3),
-            "-t",
-            span.toFixed(3),
-            "-i",
-            chainInput,
-            "-af",
+        const runUnprimed = async () => {
+          resetLogBuffer();
+          await execOrThrow(
+            ffmpeg,
+            [
+              "-hide_banner",
+              "-nostdin",
+              "-threads",
+              "1",
+              "-filter_threads",
+              "1",
+              "-y",
+              "-ss",
+              start.toFixed(3),
+              "-t",
+              span.toFixed(3),
+              "-i",
+              chainInput,
+              "-af",
+              filterChain,
+              "-ar",
+              "48000",
+              "-ac",
+              "1",
+              "-c:a",
+              "pcm_f32le",
+              segmentName,
+            ],
+            `Segment mix-ready render ${index + 1}/${segmentCount}`,
+          );
+        };
+        if (index === 0) {
+          await renderWithHeadPriming(ffmpeg, {
+            inputName: chainInput,
+            outputName: segmentName,
             filterChain,
-            "-ar",
-            "48000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_f32le",
-            segmentName,
-          ],
-          `Segment mix-ready render ${index + 1}/${segmentCount}`
-        );
+            options,
+            inputReadArgs: ["-ss", start.toFixed(3), "-t", span.toFixed(3)],
+            expectedDurationSec: span,
+            contextLabel: `${sanitizeBase(outputName)} segment 1`,
+            unprimed: runUnprimed,
+          });
+        } else {
+          await runUnprimed();
+        }
       }
 
       if (segmentNames.length < 2) {
@@ -4503,35 +4759,52 @@ const summarizeFailureReason = (error: unknown) => {
         const trimFilter = `atrim=start=${trimStartSec.toFixed(3)}:end=${trimEndSec.toFixed(3)},asetpts=N/SR/TB`;
         const filterChain = baseFilter ? `${baseFilter},${trimFilter}` : trimFilter;
 
-        resetLogBuffer();
-        await execOrThrow(
-          ffmpeg,
-          [
-            "-hide_banner",
-            "-nostdin",
-            "-threads",
-            "1",
-            "-filter_threads",
-            "1",
-            "-y",
-            "-ss",
-            readStart.toFixed(3),
-            "-t",
-            readSpan.toFixed(3),
-            "-i",
-            chainInput,
-            "-af",
-            filterChain,
-            "-ar",
-            "48000",
-            "-ac",
-            "1",
-            "-c:a",
-            "pcm_f32le",
-            segmentName,
-          ],
-          `Speech-aligned segment render ${index + 1}/${segments.length}`
-        );
+        const runUnprimed = async () => {
+          resetLogBuffer();
+          await execOrThrow(
+            ffmpeg,
+            [
+              "-hide_banner",
+              "-nostdin",
+              "-threads",
+              "1",
+              "-filter_threads",
+              "1",
+              "-y",
+              "-ss",
+              readStart.toFixed(3),
+              "-t",
+              readSpan.toFixed(3),
+              "-i",
+              chainInput,
+              "-af",
+              filterChain,
+              "-ar",
+              "48000",
+              "-ac",
+              "1",
+              "-c:a",
+              "pcm_f32le",
+              segmentName,
+            ],
+            `Speech-aligned segment render ${index + 1}/${segments.length}`,
+          );
+        };
+        if (index === 0) {
+          await renderWithHeadPriming(ffmpeg, {
+            inputName: chainInput,
+            outputName: segmentName,
+            filterChain: baseFilter,
+            options: segmentOptions,
+            inputReadArgs: ["-ss", readStart.toFixed(3), "-t", readSpan.toFixed(3)],
+            expectedDurationSec: Math.max(0.02, trimEndSec - trimStartSec),
+            contextLabel: `${sanitizeBase(outputName)} speech segment 1`,
+            postPrimeFilterChain: trimFilter,
+            unprimed: runUnprimed,
+          });
+        } else {
+          await runUnprimed();
+        }
 
         let concatName = segmentName;
         if (segment.process && enableSegmentGainMatch) {
@@ -4679,6 +4952,234 @@ const summarizeFailureReason = (error: unknown) => {
     );
   };
 
+  const alignBatchMixReadyOutputs = async (ffmpeg: FFmpeg, outputEntries: OutputEntry[]) => {
+    type AlignmentTarget = { entry: OutputEntry; index: number; groupId: string };
+
+    const estimateOutputAudioSeconds = (entry: OutputEntry) => {
+      const byteLength = Number.isFinite(entry.size) && entry.size > 0 ? entry.size : entry.blob.size;
+      if (!Number.isFinite(byteLength) || byteLength <= 44) return 0;
+      return (byteLength - 44) / (48000 * 4);
+    };
+    const medianNumber = (values: number[]) => {
+      const finiteValues = values.filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+      if (finiteValues.length === 0) return null;
+      const mid = Math.floor(finiteValues.length / 2);
+      return finiteValues.length % 2 === 0 ? (finiteValues[mid - 1] + finiteValues[mid]) / 2 : finiteValues[mid];
+    };
+    const buildGroupId = (entry: OutputEntry) => {
+      const sourceKey = entry.sourceBase ?? entry.name.replace(/_(?:part-\d+_)?(?:blend_)?mixready.*$/i, "");
+      return `${entry.variant}:${sourceKey}`;
+    };
+
+    const targets = outputEntries
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => entry.kind === "mixready")
+      .map(({ entry, index }) => ({ entry, index, groupId: buildGroupId(entry) }));
+    if (targets.length < 2) {
+      appendLog("[BatchAlign] skipped (fewer than 2 mix-ready outputs).");
+      return ffmpeg;
+    }
+
+    let activeFfmpeg = ffmpeg;
+    let cumulativeAudioSec = 0;
+    const recycleIfNeeded = async (stage: "measure" | "render") => {
+      if (cumulativeAudioSec < BATCH_AUDIO_RECYCLE_SECONDS) return;
+      activeFfmpeg = await refreshFfmpeg(
+        `batch loudness alignment ${stage} memory guard (${Math.round(cumulativeAudioSec)}s processed)`,
+      );
+      cumulativeAudioSec = 0;
+    };
+
+    const noteProcessedAudio = async (entry: OutputEntry, stage: "measure" | "render") => {
+      cumulativeAudioSec += estimateOutputAudioSeconds(entry);
+      await recycleIfNeeded(stage);
+    };
+
+    try {
+      setStatus("Batch loudness alignment");
+      const targetsByVariant = new Map<OutputEntry["variant"], AlignmentTarget[]>();
+      for (const target of targets) {
+        const variantTargets = targetsByVariant.get(target.entry.variant) ?? [];
+        variantTargets.push(target);
+        targetsByVariant.set(target.entry.variant, variantTargets);
+      }
+
+      const stagedEntries: Array<{ index: number; entry: OutputEntry }> = [];
+      let alignedCount = 0;
+      for (const [variant, variantTargets] of targetsByVariant.entries()) {
+        if (variantTargets.length < 2) {
+          appendLog(`[BatchAlign] ${variant} skipped (fewer than 2 outputs).`);
+          continue;
+        }
+
+        const groupedTargets = new Map<string, AlignmentTarget[]>();
+        const measurementsByGroup = new Map<string, number[]>();
+        const measurementByIndex = new Map<number, number | null>();
+        for (const target of variantTargets) {
+          const group = groupedTargets.get(target.groupId) ?? [];
+          group.push(target);
+          groupedTargets.set(target.groupId, group);
+
+          const inputName = `batch_align_${target.index}_measure.wav`;
+          try {
+            await activeFfmpeg.writeFile(inputName, new Uint8Array(await target.entry.blob.arrayBuffer()));
+            try {
+              const loudness = await analyzeIntegratedLoudness(activeFfmpeg, inputName);
+              measurementByIndex.set(target.index, loudness.inputI);
+              if (loudness.inputI !== null && Number.isFinite(loudness.inputI)) {
+                const values = measurementsByGroup.get(target.groupId) ?? [];
+                values.push(loudness.inputI);
+                measurementsByGroup.set(target.groupId, values);
+              }
+            } catch (error) {
+              appendLog(`[BatchAlign] ${target.entry.name}: loudness measure skipped (${describeError(error)}).`);
+              measurementByIndex.set(target.index, null);
+            }
+          } finally {
+            await safeDeleteFile(activeFfmpeg, inputName);
+          }
+          await noteProcessedAudio(target.entry, "measure");
+        }
+
+        const groupMeasurements = Array.from(groupedTargets.keys()).map((groupId) => ({
+          id: groupId,
+          inputI: medianNumber(measurementsByGroup.get(groupId) ?? []),
+        }));
+        const alignment = planBatchLoudnessAlignment(groupMeasurements);
+        if (alignment.anchorLufs === null) {
+          appendLog(`[BatchAlign] ${variant} skipped (insufficient loudness measurements).`);
+          continue;
+        }
+
+        for (const plan of alignment.plans) {
+          const groupTargets = groupedTargets.get(plan.id) ?? [];
+          if (groupTargets.length === 0) continue;
+          const groupLabel = groupTargets[0]?.entry.sourceBase ?? groupTargets[0]?.entry.name ?? plan.id;
+          if (!plan.shouldAlign) {
+            appendLog(
+              `[BatchAlign] ${groupLabel} (${variant}): within ${Math.abs(
+                (plan.inputI ?? alignment.anchorLufs) - alignment.anchorLufs,
+              ).toFixed(1)} LU of batch anchor ${alignment.anchorLufs.toFixed(1)} LUFS.`,
+            );
+            continue;
+          }
+
+          for (const target of groupTargets) {
+            const inputName = `batch_align_${target.index}_in.wav`;
+            const outputName = `batch_align_${target.index}_out.wav`;
+            let nextEntry = target.entry;
+            try {
+              await activeFfmpeg.writeFile(inputName, new Uint8Array(await target.entry.blob.arrayBuffer()));
+              resetLogBuffer();
+              await execOrThrow(
+                activeFfmpeg,
+                [
+                  "-hide_banner",
+                  "-nostdin",
+                  "-threads",
+                  "1",
+                  "-filter_threads",
+                  "1",
+                  "-y",
+                  "-i",
+                  inputName,
+                  "-af",
+                  `volume=${plan.offsetDb.toFixed(2)}dB,${LIMITER_FILTER}`,
+                  "-ar",
+                  "48000",
+                  "-ac",
+                  "1",
+                  "-c:a",
+                  "pcm_f32le",
+                  outputName,
+                ],
+                "Batch loudness alignment",
+              );
+              const expectedDurationSec = estimateOutputAudioSeconds(target.entry);
+              const renderedDurationSec = await probeInputDurationSeconds(activeFfmpeg, outputName);
+              if (
+                expectedDurationSec > 0 &&
+                renderedDurationSec !== null &&
+                Number.isFinite(renderedDurationSec) &&
+                Math.abs(renderedDurationSec - expectedDurationSec) > HEAD_PRIME_DURATION_TOLERANCE_SECONDS
+              ) {
+                throw new Error(
+                  `duration delta ${(renderedDurationSec - expectedDurationSec).toFixed(3)}s exceeds ${HEAD_PRIME_DURATION_TOLERANCE_SECONDS.toFixed(
+                    2,
+                  )}s`,
+                );
+              }
+              const alignedLoudness = await analyzeIntegratedLoudness(activeFfmpeg, outputName);
+              if (alignedLoudness.inputTP !== null && alignedLoudness.inputTP > -1.5) {
+                throw new Error(`true peak ${alignedLoudness.inputTP.toFixed(2)} dBTP exceeds -1.5 dBTP gate`);
+              }
+              const beforeI = measurementByIndex.get(target.index);
+              if (
+                beforeI !== null &&
+                beforeI !== undefined &&
+                alignedLoudness.inputI !== null &&
+                Number.isFinite(alignedLoudness.inputI)
+              ) {
+                const movedOppositeDirection =
+                  plan.offsetDb > 0
+                    ? alignedLoudness.inputI < beforeI - 0.1
+                    : alignedLoudness.inputI > beforeI + 0.1;
+                if (movedOppositeDirection) {
+                  throw new Error(
+                    `loudness moved opposite requested offset (${beforeI.toFixed(1)} -> ${alignedLoudness.inputI.toFixed(
+                      1,
+                    )} LUFS, offset ${formatSigned(plan.offsetDb, 1)} dB)`,
+                  );
+                }
+              }
+              const alignedBytes = await readVirtualFileBytes(activeFfmpeg, outputName);
+              const alignedBlob = new Blob([alignedBytes], { type: "audio/wav" });
+              nextEntry = {
+                ...target.entry,
+                blob: alignedBlob,
+                size: alignedBlob.size,
+              };
+            } finally {
+              await safeDeleteFile(activeFfmpeg, inputName);
+              await safeDeleteFile(activeFfmpeg, outputName);
+            }
+            stagedEntries.push({ index: target.index, entry: nextEntry });
+            alignedCount += 1;
+            appendLog(
+              `[BatchAlign] ${target.entry.name}: ${formatSigned(plan.offsetDb, 1)} dB toward ${variant} batch anchor ${alignment.anchorLufs.toFixed(
+                1,
+              )} LUFS.`,
+            );
+            await noteProcessedAudio(nextEntry, "render");
+          }
+          if (groupTargets.length > 1) {
+            appendLog(
+              `[BatchAlign] ${groupLabel} (${variant}): used one shared ${formatSigned(
+                plan.offsetDb,
+                1,
+              )} dB offset for ${groupTargets.length} parts.`,
+            );
+          }
+        }
+      }
+
+      for (const staged of stagedEntries) {
+        outputEntries[staged.index] = staged.entry;
+      }
+
+      if (alignedCount === 0) {
+        appendLog("[BatchAlign] all mix-ready outputs already within their variant batch anchors.");
+      }
+      return activeFfmpeg;
+    } catch (error) {
+      appendLog(`[BatchAlign] skipped after failure; original outputs kept (${describeError(error)}).`);
+      if (shouldResetFfmpegForError(error)) {
+        return refreshFfmpeg("batch loudness alignment failure");
+      }
+      return activeFfmpeg;
+    }
+  };
+
   const runLoudnorm = async (
     ffmpeg: FFmpeg,
     inputName: string,
@@ -4792,6 +5293,7 @@ const summarizeFailureReason = (error: unknown) => {
     if (chunks.length === 0) {
       throw new Error("Long-form safe mode could not plan export chunks.");
     }
+    const stagedOutputs: OutputEntry[] = [];
 
     const candidateVariant: CandidateVariant =
       sourceFirstCandidateVariantRef.current ??
@@ -4837,12 +5339,18 @@ const summarizeFailureReason = (error: unknown) => {
         });
         ffmpeg = chunkPolish.ffmpeg;
         const chunkFlow = chunkPolish.applied ? "app-final-polish" : "app";
+        await assertDurationDeltaWithin(ffmpeg, `Long-form mix ${job.base} ${partTag}`, chunk.durationSec, mixChunkName);
+        await assertTruePeakWithin(ffmpeg, `Long-form mix ${job.base} ${partTag}`, mixChunkName);
 
         if (keepMixReady || loudnessConfig === null) {
-          outputEntries.push(
-            await writeOutput(ffmpeg, mixChunkName, "mixready", "clean", chunkFlow),
+          stagedOutputs.push(
+            await writeOutput(ffmpeg, mixChunkName, "mixready", "clean", chunkFlow, {
+              sourceBase: job.base,
+              sourceName: job.file.name,
+              partIndex: chunk.index,
+              partTotal: chunk.total,
+            }),
           );
-          setOutputs([...outputEntries]);
         }
 
         if (sceneBlend) {
@@ -4854,12 +5362,18 @@ const summarizeFailureReason = (error: unknown) => {
             setStatus(`Long-form blend: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
             setActiveQueueStage(job.base, "Long-form blend", `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`);
             await runBlendMixReady(ffmpeg, mixChunkName, blendChunkName, profile);
+            await assertDurationDeltaWithin(ffmpeg, `Long-form blend ${job.base} ${partTag}`, chunk.durationSec, blendChunkName);
+            await assertTruePeakWithin(ffmpeg, `Long-form blend ${job.base} ${partTag}`, blendChunkName);
             blendRendered = true;
             if (keepMixReady || loudnessConfig === null) {
-              outputEntries.push(
-                await writeOutput(ffmpeg, blendChunkName, "mixready", "blend", chunkFlow),
+              stagedOutputs.push(
+                await writeOutput(ffmpeg, blendChunkName, "mixready", "blend", chunkFlow, {
+                  sourceBase: job.base,
+                  sourceName: job.file.name,
+                  partIndex: chunk.index,
+                  partTotal: chunk.total,
+                }),
               );
-              setOutputs([...outputEntries]);
             }
           }
         }
@@ -4868,10 +5382,16 @@ const summarizeFailureReason = (error: unknown) => {
           setStatus(`Long-form loudness: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
           setActiveQueueStage(job.base, "Long-form loudness", `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`);
           await runLoudnorm(ffmpeg, mixChunkName, loudChunkName, loudnessConfig);
-          outputEntries.push(
-            await writeOutput(ffmpeg, loudChunkName, "loudness", "clean", chunkFlow),
+          await assertDurationDeltaWithin(ffmpeg, `Long-form loudness ${job.base} ${partTag}`, chunk.durationSec, loudChunkName);
+          await assertTruePeakWithin(ffmpeg, `Long-form loudness ${job.base} ${partTag}`, loudChunkName);
+          stagedOutputs.push(
+            await writeOutput(ffmpeg, loudChunkName, "loudness", "clean", chunkFlow, {
+              sourceBase: job.base,
+              sourceName: job.file.name,
+              partIndex: chunk.index,
+              partTotal: chunk.total,
+            }),
           );
-          setOutputs([...outputEntries]);
 
           if (blendRendered && blendLoudChunkName) {
             setStatus(`Long-form blend loudness: ${job.base} (${fileIndex + 1}/${totalFiles}, part ${partLabel})`);
@@ -4881,10 +5401,21 @@ const summarizeFailureReason = (error: unknown) => {
               `File ${fileIndex + 1}/${totalFiles}, part ${partLabel}`,
             );
             await runLoudnorm(ffmpeg, blendChunkName, blendLoudChunkName, loudnessConfig);
-            outputEntries.push(
-              await writeOutput(ffmpeg, blendLoudChunkName, "loudness", "blend", chunkFlow),
+            await assertDurationDeltaWithin(
+              ffmpeg,
+              `Long-form blend loudness ${job.base} ${partTag}`,
+              chunk.durationSec,
+              blendLoudChunkName,
             );
-            setOutputs([...outputEntries]);
+            await assertTruePeakWithin(ffmpeg, `Long-form blend loudness ${job.base} ${partTag}`, blendLoudChunkName);
+            stagedOutputs.push(
+              await writeOutput(ffmpeg, blendLoudChunkName, "loudness", "blend", chunkFlow, {
+                sourceBase: job.base,
+                sourceName: job.file.name,
+                partIndex: chunk.index,
+                partTotal: chunk.total,
+              }),
+            );
           }
         }
 
@@ -4909,6 +5440,8 @@ const summarizeFailureReason = (error: unknown) => {
       }
     }
 
+    outputEntries.push(...stagedOutputs);
+    setOutputs([...outputEntries]);
     appendLog(
       `[LongForm] ${job.base}: complete. Review bundles and duplicate candidate renders were skipped to keep this PC cool and memory-bounded.`,
     );
@@ -5014,6 +5547,39 @@ const summarizeFailureReason = (error: unknown) => {
       );
     } catch {
       // Ignore probe failures for post-render diagnostics.
+    }
+  };
+
+  const assertDurationDeltaWithin = async (
+    ffmpeg: FFmpeg,
+    context: string,
+    inputDurationSeconds: number,
+    outputName: string,
+    maxDeltaSeconds = HEAD_PRIME_DURATION_TOLERANCE_SECONDS,
+  ) => {
+    if (!Number.isFinite(inputDurationSeconds) || inputDurationSeconds <= 0) return;
+    const outputDurationSeconds = await probeInputDurationSeconds(ffmpeg, outputName);
+    if (outputDurationSeconds === null || !Number.isFinite(outputDurationSeconds)) {
+      throw new Error(`${context}: could not verify output duration`);
+    }
+    const deltaSeconds = outputDurationSeconds - inputDurationSeconds;
+    appendLog(
+      `[Duration] ${context}: input ${inputDurationSeconds.toFixed(3)}s -> output ${outputDurationSeconds.toFixed(
+        3,
+      )}s (delta ${formatSigned(deltaSeconds, 3)}s).`,
+    );
+    if (Math.abs(deltaSeconds) > maxDeltaSeconds) {
+      throw new Error(`${context}: duration delta ${deltaSeconds.toFixed(3)}s exceeds ${maxDeltaSeconds.toFixed(2)}s`);
+    }
+  };
+
+  const assertTruePeakWithin = async (ffmpeg: FFmpeg, context: string, inputName: string, maxTruePeakDb = -1.5) => {
+    const loudness = await analyzeIntegratedLoudness(ffmpeg, inputName);
+    if (loudness.inputTP === null || !Number.isFinite(loudness.inputTP)) {
+      throw new Error(`${context}: could not verify true peak`);
+    }
+    if (loudness.inputTP > maxTruePeakDb) {
+      throw new Error(`${context}: true peak ${loudness.inputTP.toFixed(2)} dBTP exceeds ${maxTruePeakDb.toFixed(1)} dBTP`);
     }
   };
 
@@ -5124,12 +5690,16 @@ const summarizeFailureReason = (error: unknown) => {
       plan.earlyRunCapCount > 0
         ? `, ${plan.earlyRunCapCount} hot opener${plan.earlyRunCapCount === 1 ? "" : "s"} capped (max ${plan.earlyRunMaxReductionDb.toFixed(1)} dB)`
         : "";
+    const coldOpenLiftNote =
+      plan.coldOpenLiftCount > 0
+        ? `, ${plan.coldOpenLiftCount} quiet opener${plan.coldOpenLiftCount === 1 ? "" : "s"} lifted (max ${plan.coldOpenLiftMaxDb.toFixed(1)} dB)`
+        : "";
     appendLog(
       `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(
         1,
       )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
         2,
-      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}).`,
+      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}).`,
     );
 
     context.plan = plan;
@@ -5360,8 +5930,12 @@ const summarizeFailureReason = (error: unknown) => {
             plan.earlyRunCapCount > 0
               ? `, ${plan.earlyRunCapCount} hot opener${plan.earlyRunCapCount === 1 ? "" : "s"} capped (max ${plan.earlyRunMaxReductionDb.toFixed(1)} dB)`
               : "";
+          const coldOpenLiftNote =
+            plan.coldOpenLiftCount > 0
+              ? `, ${plan.coldOpenLiftCount} quiet opener${plan.coldOpenLiftCount === 1 ? "" : "s"} lifted (max ${plan.coldOpenLiftMaxDb.toFixed(1)} dB)`
+              : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}).`,
           );
         } else {
           appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);
@@ -5737,6 +6311,13 @@ const summarizeFailureReason = (error: unknown) => {
       const outputEntries: OutputEntry[] = [];
       const nextReviewBundles: ReviewBundleEntry[] = [];
       const jobs = buildJobs(files);
+      const reviewBundleFinalOutputBlocker = (() => {
+        if (sceneBlend) return "scene-blend deliverables are rendered after the per-file review point";
+        if (loudnessConfig !== null) return "loudness-target deliverables are rendered after the per-file review point";
+        if (jobs.length > 1) return "batch alignment can adjust mix-ready bytes after all files render";
+        return null;
+      })();
+      const canEmitPerFileReviewBundle = reviewBundleFinalOutputBlocker === null;
       initializeQueueItems(jobs);
       const analysisByBase = new Map<string, FileAnalysis>();
       let batchReference: BatchReference | null = null;
@@ -5760,6 +6341,13 @@ const summarizeFailureReason = (error: unknown) => {
             const analysis = analysisResult.analysis;
             analysisByBase.set(job.base, analysis);
             analyses.push(analysis);
+            if (analysis.coldOpenDipDb !== null) {
+              appendLog(
+                `[SourceQC] ${job.base}: cold-open ${analysis.coldOpenDipDb.toFixed(
+                  1,
+                )} dB (risk ${Math.round((analysis.coldOpenRiskScore ?? 0) * 100)}%).`,
+              );
+            }
             markQueuePending(job.base, "Ready for render", "Analysis complete");
           } catch (error) {
             appendLog(
@@ -5834,6 +6422,12 @@ const summarizeFailureReason = (error: unknown) => {
       // Cumulative audio (sec) processed by the current ffmpeg worker.
       // Reset on every refresh; drives the duration-aware recycling.
       let workerCumulativeAudioSec = 0;
+      let postRenderReviewRequests = 0;
+      let correctiveRenderAttempts = 0;
+      const correctiveRenderBudget = resolveCorrectiveMaxFilesPerBatch(jobs.length);
+      appendLog(
+        `[Corrective] batch render budget ${correctiveRenderBudget}/${jobs.length} file(s) (40% cap, minimum 2).`,
+      );
       let i = 0;
       while (i < jobs.length) {
         const job = jobs[i];
@@ -6161,7 +6755,10 @@ const summarizeFailureReason = (error: unknown) => {
                 }
               }
               const alignment = useLongCandidateMemoryPolicy
-                ? buildDurationOnlyAlignmentMetrics(fileDurationForVariants)
+                ? buildDurationOnlyAlignmentMetrics(
+                    fileDurationForVariants,
+                    estimatePcmF32MonoWavSeconds(candidateBytes.byteLength),
+                  )
                 : sourceDecodedForReview && candidateDecodedForReview
                   ? estimateAlignmentMetrics(
                       sourceDecodedForReview.monoSamples,
@@ -6201,7 +6798,11 @@ const summarizeFailureReason = (error: unknown) => {
                 selectionReason: null,
               });
               appendLog(
-                `[CandidateQC] ${job.base}/${candidateLabel}: ${summarizeCandidateScore(candidateScore)}, ${summarizeCandidateMeta(
+                `[CandidateQC] ${job.base}/${candidateLabel}: ${summarizeCandidateScore(candidateScore)}${
+                  candidateAnalysis?.coldOpenDipDb !== null && candidateAnalysis?.coldOpenDipDb !== undefined
+                    ? `, cold-open ${candidateAnalysis.coldOpenDipDb.toFixed(1)} dB`
+                    : ""
+                }, ${summarizeCandidateMeta(
                   candidateMeta
                 )}.`
               );
@@ -6319,15 +6920,389 @@ const summarizeFailureReason = (error: unknown) => {
             }.`
           );
           appendLog(`[CandidateSummary] ${job.base}: ${selectedSummary}.`);
+          const polishResult = await runFinalAppPolishPass(ffmpeg, job.mixName, profile, {
+            base: job.base,
+            detail: `File ${i + 1} of ${jobs.length}, final app polish`,
+            candidateVariant: selectedVariant,
+          });
+          ffmpeg = polishResult.ffmpeg;
+          const outputProcessingFlow = polishResult.applied ? "app-final-polish" : "app";
+
+          const buildArtifactForRenderedMix = async (
+            renderedName: string,
+            bytes: Uint8Array,
+            variant: CandidateVariant,
+            label: string,
+            meta: CandidateRenderMeta,
+            selectionReasonForArtifact: string | null,
+          ): Promise<CandidateReviewArtifact> => {
+            let renderedAnalysis: FileAnalysis | null = null;
+            let renderedMeta = meta;
+            try {
+              const analysisFfmpeg = ffmpeg;
+              const analysisResult = await analyzeFile(ffmpeg, renderedName, [job.inputName]);
+              ffmpeg = analysisResult.ffmpeg;
+              renderedAnalysis = analysisResult.analysis;
+              if (ffmpeg !== analysisFfmpeg) {
+                await writeJobInput(ffmpeg, job);
+                await ffmpeg.writeFile(renderedName, cloneBytes(bytes));
+              }
+            } catch (error) {
+              appendLog(`[Corrective] ${job.base}/${label}: QC fallback (${describeError(error)}).`);
+              renderedMeta = {
+                ...renderedMeta,
+                degraded: true,
+                degradeReasons: Array.from(new Set([...renderedMeta.degradeReasons, "qc-unavailable"])),
+              };
+              if (shouldResetFfmpegForError(error)) {
+                ffmpeg = await refreshFfmpeg(`corrective QC on ${job.base}`);
+                await writeJobInput(ffmpeg, job);
+                await ffmpeg.writeFile(renderedName, cloneBytes(bytes));
+              }
+            }
+
+            const baselineScore = buildCandidateScore(renderedAnalysis);
+            const qcSnapshot = toReviewMetricSnapshot(renderedAnalysis);
+            let renderedDecodedForReview: DecodedMonoAudio | null = null;
+            if (!useLongCandidateMemoryPolicy) {
+              try {
+                renderedDecodedForReview = decodeWavToMono(bytes);
+              } catch (error) {
+                appendLog(`[Corrective] ${job.base}/${label}: alignment fallback (${describeError(error)}).`);
+              }
+            }
+            const alignment = useLongCandidateMemoryPolicy
+              ? buildDurationOnlyAlignmentMetrics(fileDurationForVariants, estimatePcmF32MonoWavSeconds(bytes.byteLength))
+              : sourceDecodedForReview && renderedDecodedForReview
+                ? estimateAlignmentMetrics(
+                    sourceDecodedForReview.monoSamples,
+                    sourceDecodedForReview.sampleRate,
+                    renderedDecodedForReview.monoSamples,
+                    renderedDecodedForReview.sampleRate,
+                  )
+                : buildFallbackAlignmentMetrics(sourceDecodedForReview, renderedDecodedForReview);
+            const ranking = scoreCandidateWithLearnedWeights({
+              baselineScore,
+              candidateQc: qcSnapshot,
+              sourceQc: sourceQcSnapshot,
+              alignment,
+              meta: renderedMeta,
+              weights: learnedReviewWeights,
+            });
+            const scoredScore: CandidateScore = {
+              ...baselineScore,
+              hardGatePenalty: ranking.hardGatePenalty,
+              learnedAdjustment: ranking.learnedAdjustment,
+              rankingScore: ranking.rankingScore,
+              gateReasons: ranking.gateReasons,
+            };
+            return {
+              variant,
+              label,
+              bytes,
+              analysis: renderedAnalysis,
+              meta: renderedMeta,
+              baselineScore,
+              scoredScore,
+              qcSnapshot,
+              qcDelta: buildReviewMetricDelta(sourceQcSnapshot, qcSnapshot),
+              alignment,
+              ranking,
+              selectionReason: selectionReasonForArtifact,
+            };
+          };
+
+          const buildSingleWinnerManifest = (
+            artifact: CandidateReviewArtifact,
+            challenger: CandidateReviewArtifact | null,
+            reason: string | null,
+          ): ReviewBundleManifest => ({
+            schemaVersion: REVIEW_BUNDLE_SCHEMA_VERSION,
+            bundleId: `${job.base}_post_render_${String(i + 1).padStart(3, "0")}`,
+            createdAt: new Date().toISOString(),
+            source: {
+              fileName: job.file.name,
+              audioFile: "source.wav",
+              durationSec: sourceDecodedForReview?.durationSec ?? speechRenderPlan?.durationSeconds ?? 0,
+              sampleRate: sourceDecodedForReview?.sampleRate ?? 0,
+              qc: sourceQcSnapshot,
+            },
+            decisionContext: {
+              jobBase: job.base,
+              loudnessTarget,
+              selectedVariant: artifact.label,
+              selectedReason: reason,
+              learnedWeightsName: learnedReviewWeights.modelName,
+              learnedWeightsSource: learnedReviewWeightsSource,
+              reviewModelType: learnedReviewWeights.modelType,
+            },
+            candidates: [
+              {
+                role: "winner",
+                audioFile: "winner.wav",
+                variantLabel: artifact.label,
+                renderMeta: artifact.meta,
+                baselineScore: artifact.baselineScore,
+                ranking: artifact.ranking,
+                qc: artifact.qcSnapshot,
+                sourceComparison: {
+                  alignment: artifact.alignment,
+                  qcDelta: artifact.qcDelta,
+                },
+                selectionReason: artifact.selectionReason,
+              },
+              ...(challenger
+                ? [
+                    {
+                      role: "challenger" as const,
+                      audioFile: "challenger.wav",
+                      variantLabel: challenger.label,
+                      renderMeta: challenger.meta,
+                      baselineScore: challenger.baselineScore,
+                      ranking: challenger.ranking,
+                      qc: challenger.qcSnapshot,
+                      sourceComparison: {
+                        alignment: challenger.alignment,
+                        qcDelta: challenger.qcDelta,
+                      },
+                      selectionReason: challenger.selectionReason,
+                    },
+                  ]
+                : []),
+            ],
+          });
+
+          if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant) {
+            const selectedPostPolishBytes = await readVirtualFileBytes(ffmpeg, job.mixName);
+            const selectedPostPolishArtifact = await buildArtifactForRenderedMix(
+              job.mixName,
+              selectedPostPolishBytes,
+              selectedVariant,
+              formatCandidateVariant(selectedVariant),
+              selectedMeta ?? {
+                strategyLabel: "primary chain",
+                renderPath: "single-pass",
+                segmentedHealthy: false,
+                degraded: false,
+                degradeReasons: [],
+                analysisWindowsAttempted: 0,
+                analysisWindowsSucceeded: 0,
+                analysisWindowsDropped: 0,
+              },
+              selectedReason,
+            );
+            const postRenderManifest = buildSingleWinnerManifest(selectedPostPolishArtifact, null, selectedReason);
+            const postAutoReview = autoReviewBundle(postRenderManifest);
+            const hardGateReasons = selectedPostPolishArtifact.ranking.gateReasons;
+            const correctiveTriggered = shouldAttemptCorrectivePassForAssessment(
+              postAutoReview.selectedAssessment,
+              hardGateReasons,
+            );
+            const correctiveTriggerSummary = `fail ${postAutoReview.selectedAssessment.failCount}, warn ${
+              postAutoReview.selectedAssessment.warnCount
+            }, tags ${postAutoReview.issueTags.join(", ") || "none"}, gates ${hardGateReasons.join(", ") || "none"}`;
+            const shouldTryCorrective =
+              candidateQcSafeDurationSeconds < LONG_CANDIDATE_QC_SAFE_SECONDS && correctiveTriggered;
+
+            if (correctiveTriggered && candidateQcSafeDurationSeconds >= LONG_CANDIDATE_QC_SAFE_SECONDS) {
+              appendLog(
+                `[Corrective] ${job.base}: skipped for long-file QC safety (${correctiveTriggerSummary}).`,
+              );
+            } else if (shouldTryCorrective && correctiveRenderAttempts >= correctiveRenderBudget) {
+              appendLog(
+                `[Corrective] ${job.base}: skipped by batch budget ${correctiveRenderAttempts}/${correctiveRenderBudget} (${correctiveTriggerSummary}).`,
+              );
+            } else if (shouldTryCorrective) {
+              appendLog(
+                `[Corrective] ${job.base}: trigger accepted (${correctiveTriggerSummary}; budget ${correctiveRenderAttempts}/${correctiveRenderBudget} used).`,
+              );
+              const baseDirectives = getActiveAudioReviewAdaptiveDirectives();
+              let correctiveDirectives = mergeAudioReviewAdaptiveDirectives(
+                baseDirectives,
+                adaptiveDirectiveDeltaFromDefault(buildCorrectiveDirectivesForIssueTags(postAutoReview.issueTags)),
+              );
+              if (postRenderReviewRequests < POST_RENDER_REVIEW_MAX_REQUESTS) {
+                postRenderReviewRequests += 1;
+                const postReviewFile = buildAudioReviewFileInput(
+                  job,
+                  fileAnalysis,
+                  profile,
+                  fileDurationForVariants,
+                  buildSelectedCandidateReviewInput(
+                    selectedPostPolishArtifact,
+                    selectedReason,
+                    outputProcessingFlow,
+                    postAutoReview.issueTags,
+                  ),
+                );
+                const postReview = await runAiAudioReview([postReviewFile], {
+                  source: "post-render",
+                  reviewStage: "post-render",
+                });
+                const fileReview = postReview?.review.perFileProfiles.find(
+                  (item) => item.base === job.base || item.fileName === job.file.name,
+                );
+                if (
+                  fileReview &&
+                  (postReview?.review.verdict === "adjust" || postReview?.review.verdict === "risky") &&
+                  hasNonTrivialAdaptiveDirectives(normalizeAdaptiveDirectives(fileReview.adaptiveDirectives), baseDirectives)
+                ) {
+                  correctiveDirectives = normalizeAdaptiveDirectives(fileReview.adaptiveDirectives);
+                }
+              } else {
+                appendLog(`[Corrective] ${job.base}: Gemini post-render review skipped (batch cap reached).`);
+              }
+
+              if (hasNonTrivialAdaptiveDirectives(correctiveDirectives, baseDirectives)) {
+                correctiveRenderAttempts += 1;
+                appendLog(
+                  `[Corrective] ${job.base}: using render budget ${correctiveRenderAttempts}/${correctiveRenderBudget}.`,
+                );
+                const previousDirectives: AudioReviewAdaptiveDirectives | null = aiAdaptiveDirectivesOverrideRef.current;
+                const correctiveName = `${job.base}_corrective_candidate.wav`;
+                try {
+                  if (candidateQcSafeDurationSeconds >= LONG_FILE_DURATION_SECONDS) {
+                    ffmpeg = await refreshFfmpeg(`corrective render preflight on ${job.base}`);
+                    await writeJobInput(ffmpeg, job);
+                  }
+                  aiAdaptiveDirectivesOverrideRef.current = correctiveDirectives;
+                  const correctiveProfile = buildAdaptiveProfile(fileAnalysis, batchReference);
+                  const correctivePlannerContext = await preparePlannerRenderContext(
+                    ffmpeg,
+                    job,
+                    correctiveProfile,
+                    fileAnalysis,
+                    fileDurationForVariants,
+                  );
+                  const correctiveResult = await renderMixReadyWithFallbacks(
+                    ffmpeg,
+                    job,
+                    correctiveName,
+                    correctiveProfile,
+                    i,
+                    jobs.length,
+                    "Corrective render",
+                    {
+                      candidateVariant: selectedVariant,
+                      skipSpeechSegmentation:
+                        selectedVariant === "source-safe" ||
+                        (selectedVariant === "continuity-safe" && (correctiveProfile?.preferSinglePassContinuity ?? false)),
+                      sourceSafeChain: selectedVariant === "source-safe",
+                      disableRoomCleanup: selectedVariant === "source-safe" ? true : undefined,
+                      disableAdaptiveNoiseReduction: selectedVariant === "source-safe" ? true : undefined,
+                    },
+                    speechRenderPlan,
+                    fileAnalysis,
+                    correctivePlannerContext,
+                  );
+                  ffmpeg = correctiveResult.ffmpeg;
+                  const correctivePolish = await runFinalAppPolishPass(ffmpeg, correctiveName, correctiveProfile, {
+                    base: job.base,
+                    detail: `File ${i + 1} of ${jobs.length}, corrective final app polish`,
+                    candidateVariant: selectedVariant,
+                  });
+                  ffmpeg = correctivePolish.ffmpeg;
+                  const correctiveBytes = await readVirtualFileBytes(ffmpeg, correctiveName);
+                  const correctiveArtifact = await buildArtifactForRenderedMix(
+                    correctiveName,
+                    correctiveBytes,
+                    selectedVariant,
+                    `${formatCandidateVariant(selectedVariant)} corrective`,
+                    correctiveResult.meta,
+                    "bounded corrective pass",
+                  );
+                  const originalRank = selectedPostPolishArtifact.scoredScore.rankingScore ?? selectedPostPolishArtifact.scoredScore.total;
+                  const correctiveRank = correctiveArtifact.scoredScore.rankingScore ?? correctiveArtifact.scoredScore.total;
+                  const correctiveWins =
+                    correctiveArtifact.ranking.gateReasons.length === 0 &&
+                    correctiveRank <= originalRank - CORRECTIVE_WIN_MARGIN;
+                  if (correctiveWins) {
+                    await ffmpeg.writeFile(job.mixName, cloneBytes(correctiveBytes));
+                    selectedBytes = correctiveBytes;
+                    selectedAnalysis = correctiveArtifact.analysis;
+                    selectedScore = correctiveArtifact.scoredScore;
+                    selectedMeta = correctiveArtifact.meta;
+                    selectedReason = `corrective pass kept (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points)`;
+                    if (canEmitPerFileReviewBundle) {
+                      nextReviewBundles.push({
+                        bundleId: `${job.base}_corrective_${String(i + 1).padStart(3, "0")}`,
+                        manifest: buildSingleWinnerManifest(correctiveArtifact, selectedPostPolishArtifact, selectedReason),
+                        assets: [
+                          { path: "source.wav", blob: job.file },
+                          { path: "winner.wav", blob: reviewBlobFromBytes(correctiveArtifact.bytes) },
+                          { path: "challenger.wav", blob: reviewBlobFromBytes(selectedPostPolishArtifact.bytes) },
+                        ],
+                      });
+                    } else {
+                      appendLog(
+                        `[ReviewBundle] ${job.base}: skipped corrective QC Lab bundle because ${reviewBundleFinalOutputBlocker}; stale winner.wav artifacts are not emitted.`,
+                      );
+                    }
+                    appendLog(
+                      `[Corrective] ${job.base}: kept corrective render triggered by ${postAutoReview.issueTags.join(
+                        ", ",
+                      ) || "auto-review"} (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points).`,
+                    );
+                  } else {
+                    await ffmpeg.writeFile(job.mixName, cloneBytes(selectedPostPolishBytes));
+                    appendLog(
+                      `[Corrective] ${job.base}: discarded corrective render triggered by ${postAutoReview.issueTags.join(
+                        ", ",
+                      ) || "auto-review"} (delta ${(originalRank - correctiveRank).toFixed(1)} ranking points; gates ${
+                        correctiveArtifact.ranking.gateReasons.join(", ") || "none"
+                      }).`,
+                    );
+                  }
+                } catch (error) {
+                  appendLog(`[Corrective] ${job.base}: skipped after failure (${describeError(error)}).`);
+                  if (shouldResetFfmpegForError(error)) {
+                    ffmpeg = await refreshFfmpeg(`corrective failure on ${job.base}`);
+                    await writeJobInput(ffmpeg, job);
+                  }
+                  await ffmpeg.writeFile(job.mixName, cloneBytes(selectedPostPolishBytes));
+                } finally {
+                  aiAdaptiveDirectivesOverrideRef.current = previousDirectives;
+                  await safeDeleteFile(ffmpeg, correctiveName);
+                }
+              } else {
+                appendLog(`[Corrective] ${job.base}: no non-trivial corrective directives for ${postAutoReview.issueTags.join(", ") || "auto-review"}.`);
+              }
+            } else {
+              appendLog(`[Corrective] ${job.base}: no corrective pass needed (${postAutoReview.selectedAssessment.summary}).`);
+            }
+          }
+
           const skipReviewBundleForMemory = candidateQcSafeDurationSeconds >= LONG_FILE_DURATION_SECONDS;
-          if (selectedArtifact && skipReviewBundleForMemory) {
+          if (skipReviewBundleForMemory) {
             appendLog(
               `[ReviewBundle] ${job.base}: skipped QC Lab review bundle for ${candidateQcSafeDurationSeconds.toFixed(
                 0,
               )}s long file to avoid duplicating large audio blobs in browser memory.`,
             );
-          } else if (selectedArtifact) {
+          } else if (reviewBundleFinalOutputBlocker) {
+            appendLog(
+              `[ReviewBundle] ${job.base}: skipped QC Lab review bundle because ${reviewBundleFinalOutputBlocker}; stale winner.wav artifacts are not emitted.`,
+            );
+          } else {
             try {
+              const finalBytes = await readVirtualFileBytes(ffmpeg, job.mixName);
+              const finalArtifact = await buildArtifactForRenderedMix(
+                job.mixName,
+                finalBytes,
+                selectedVariant,
+                `${formatCandidateVariant(selectedVariant)} final`,
+                selectedMeta ?? {
+                  strategyLabel: "primary chain",
+                  renderPath: "single-pass",
+                  segmentedHealthy: false,
+                  degraded: false,
+                  degradeReasons: [],
+                  analysisWindowsAttempted: 0,
+                  analysisWindowsSucceeded: 0,
+                  analysisWindowsDropped: 0,
+                },
+                selectedReason,
+              );
               const bundleId = `${job.base}_review_${String(i + 1).padStart(3, "0")}`;
               const sourceDurationSec =
                 sourceDecodedForReview?.durationSec ?? speechRenderPlan?.durationSeconds ?? 0;
@@ -6338,7 +7313,7 @@ const summarizeFailureReason = (error: unknown) => {
                 role: "winner" | "challenger";
                 assetName: string;
                 artifact: CandidateReviewArtifact;
-              }> = [{ role: "winner", assetName: "winner.wav", artifact: selectedArtifact }];
+              }> = [{ role: "winner", assetName: "winner.wav", artifact: finalArtifact }];
               if (challengerArtifact) {
                 reviewCandidates.push({
                   role: "challenger",
@@ -6386,7 +7361,7 @@ const summarizeFailureReason = (error: unknown) => {
                 manifest,
                 assets: [
                   { path: "source.wav", blob: job.file },
-                  { path: "winner.wav", blob: reviewBlobFromBytes(selectedArtifact.bytes) },
+                  { path: "winner.wav", blob: reviewBlobFromBytes(finalArtifact.bytes) },
                   ...(challengerArtifact
                     ? [
                         {
@@ -6398,28 +7373,24 @@ const summarizeFailureReason = (error: unknown) => {
                 ],
               });
               appendLog(
-                `[ReviewBundle] ${job.base}: captured ${selectedVariantLabel} winner${
+                `[ReviewBundle] ${job.base}: captured final ${selectedVariantLabel} winner${
                   challengerArtifact ? ` vs ${challengerArtifact.label}` : ""
-                } for QC Lab review.`
+                } for QC Lab review.`,
               );
             } catch (error) {
               appendLog(
-                `[ReviewBundle] ${job.base}: skipped after bundle build failed (${
-                  error instanceof Error ? error.message : String(error)
-                }); audio outputs continue.`,
+                `[ReviewBundle] ${job.base}: skipped after final bundle build failed (${describeError(
+                  error,
+                )}); audio outputs continue.`,
               );
             }
           }
-          const polishResult = await runFinalAppPolishPass(ffmpeg, job.mixName, profile, {
-            base: job.base,
-            detail: `File ${i + 1} of ${jobs.length}, final app polish`,
-            candidateVariant: selectedVariant,
-          });
-          ffmpeg = polishResult.ffmpeg;
-          const outputProcessingFlow = polishResult.applied ? "app-final-polish" : "app";
 
           if (keepMixReady || loudnessConfig === null) {
-            const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean", outputProcessingFlow);
+            const mixOutput = await writeOutput(ffmpeg, job.mixName, "mixready", "clean", outputProcessingFlow, {
+              sourceBase: job.base,
+              sourceName: job.file.name,
+            });
             outputEntries.push(mixOutput);
           }
 
@@ -6440,8 +7411,12 @@ const summarizeFailureReason = (error: unknown) => {
                     job.blendMixName,
                     "mixready",
                     "blend",
-                    outputProcessingFlow,
-                  );
+                  outputProcessingFlow,
+                  {
+                    sourceBase: job.base,
+                    sourceName: job.file.name,
+                  },
+                );
                   outputEntries.push(blendMixOutput);
                 }
               } catch (error) {
@@ -6457,7 +7432,10 @@ const summarizeFailureReason = (error: unknown) => {
             setStatus(`Loudness clean: ${job.base} (${i + 1}/${jobs.length})`);
             setActiveQueueStage(job.base, "Loudness (clean)", `File ${i + 1} of ${jobs.length}`);
             await runLoudnorm(ffmpeg, job.mixName, cleanLoudName, loudnessConfig);
-            const loudOutput = await writeOutput(ffmpeg, cleanLoudName, "loudness", "clean", outputProcessingFlow);
+            const loudOutput = await writeOutput(ffmpeg, cleanLoudName, "loudness", "clean", outputProcessingFlow, {
+              sourceBase: job.base,
+              sourceName: job.file.name,
+            });
             outputEntries.push(loudOutput);
 
             if (sceneBlend && blendRendered) {
@@ -6471,6 +7449,10 @@ const summarizeFailureReason = (error: unknown) => {
                 "loudness",
                 "blend",
                 outputProcessingFlow,
+                {
+                  sourceBase: job.base,
+                  sourceName: job.file.name,
+                },
               );
               outputEntries.push(blendLoudOutput);
             }
@@ -6552,6 +7534,10 @@ const summarizeFailureReason = (error: unknown) => {
           ffmpeg = await refreshFfmpeg(`processing memory guard (${i}/${jobs.length})`);
           workerCumulativeAudioSec = 0;
         }
+      }
+
+      if (loudnessConfig === null) {
+        ffmpeg = await alignBatchMixReadyOutputs(ffmpeg, outputEntries);
       }
 
       // Final reconciliation. Live updates inside the loop already pushed

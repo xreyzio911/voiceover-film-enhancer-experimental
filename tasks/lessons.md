@@ -1,5 +1,35 @@
 # Lessons
 
+## 2026-07-03 - Delivered Audio Must Be The Review Artifact
+
+- What went wrong: QC Lab review bundles were built at the per-file review point, but scene blend, loudness export, and batch alignment can still change the delivered WAV bytes afterward.
+- Rule to prevent it: Emit a review bundle only when `winner.wav` is the final delivered artifact; otherwise skip the bundle rather than publishing stale review evidence.
+- How to verify next time: Trace every output mutation after review-bundle creation, especially blend/loudness/batch paths, and confirm bundle assets are produced from final `OutputEntry` blobs.
+
+## 2026-07-03 - Sparse Spike Controls Need Separate Safety Floors
+
+- What went wrong: The sparse clean-take branch lowered the same `speechSpikeTaming` value used by both the local body-spike shaper and the residual loud-cluster safety pass.
+- Rule to prevent it: Keep musical sparse-take relaxation scoped to the local body-relative shaper; keep the residual speech-spike floor active so caller-provided zeroes cannot bypass safety.
+- How to verify next time: Cover both a sparse clean take that should not be over-dipped and a sparse over-hot take that still needs residual correction.
+
+## 2026-07-03 - Long-Form Parts Must Commit Atomically
+
+- What went wrong: Long-form chunk exports pushed each part into UI outputs immediately, so a later chunk failure could leave a partial downloadable set for the same source.
+- Rule to prevent it: Stage long-form part outputs locally and publish them only after all required chunks and variants pass duration/peak gates.
+- How to verify next time: Review long-form export paths for per-part `setOutputs` calls and prefer one final commit per source file.
+
+## 2026-07-02 - Post-Render Directive Semantics
+
+- What went wrong: The post-render Gemini prompt described `adaptiveDirectives` as deltas, but the normalized directive object represents complete bounded values. Treating those as deltas can double-apply corrective moves on top of the active base profile.
+- Rule to prevent it: Keep deterministic issue-tag mappings delta-based, but treat AI-returned post-render `adaptiveDirectives` as absolute final settings unless the schema explicitly says otherwise.
+- How to verify next time: Add prompt tests for the wording and a focused test that normalized post-render directive values are retained as final values.
+
+## 2026-07-02 - Mixed Metric Snapshot Keys
+
+- What went wrong: Adding `bandSpectrumDb` to the AI review metric snapshot made a numeric metric reducer type-unsafe because the reducer key list still allowed array-valued fields.
+- Rule to prevent it: When a snapshot mixes scalar metrics and bounded arrays, keep separate typed key lists for scalar normalization and array normalization.
+- How to verify next time: Run `npm run build` after schema/type additions, not just focused Node tests.
+
 ## 2026-04-28 - Next Dev Upload Limit
 
 - What went wrong: The Audio Track Splitter route accepted multipart uploads, but Next's proxy body clone limit stayed at the 10 MB default, so WAV batches were truncated before `request.formData()`.

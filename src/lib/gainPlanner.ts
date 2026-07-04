@@ -21,6 +21,12 @@ export type SpeechRun = {
 export type GainPlannerInput = {
   /** 10ms-frame RMS in dB (e.g. from analyzeFloatSamples envelope). */
   frameDb: number[];
+  /**
+   * Optional same-length perceptual loudness envelope. Target/gain math can
+   * use this, but raw frameDb stays authoritative for masks, peaks, crest,
+   * and body-relative spike guards whose thresholds were tuned in raw RMS.
+   */
+  loudnessFrameDb?: number[];
   /** Speech runs (frame index ranges) already detected by the analyzer. */
   speechRuns: SpeechRun[];
   /** Noise floor of the source in dB (pauseNoiseFloorDb). */
@@ -45,6 +51,8 @@ export type GainPlannerInput = {
   /** Optional Float32 samples + sampleRate. If supplied, peak-guard pass simulates the applied gain. */
   samples?: Float32Array;
   sampleRate?: number;
+  coldOpenLiftToleranceDb?: number;
+  coldOpenLiftMaxDb?: number;
   /** Ceiling in dBFS for samples after gain is applied (limiter has margin beyond this). Default -4. */
   peakCeilingDb?: number;
   /**
@@ -111,10 +119,98 @@ export type GainPlannerOutput = {
   earlyRunCapCount: number;
   /** Largest early-dialogue cap in dB. Diagnostic. */
   earlyRunMaxReductionDb: number;
+  /** Count of early dialogue runs lifted toward later dialogue body. */
+  coldOpenLiftCount: number;
+  /** Largest cold-open lift in dB. Diagnostic. */
+  coldOpenLiftMaxDb: number;
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const dbToLin = (db: number) => Math.pow(10, db / 20);
+const COLD_OPEN_WINDOW_MS = 2500;
+const COLD_OPEN_RUN_COUNT = 3;
+const COLD_OPEN_TRANSIENT_CREST_DB = 15;
+const COLD_OPEN_TRANSIENT_PEAK_OVER_TARGET_DB = 8;
+const COLD_OPEN_LIFT_TOLERANCE_DB = 1.5;
+const COLD_OPEN_LIFT_MAX_DB = 5;
+const COLD_OPEN_ONSET_BACKTRACK_MS = 60;
+const COLD_OPEN_ATTACK_LEAD_MS = 40;
+const K_WEIGHT_STAGE1_HIGH_SHELF_HZ = 1681.974450955533;
+const K_WEIGHT_STAGE1_GAIN_DB = 4;
+const K_WEIGHT_STAGE2_HIGH_PASS_HZ = 38.13547087602444;
+const K_WEIGHT_STAGE2_Q = 0.5;
+
+type BiquadCoefficients = {
+  b0: number;
+  b1: number;
+  b2: number;
+  a1: number;
+  a2: number;
+};
+
+const normalizeBiquad = (b0: number, b1: number, b2: number, a0: number, a1: number, a2: number) => ({
+  b0: b0 / a0,
+  b1: b1 / a0,
+  b2: b2 / a0,
+  a1: a1 / a0,
+  a2: a2 / a0,
+});
+
+const buildHighPassBiquad = (sampleRate: number, frequencyHz: number, q: number): BiquadCoefficients => {
+  const w0 = (2 * Math.PI * frequencyHz) / sampleRate;
+  const cosW0 = Math.cos(w0);
+  const alpha = Math.sin(w0) / (2 * q);
+  const b0 = (1 + cosW0) / 2;
+  const b1 = -(1 + cosW0);
+  const b2 = (1 + cosW0) / 2;
+  const a0 = 1 + alpha;
+  const a1 = -2 * cosW0;
+  const a2 = 1 - alpha;
+  return normalizeBiquad(b0, b1, b2, a0, a1, a2);
+};
+
+const buildHighShelfBiquad = (sampleRate: number, frequencyHz: number, gainDb: number): BiquadCoefficients => {
+  const a = Math.pow(10, gainDb / 40);
+  const w0 = (2 * Math.PI * frequencyHz) / sampleRate;
+  const cosW0 = Math.cos(w0);
+  const sinW0 = Math.sin(w0);
+  const alpha = (sinW0 / 2) * Math.SQRT2;
+  const sqrtAAlpha2 = 2 * Math.sqrt(a) * alpha;
+  const b0 = a * ((a + 1) + (a - 1) * cosW0 + sqrtAAlpha2);
+  const b1 = -2 * a * ((a - 1) + (a + 1) * cosW0);
+  const b2 = a * ((a + 1) + (a - 1) * cosW0 - sqrtAAlpha2);
+  const a0 = (a + 1) - (a - 1) * cosW0 + sqrtAAlpha2;
+  const a1 = 2 * ((a - 1) - (a + 1) * cosW0);
+  const a2 = (a + 1) - (a - 1) * cosW0 - sqrtAAlpha2;
+  return normalizeBiquad(b0, b1, b2, a0, a1, a2);
+};
+
+const applyBiquad = (samples: Float32Array, coeffs: BiquadCoefficients) => {
+  const out = new Float32Array(samples.length);
+  let x1 = 0;
+  let x2 = 0;
+  let y1 = 0;
+  let y2 = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    const x0 = samples[i];
+    const y0 = coeffs.b0 * x0 + coeffs.b1 * x1 + coeffs.b2 * x2 - coeffs.a1 * y1 - coeffs.a2 * y2;
+    out[i] = y0;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+  }
+  return out;
+};
+
+export const applyKWeighting = (samples: Float32Array, sampleRate: number) => {
+  if (!Number.isFinite(sampleRate) || sampleRate <= K_WEIGHT_STAGE1_HIGH_SHELF_HZ * 2) {
+    return new Float32Array(samples);
+  }
+  const shelf = buildHighShelfBiquad(sampleRate, K_WEIGHT_STAGE1_HIGH_SHELF_HZ, K_WEIGHT_STAGE1_GAIN_DB);
+  const highPass = buildHighPassBiquad(sampleRate, K_WEIGHT_STAGE2_HIGH_PASS_HZ, K_WEIGHT_STAGE2_Q);
+  return applyBiquad(applyBiquad(samples, shelf), highPass);
+};
 
 const rmsDbOfSlice = (frameDb: number[], start: number, end: number): number => {
   const a = Math.max(0, start);
@@ -155,12 +251,16 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   const sourceTargetBlend = clamp(input.sourceTargetBlend ?? 0.15, 0, 1);
   const maxGainDb = input.maxGainDb ?? 14;
   const minGainDb = input.minGainDb ?? -14;
+  const coldOpenLiftToleranceDb = input.coldOpenLiftToleranceDb ?? COLD_OPEN_LIFT_TOLERANCE_DB;
+  const coldOpenLiftMaxAllowedDb = input.coldOpenLiftMaxDb ?? COLD_OPEN_LIFT_MAX_DB;
   // -4 dBFS ceiling gives the downstream `alimiter=limit=-2dB` genuine
   // headroom — peaks that nearly kiss our ceiling leave 2 dB for the
   // limiter to shape transients without clipping.
   const peakCeilingDb = input.peakCeilingDb ?? -4;
 
   const frameCount = input.frameDb.length;
+  const loudnessFrameDb =
+    input.loudnessFrameDb?.length === frameCount ? input.loudnessFrameDb : input.frameDb;
   const gainDbCurve = new Float32Array(frameCount);
 
   // Adaptive micro-ride amplitude. The micro-ride applies small corrective
@@ -180,11 +280,12 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // and ramp to 1.0 as instabilityHint approaches 1. Previously the guard
   // only kicked in above instabilityHint 0.35, leaving most files with
   // speechSpikeTaming = 0 and no within-sentence spike protection.
-  let speechSpikeTaming = clamp(
-    input.speechSpikeTaming ?? clamp(0.3 + (instabilityHint - 0.05) * 0.85, 0.3, 1),
+  const speechSpikeTaming = clamp(
+    Math.max(input.speechSpikeTaming ?? clamp(0.3 + (instabilityHint - 0.05) * 0.85, 0.3, 1), 0.3),
     0,
     1,
   );
+  let bodyRelativeSpeechSpikeTaming = speechSpikeTaming;
 
   // 1) Per-run body RMS + classification.
   //
@@ -196,11 +297,12 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // When `input.samples` is provided we compute a per-frame peak from the
   // actual waveform (accurate); otherwise we approximate peak ~= body + 12
   // dB which is the typical speech crest factor.
-  const runRmsDb: number[] = []; // body-speech runs ONLY — these drive the target
+  const runRmsDb: number[] = []; // body-speech loudness-domain runs ONLY — these drive the target
   type RunEntry = {
     startFrame: number;
     endFrame: number;
     meanDb: number;
+    loudnessMeanDb: number;
     peakDb: number;
     crestDb: number;
     /**
@@ -211,6 +313,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
      */
     hotFrameRatio: number;
     runClass: SpeechRunClass;
+    isColdOpen: boolean;
   };
   const runMeta: RunEntry[] = [];
 
@@ -235,23 +338,39 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
 
   for (let runIndex = 0; runIndex < input.speechRuns.length; runIndex += 1) {
     const run = input.speechRuns[runIndex];
-    const runFrames = run.endFrame - run.startFrame;
+    let startFrame = run.startFrame;
+    if (runIndex === 0) {
+      const backtrackFrames = Math.max(0, Math.round(COLD_OPEN_ONSET_BACKTRACK_MS / frameMs));
+      const backtrackFloorDb = input.speechThresholdDb - 6;
+      let walkedFrames = 0;
+      while (
+        startFrame > 0 &&
+        walkedFrames < backtrackFrames &&
+        input.frameDb[startFrame - 1] >= backtrackFloorDb
+      ) {
+        startFrame -= 1;
+        walkedFrames += 1;
+      }
+    }
+    const runFrames = run.endFrame - startFrame;
     if (runFrames < 6) continue;
     const trim = Math.max(2, Math.floor(runFrames * 0.12));
-    const bodyStart = run.startFrame + trim;
+    const bodyStart = startFrame + trim;
     const bodyEnd = Math.max(bodyStart + 1, run.endFrame - trim);
     const meanDb = rmsDbOfSlice(input.frameDb, bodyStart, bodyEnd);
+    const loudnessMeanDb = rmsDbOfSlice(loudnessFrameDb, bodyStart, bodyEnd);
     if (!Number.isFinite(meanDb) || meanDb <= -100) continue;
+    if (!Number.isFinite(loudnessMeanDb) || loudnessMeanDb <= -100) continue;
 
     // Peak over the ENTIRE run (including edges — that's where plosives
     // live). Fall back to frameDb + 12 dB when samples are unavailable.
     let peakDb = -120;
     if (framePeakDb) {
-      for (let f = run.startFrame; f < run.endFrame; f += 1) {
+      for (let f = startFrame; f < run.endFrame; f += 1) {
         if (framePeakDb[f] > peakDb) peakDb = framePeakDb[f];
       }
     } else {
-      for (let f = run.startFrame; f < run.endFrame; f += 1) {
+      for (let f = startFrame; f < run.endFrame; f += 1) {
         if (input.frameDb[f] > peakDb) peakDb = input.frameDb[f];
       }
       peakDb += 12;
@@ -266,7 +385,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     // sub-targeting decision below so we don't psycho-acoustically
     // duck a sentence just because one consonant has a sharp peak.
     let hotFrameCount = 0;
-    for (let f = run.startFrame; f < run.endFrame; f += 1) {
+    for (let f = startFrame; f < run.endFrame; f += 1) {
       const framePeakAtF = framePeakDb ? framePeakDb[f] : input.frameDb[f] + 12;
       if (framePeakAtF > meanDb + 6) hotFrameCount += 1;
     }
@@ -274,9 +393,10 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     const previousEndFrame = runIndex > 0 ? input.speechRuns[runIndex - 1].endFrame : 0;
     const nextStartFrame =
       runIndex + 1 < input.speechRuns.length ? input.speechRuns[runIndex + 1].startFrame : frameCount;
-    const preGapMs = Math.max(0, run.startFrame - previousEndFrame) * frameMs;
+    const preGapMs = Math.max(0, startFrame - previousEndFrame) * frameMs;
     const postGapMs = Math.max(0, nextStartFrame - run.endFrame) * frameMs;
     const isolatedOrLeadIn = preGapMs >= 70 || postGapMs >= 70;
+    const isColdOpen = runIndex < COLD_OPEN_RUN_COUNT || startFrame * frameMs <= COLD_OPEN_WINDOW_MS;
     const shortHotPerformance =
       runLenMs < 650 &&
       isolatedOrLeadIn &&
@@ -285,7 +405,19 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         (runLenMs < 360 && peakDb >= targetDbBase + 8 && meanDb <= targetDbBase + 1.5));
 
     let runClass: SpeechRunClass;
-    if (shortHotPerformance) {
+    if (isColdOpen && runLenMs < 100) {
+      runClass = "edge-fragment";
+    } else if (
+      isColdOpen &&
+      (shortHotPerformance || runLenMs < 400) &&
+      framePeakDb &&
+      crestDb >= COLD_OPEN_TRANSIENT_CREST_DB &&
+      peakDb >= targetDbBase + COLD_OPEN_TRANSIENT_PEAK_OVER_TARGET_DB
+    ) {
+      runClass = "transient-breath";
+    } else if (isColdOpen) {
+      runClass = "body-speech";
+    } else if (shortHotPerformance) {
       runClass = "transient-breath";
     } else if (runLenMs < 100) {
       runClass = "edge-fragment";
@@ -296,17 +428,19 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
 
     runMeta.push({
-      startFrame: run.startFrame,
+      startFrame,
       endFrame: run.endFrame,
       meanDb,
+      loudnessMeanDb,
       peakDb,
       crestDb,
       hotFrameRatio,
       runClass,
+      isColdOpen,
     });
     // Only body-speech runs drive the batch target — a single loud gasp
     // must NOT pull the dialogue target level up.
-    if (runClass === "body-speech") runRmsDb.push(meanDb);
+    if (runClass === "body-speech") runRmsDb.push(loudnessMeanDb);
   }
 
   // 2) Target = TRIMMED MEAN of run body RMS (drop extreme sentences as
@@ -368,21 +502,25 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     bodyRunSigmaDb <= 1.25 &&
     input.pauseNoiseRisk <= 0.25
   ) {
-    // Sparse takes that are already line-consistent should not get their
-    // dialogue bodies re-shaped by the body-relative spike guard. The global
-    // peak ceiling below still catches real clipping/overs, but consonants in
-    // clean short takes keep their natural tone and do not create new level
-    // variance.
-    speechSpikeTaming = Math.min(speechSpikeTaming, 0.05);
+    // Sparse takes that are already line-consistent should not get aggressive
+    // body-relative spike shaping, but the residual safety floor must remain
+    // active so caller-provided zeroes cannot bypass the speech-spike guard.
+    bodyRelativeSpeechSpikeTaming = Math.min(bodyRelativeSpeechSpikeTaming, 0.05);
   }
 
   const breathTargetDb = targetDb - 3.2;
   const plannedRunGainDb: number[] = runMeta.map((m) => {
     if (m.runClass === "transient-breath") {
-      return clamp(breathTargetDb - m.meanDb, -12, 4);
+      const targetClassGain = breathTargetDb - m.loudnessMeanDb;
+      const positiveClamp =
+        m.isColdOpen && targetClassGain > 0 ? Math.min(maxGainDb, Math.max(4, targetClassGain)) : 4;
+      return clamp(targetClassGain, -12, positiveClamp);
     }
     if (m.runClass === "edge-fragment") {
-      return clamp(targetDb - m.meanDb, -4, 4);
+      const targetClassGain = targetDb - m.loudnessMeanDb;
+      const positiveClamp =
+        m.isColdOpen && targetClassGain > 0 ? Math.min(maxGainDb, Math.max(4, targetClassGain)) : 4;
+      return clamp(targetClassGain, -4, positiveClamp);
     }
     // Body-speech: psycho-acoustic adjustment for SUSTAINED high-crest
     // vocalizations. We require BOTH:
@@ -405,7 +543,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     // High-crest sustained runs get a wider attenuation window so very
     // loud sources can be brought down further than the standard ±14 dB.
     const lowerClamp = sustainedHighCrest ? Math.min(minGainDb, -18) : minGainDb;
-    return clamp(adjustedTarget - m.meanDb, lowerClamp, maxGainDb);
+    return clamp(adjustedTarget - m.loudnessMeanDb, lowerClamp, maxGainDb);
   });
   // Cross-run smoothing on adjacent body-speech pairs only.
   //
@@ -432,7 +570,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     const prev = runMeta[i - 1];
     if (cur.runClass !== "body-speech" || prev.runClass !== "body-speech") continue;
     if (isSustainedHighCrest(i) || isSustainedHighCrest(i - 1)) continue;
-    if (Math.abs(cur.meanDb - prev.meanDb) > 8) continue;
+    if (Math.abs(cur.loudnessMeanDb - prev.loudnessMeanDb) > 8) continue;
     const diff = plannedRunGainDb[i] - plannedRunGainDb[i - 1];
     if (Math.abs(diff) > 3) {
       const mid = (plannedRunGainDb[i] + plannedRunGainDb[i - 1]) / 2;
@@ -447,15 +585,17 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // does not start loud and then settle down.
   let earlyRunCapCount = 0;
   let earlyRunMaxReductionDb = 0;
+  let coldOpenLiftCount = 0;
+  let coldOpenLiftMaxDb = 0;
   const bodyRunIndexes = runMeta
     .map((meta, index) => (meta.runClass === "body-speech" ? index : -1))
     .filter((index) => index >= 0);
-  if (bodyRunIndexes.length >= 5) {
+  if (bodyRunIndexes.length >= 3) {
     const earlyRunIndexes = bodyRunIndexes.slice(0, Math.min(3, bodyRunIndexes.length - 2));
     const earlySet = new Set(earlyRunIndexes);
     const laterAppliedBodies = bodyRunIndexes
       .filter((index) => !earlySet.has(index))
-      .map((index) => runMeta[index].meanDb + (plannedRunGainDb[index] ?? 0))
+      .map((index) => runMeta[index].loudnessMeanDb + (plannedRunGainDb[index] ?? 0))
       .filter(Number.isFinite)
       .sort((a, b) => a - b);
     const laterAnchorDb = laterAppliedBodies[Math.floor(laterAppliedBodies.length / 2)];
@@ -463,7 +603,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       const toleranceDb = 1.5;
       const triggerDb = 2.75;
       for (const index of earlyRunIndexes) {
-        const appliedBodyDb = runMeta[index].meanDb + (plannedRunGainDb[index] ?? 0);
+        const appliedBodyDb = runMeta[index].loudnessMeanDb + (plannedRunGainDb[index] ?? 0);
         const overLaterDb = appliedBodyDb - laterAnchorDb;
         if (overLaterDb < triggerDb) continue;
         const reductionDb = clamp(overLaterDb - toleranceDb, 0, 5);
@@ -471,6 +611,21 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
         plannedRunGainDb[index] -= reductionDb;
         earlyRunCapCount += 1;
         earlyRunMaxReductionDb = Math.max(earlyRunMaxReductionDb, reductionDb);
+      }
+      for (const index of earlyRunIndexes) {
+        const appliedBodyDb = runMeta[index].loudnessMeanDb + (plannedRunGainDb[index] ?? 0);
+        const underLaterDb = laterAnchorDb - appliedBodyDb;
+        if (underLaterDb <= coldOpenLiftToleranceDb) continue;
+        const maxAllowedByGain = maxGainDb - (plannedRunGainDb[index] ?? 0);
+        const liftDb = clamp(
+          underLaterDb - coldOpenLiftToleranceDb,
+          0,
+          Math.min(coldOpenLiftMaxAllowedDb, maxAllowedByGain),
+        );
+        if (liftDb <= 0) continue;
+        plannedRunGainDb[index] += liftDb;
+        coldOpenLiftCount += 1;
+        coldOpenLiftMaxDb = Math.max(coldOpenLiftMaxDb, liftDb);
       }
     }
   }
@@ -528,7 +683,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       }
       const winStart = Math.max(startFrame, i - Math.floor(slideFrames / 2));
       const winEnd = Math.min(endFrame, i + Math.ceil(slideFrames / 2));
-      const localDb = rmsDbOfSlice(input.frameDb, winStart, winEnd);
+      const localDb = rmsDbOfSlice(loudnessFrameDb, winStart, winEnd);
       const microGainDb = clamp(
         targetDb - (localDb + bodyGainDb),
         -runEffectiveMicroRideDb,
@@ -542,13 +697,20 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     // don't trample that run's release.
     const prevRunEnd = r > 0 ? runMeta[r - 1].endFrame : 0;
     const attackStart = Math.max(startFrame - attackFrames, prevRunEnd, 0);
-    const attackLen = startFrame - attackStart;
+    const attackLeadFrames = r === 0 ? Math.max(0, Math.round(COLD_OPEN_ATTACK_LEAD_MS / frameMs)) : 0;
+    const attackEnd = r === 0 ? Math.max(attackStart, startFrame - attackLeadFrames) : startFrame;
+    const attackLen = attackEnd - attackStart;
     const bodyGainAtStart = gainDbCurve[startFrame];
     for (let k = 0; k < attackLen; k += 1) {
       const t = (k + 1) / (attackLen + 1); // 0 → 1 as we approach run start
       const weight = Math.sin((t * Math.PI) / 2) ** 2; // cos² rising
       gainDbCurve[attackStart + k] =
         silenceGainDefaultDb + (bodyGainAtStart - silenceGainDefaultDb) * weight;
+    }
+    if (r === 0) {
+      for (let f = attackEnd; f < startFrame; f += 1) {
+        gainDbCurve[f] = bodyGainAtStart;
+      }
     }
 
     // Release ramp — lives in the silence AFTER the run, never inside it.
@@ -629,15 +791,15 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       if (
         runIdx >= 0 &&
         runMetaForFrame?.runClass === "body-speech" &&
-        speechSpikeTaming > 0.08
+        bodyRelativeSpeechSpikeTaming > 0.08
       ) {
         const bodyLevelDb = runMetaForFrame.meanDb + (plannedRunGainDb[runIdx] ?? currentGainDb);
         // TIGHTER thresholds. Previously allowed 14.8 dB peak / 4.8 dB RMS
         // above body, which let visible waveform spikes through entirely.
         // Pro VO crest factor is 8-10 dB; anything above ~10 dB peak / 3 dB
         // RMS reads as a "spike" to the listener and on the waveform.
-        const allowedRmsSpikeDb = 3.0 - speechSpikeTaming * 1.0; // 3.0 → 2.0 dB
-        const allowedPeakSpikeDb = 9.5 - speechSpikeTaming * 1.5; // 9.5 → 8.0 dB
+        const allowedRmsSpikeDb = 3.0 - bodyRelativeSpeechSpikeTaming * 1.0; // 3.0 → 2.0 dB
+        const allowedPeakSpikeDb = 9.5 - bodyRelativeSpeechSpikeTaming * 1.5; // 9.5 → 8.0 dB
         const appliedFrameDb = input.frameDb[f] + currentGainDb;
         const relativePeakCeilingDb = Math.min(peakCeilingDb, bodyLevelDb + allowedPeakSpikeDb);
         const rmsExcessDb = appliedFrameDb - (bodyLevelDb + allowedRmsSpikeDb);
@@ -653,7 +815,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
           // Lower contrast threshold so even modest local jumps qualify
           // as spikes worth taming. Previously 1.4 dB minimum kept many
           // audible peaks unprotected.
-          const localContrastThresholdDb = 0.8 + (1 - speechSpikeTaming) * 0.6;
+          const localContrastThresholdDb = 0.8 + (1 - bodyRelativeSpeechSpikeTaming) * 0.6;
           const isHotFrame = (idx: number) => {
             const gainDb = slewed[idx];
             return (
@@ -696,7 +858,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
             const bodySpikeReductionDb = clamp(
               Math.max(rmsExcessDb * 0.85, relativePeakExcessDb * 1.0),
               0,
-              5.5 + speechSpikeTaming * 6,
+              5.5 + bodyRelativeSpeechSpikeTaming * 6,
             );
             if (bodySpikeReductionDb > 0.05) {
               reductionDb = Math.max(reductionDb, bodySpikeReductionDb);
@@ -736,7 +898,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   //
   // Runs OUTSIDE the framePeakDb branch above so it fires whether or not
   // the caller supplied raw samples — the residual check only needs the
-  // planned gain and frameDb, both of which are always available.
+  // planned gain and loudness-domain frame body, both of which are always
+  // available.
   //
   // The high-crest sub-targeting plus the ±18 dB attenuation window
   // catches MOST loud vocalizations, but for an EXTREMELY loud source
@@ -760,7 +923,7 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
       const meta = runMeta[r];
       if (meta.runClass !== "body-speech") continue;
       const plannedGain = plannedRunGainDb[r] ?? 0;
-      const appliedBodyDb = meta.meanDb + plannedGain;
+      const appliedBodyDb = meta.loudnessMeanDb + plannedGain;
       const residualOverDb = appliedBodyDb - targetDb;
       if (residualOverDb < 3) continue;
       // Scale: residual 3 dB → ~0.7 dB cut, residual 10 dB → ~4.7 dB cut.
@@ -825,6 +988,8 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     sustainedLoudMaxReductionDb: sustainedClusterMaxReductionDbOut,
     earlyRunCapCount,
     earlyRunMaxReductionDb,
+    coldOpenLiftCount,
+    coldOpenLiftMaxDb,
   };
 };
 
