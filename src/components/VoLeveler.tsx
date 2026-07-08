@@ -3314,6 +3314,8 @@ const summarizeFailureReason = (error: unknown) => {
     candidateVariant?: "cinematic-stable" | "continuity-safe" | "pause-safe" | "source-safe";
     sourceSafeChain?: boolean;
     skipSpeechSegmentation?: boolean;
+    disableGainPlanner?: boolean;
+    disableHeadPriming?: boolean;
     forceEndingProtection?: boolean;
     /**
      * When true, the input the chain is about to process has already been
@@ -4377,6 +4379,8 @@ const summarizeFailureReason = (error: unknown) => {
   const shouldUseHeadPriming = (options: MixRenderOptions | undefined, expectedDurationSec: number | null) =>
     HEAD_PRIME_ENABLED &&
     !options?.minimalStabilityChain &&
+    !options?.sourceSafeChain &&
+    !options?.disableHeadPriming &&
     (expectedDurationSec === null || expectedDurationSec < GAIN_PLANNER_MAX_DURATION_SECONDS);
 
   const renderWithHeadPriming = async (
@@ -5993,6 +5997,8 @@ const summarizeFailureReason = (error: unknown) => {
         disableRoomCleanup: true,
         disableAdaptiveNoiseReduction: true,
         disableSegmentGainMatch: true,
+        disableGainPlanner: true,
+        disableHeadPriming: true,
         skipSpeechSegmentation: true,
         sourceSafeChain: true,
       },
@@ -6112,8 +6118,8 @@ const summarizeFailureReason = (error: unknown) => {
     // refresh because refresh wipes the virtual FS.
     const leveledInputName = plan ? (plannerContext?.leveledInputName ?? `${job.base}_planner_leveled.wav`) : null;
     let leveledReady = plannerContext?.leveledReady ?? false;
-    const ensureLeveledInput = async (): Promise<string | null> => {
-      if (!plan || !leveledInputName) return null;
+    const ensureLeveledInput = async (allowPlanner = true): Promise<string | null> => {
+      if (!allowPlanner || !plan || !leveledInputName) return null;
       if (leveledReady) {
         try {
           await ffmpeg.readFile(leveledInputName);
@@ -6221,7 +6227,7 @@ const summarizeFailureReason = (error: unknown) => {
           const runFixedSegmentation = async () => {
             setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
             setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
-            const leveled = await ensureLeveledInput();
+            const leveled = await ensureLeveledInput(!effectiveOptions.disableGainPlanner);
             await runMixReadySegmented(
               ffmpeg,
               job.inputName,
@@ -6248,7 +6254,7 @@ const summarizeFailureReason = (error: unknown) => {
           const runSpeechSegmentation = async (segments: RenderSegment[], segmentLite: boolean) => {
             setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
             setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
-            const leveled = await ensureLeveledInput();
+            const leveled = await ensureLeveledInput(!effectiveOptions.disableGainPlanner);
             speechAlignedSegmentCountUsed = await runMixReadySpeechAlignedSegmented(
               ffmpeg,
               job.inputName,
@@ -6385,7 +6391,7 @@ const summarizeFailureReason = (error: unknown) => {
 
         setStatus(`${stageLabel}: ${job.base} (${fileIndex + 1}/${totalFiles})`);
         setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
-        const leveledForSinglePass = await ensureLeveledInput();
+        const leveledForSinglePass = await ensureLeveledInput(!effectiveOptions.disableGainPlanner);
         await runMixReady(ffmpeg, job.inputName, outputName, profile, effectiveOptions, leveledForSinglePass);
         if (strategyDegradeReasons.includes("segment-render-memory-fault")) {
           strategyDegradeReasons.push("single-pass-recovery");
@@ -6426,7 +6432,7 @@ const summarizeFailureReason = (error: unknown) => {
             appendLog(
               `[MixFallback] ${job.base}: ${strategy.label} failed (${strategyFailureMessage}), trying segmented ${strategy.label}.`
             );
-            const leveledForSeg = await ensureLeveledInput();
+            const leveledForSeg = await ensureLeveledInput(!effectiveOptions.disableGainPlanner);
             await runMixReadySegmented(
               ffmpeg,
               job.inputName,
