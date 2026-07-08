@@ -1,3 +1,16 @@
+# End-Spiked-Down Tail Protection
+
+## Checklist
+
+- [x] Read requested `complexity-optimizer` and `oracle` skills, project rules, implementation plan, package scripts, and relevant memory.
+- [x] Run whole-codebase complexity scan with generated/vendor/audio folders excluded; inspect the planner/QC/render hot path manually.
+- [x] Measure the provided source/output WAVs and screenshots to confirm repeated near-silent output holes inside source-speech tails.
+- [x] Run first Oracle planning consult with GPT-5.5 Pro browser mode and reconcile its advice before production edits.
+- [x] Add focused gain-planner regression tests for soft spoken tails that fall just outside the detected speech run and close-gap next-run attack overwrite.
+- [x] Implement the smallest safe tail-protection fix without touching the audio splitter or enabling neural enhancement.
+- [x] Run second Oracle review consult after the patch and address its blocker finding.
+- [x] Run `npm run test:audio-qc`, `npm run lint`, and `npm run build`; record verification evidence.
+
 # VO Cinematic Voice Upgrade Review Fixes
 
 ## Priority Checklist

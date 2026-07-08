@@ -123,6 +123,12 @@ export type GainPlannerOutput = {
   coldOpenLiftCount: number;
   /** Largest cold-open lift in dB. Diagnostic. */
   coldOpenLiftMaxDb: number;
+  /** Count of body-speech runs whose soft post-run tail stayed at speech gain. */
+  tailRescueRunCount: number;
+  /** Total number of post-run frames held at speech gain for soft spoken tails. */
+  tailRescueFrameCount: number;
+  /** Longest soft-tail rescue in milliseconds. */
+  tailRescueMaxMs: number;
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -135,6 +141,15 @@ const COLD_OPEN_LIFT_TOLERANCE_DB = 1.5;
 const COLD_OPEN_LIFT_MAX_DB = 5;
 const COLD_OPEN_ONSET_BACKTRACK_MS = 60;
 const COLD_OPEN_ATTACK_LEAD_MS = 40;
+const SOFT_TAIL_RESCUE_MAX_MS = 500;
+const SOFT_TAIL_RESCUE_NOISY_MAX_MS = 240;
+const SOFT_TAIL_RESCUE_NOISY_RISK = 0.55;
+const SOFT_TAIL_RESCUE_MIN_ACTIVE_MS = 20;
+const SOFT_TAIL_RESCUE_BRIDGE_MS = 40;
+const SOFT_TAIL_RESCUE_NOISE_MARGIN_DB = 8;
+const SOFT_TAIL_RESCUE_SPEECH_MARGIN_DB = 10;
+const SOFT_TAIL_RESCUE_BODY_DROP_DB = 28;
+const SOFT_TAIL_RESCUE_HARD_NOISE_MARGIN_DB = 4;
 const K_WEIGHT_STAGE1_HIGH_SHELF_HZ = 1681.974450955533;
 const K_WEIGHT_STAGE1_GAIN_DB = 4;
 const K_WEIGHT_STAGE2_HIGH_PASS_HZ = 38.13547087602444;
@@ -656,6 +671,56 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
   // don't vanish abruptly.
   const attackFrames = Math.max(1, Math.round(80 / frameMs));
   const releaseFrames = Math.max(1, Math.round(500 / frameMs));
+  const softTailRescueMaxFrames = Math.max(
+    1,
+    Math.round(
+      (input.pauseNoiseRisk >= SOFT_TAIL_RESCUE_NOISY_RISK
+        ? SOFT_TAIL_RESCUE_NOISY_MAX_MS
+        : SOFT_TAIL_RESCUE_MAX_MS) / frameMs,
+    ),
+  );
+  const softTailRescueMinActiveFrames = Math.max(1, Math.round(SOFT_TAIL_RESCUE_MIN_ACTIVE_MS / frameMs));
+  const softTailRescueBridgeFrames = Math.max(0, Math.round(SOFT_TAIL_RESCUE_BRIDGE_MS / frameMs));
+  let tailRescueRunCount = 0;
+  let tailRescueFrameCount = 0;
+  let tailRescueMaxFrames = 0;
+  const protectedEndFrameByRun = new Array<number>(runMeta.length).fill(0);
+
+  const resolveSoftTailRescueEndFrame = (meta: RunEntry, nextRunStart: number) => {
+    if (meta.runClass !== "body-speech") return meta.endFrame;
+
+    const scanEnd = Math.min(nextRunStart, meta.endFrame + softTailRescueMaxFrames, frameCount);
+    const tailFloorDb = Math.max(
+      input.noiseFloorDb + SOFT_TAIL_RESCUE_NOISE_MARGIN_DB,
+      input.speechThresholdDb - SOFT_TAIL_RESCUE_SPEECH_MARGIN_DB,
+      meta.meanDb - SOFT_TAIL_RESCUE_BODY_DROP_DB,
+    );
+    const hardNoiseFloorDb = input.noiseFloorDb + SOFT_TAIL_RESCUE_HARD_NOISE_MARGIN_DB;
+
+    let rescueEndFrame = meta.endFrame;
+    let activeFrames = 0;
+    let quietBridgeFrames = 0;
+
+    for (let f = meta.endFrame; f < scanEnd; f += 1) {
+      const frameDb = input.frameDb[f] ?? -120;
+      if (frameDb >= tailFloorDb) {
+        activeFrames += 1;
+        quietBridgeFrames = 0;
+        rescueEndFrame = f + 1;
+        continue;
+      }
+
+      if (activeFrames > 0 && frameDb >= hardNoiseFloorDb && quietBridgeFrames < softTailRescueBridgeFrames) {
+        quietBridgeFrames += 1;
+        rescueEndFrame = f + 1;
+        continue;
+      }
+
+      break;
+    }
+
+    return activeFrames >= softTailRescueMinActiveFrames ? rescueEndFrame : meta.endFrame;
+  };
 
   for (let r = 0; r < runMeta.length; r += 1) {
     const { startFrame, endFrame, runClass, crestDb } = runMeta[r];
@@ -693,9 +758,11 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     }
 
     // Attack ramp — lives in the silence BEFORE the run, never inside it.
-    // We walk back from startFrame, bounded by the previous run's end so we
-    // don't trample that run's release.
-    const prevRunEnd = r > 0 ? runMeta[r - 1].endFrame : 0;
+    // We walk back from startFrame, bounded by the previous protected end so
+    // we don't trample that run's release or rescued tail.
+    const prevRunEnd = r > 0
+      ? Math.max(runMeta[r - 1].endFrame, protectedEndFrameByRun[r - 1] ?? runMeta[r - 1].endFrame)
+      : 0;
     const attackStart = Math.max(startFrame - attackFrames, prevRunEnd, 0);
     const attackLeadFrames = r === 0 ? Math.max(0, Math.round(COLD_OPEN_ATTACK_LEAD_MS / frameMs)) : 0;
     const attackEnd = r === 0 ? Math.max(attackStart, startFrame - attackLeadFrames) : startFrame;
@@ -716,13 +783,26 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     // Release ramp — lives in the silence AFTER the run, never inside it.
     // Bounded by the NEXT run's start so we don't overwrite its attack.
     const nextRunStart = r + 1 < runMeta.length ? runMeta[r + 1].startFrame : frameCount;
-    const releaseEnd = Math.min(endFrame + releaseFrames, nextRunStart);
-    const releaseLen = releaseEnd - endFrame;
     const bodyGainAtEnd = gainDbCurve[endFrame - 1];
+    const softTailEndFrame = resolveSoftTailRescueEndFrame(runMeta[r], nextRunStart);
+    protectedEndFrameByRun[r] = softTailEndFrame;
+    if (softTailEndFrame > endFrame) {
+      for (let f = endFrame; f < softTailEndFrame; f += 1) {
+        gainDbCurve[f] = bodyGainAtEnd;
+      }
+      const rescuedFrames = softTailEndFrame - endFrame;
+      tailRescueRunCount += 1;
+      tailRescueFrameCount += rescuedFrames;
+      tailRescueMaxFrames = Math.max(tailRescueMaxFrames, rescuedFrames);
+    }
+
+    const releaseStart = softTailEndFrame;
+    const releaseEnd = Math.min(endFrame + releaseFrames, nextRunStart);
+    const releaseLen = releaseEnd - releaseStart;
     for (let k = 0; k < releaseLen; k += 1) {
       const t = (k + 1) / (releaseLen + 1); // 0 just after run → 1 deep in silence
       const weight = Math.cos((t * Math.PI) / 2) ** 2; // cos² falling
-      gainDbCurve[endFrame + k] =
+      gainDbCurve[releaseStart + k] =
         silenceGainDefaultDb + (bodyGainAtEnd - silenceGainDefaultDb) * weight;
     }
   }
@@ -990,6 +1070,9 @@ export const planGainCurve = (input: GainPlannerInput): GainPlannerOutput => {
     earlyRunMaxReductionDb,
     coldOpenLiftCount,
     coldOpenLiftMaxDb,
+    tailRescueRunCount,
+    tailRescueFrameCount,
+    tailRescueMaxMs: tailRescueMaxFrames * frameMs,
   };
 };
 

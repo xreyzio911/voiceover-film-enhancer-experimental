@@ -1499,6 +1499,12 @@ const summarizeFailureReason = (error: unknown) => {
     coldOpenLiftCount: number;
     /** Largest cold-open lift applied in dB. */
     coldOpenLiftMaxDb: number;
+    /** Body-speech runs whose soft post-run tails stayed at speech gain. */
+    tailRescueRunCount: number;
+    /** Total post-run frames held at speech gain for soft spoken tails. */
+    tailRescueFrameCount: number;
+    /** Longest soft-tail rescue in milliseconds. */
+    tailRescueMaxMs: number;
     /** Effective intra-run micro-ride range in dB. Diagnostic. */
     microRideDb: number;
   };
@@ -1663,6 +1669,9 @@ const summarizeFailureReason = (error: unknown) => {
         earlyRunMaxReductionDb: plan.earlyRunMaxReductionDb,
         coldOpenLiftCount: plan.coldOpenLiftCount,
         coldOpenLiftMaxDb: plan.coldOpenLiftMaxDb,
+        tailRescueRunCount: plan.tailRescueRunCount,
+        tailRescueFrameCount: plan.tailRescueFrameCount,
+        tailRescueMaxMs: plan.tailRescueMaxMs,
         microRideDb: plan.microRideDb,
       };
     } finally {
@@ -5694,12 +5703,16 @@ const summarizeFailureReason = (error: unknown) => {
       plan.coldOpenLiftCount > 0
         ? `, ${plan.coldOpenLiftCount} quiet opener${plan.coldOpenLiftCount === 1 ? "" : "s"} lifted (max ${plan.coldOpenLiftMaxDb.toFixed(1)} dB)`
         : "";
+    const tailRescueNote =
+      plan.tailRescueRunCount > 0
+        ? `, ${plan.tailRescueRunCount} soft tail${plan.tailRescueRunCount === 1 ? "" : "s"} held (${plan.tailRescueFrameCount} frames, max ${plan.tailRescueMaxMs.toFixed(0)} ms)`
+        : "";
     appendLog(
       `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(
         1,
       )} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride +/-${plan.microRideDb.toFixed(
         2,
-      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}).`,
+      )} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
     );
 
     context.plan = plan;
@@ -5934,8 +5947,12 @@ const summarizeFailureReason = (error: unknown) => {
             plan.coldOpenLiftCount > 0
               ? `, ${plan.coldOpenLiftCount} quiet opener${plan.coldOpenLiftCount === 1 ? "" : "s"} lifted (max ${plan.coldOpenLiftMaxDb.toFixed(1)} dB)`
               : "";
+          const tailRescueNote =
+            plan.tailRescueRunCount > 0
+              ? `, ${plan.tailRescueRunCount} soft tail${plan.tailRescueRunCount === 1 ? "" : "s"} held (${plan.tailRescueFrameCount} frames, max ${plan.tailRescueMaxMs.toFixed(0)} ms)`
+              : "";
           appendLog(
-            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}).`,
+            `[Planner] ${job.base}: leveled ${plan.speechRunCount} speech runs to ${plan.targetDb.toFixed(1)} dB (expander ${plan.expanderDepthDb.toFixed(1)} dB, micro-ride \u00b1${plan.microRideDb.toFixed(2)} dB${breathNote}${speechSpikeNote}${sustainedLoudNote}${earlyRunCapNote}${coldOpenLiftNote}${tailRescueNote}).`,
           );
         } else {
           appendLog(`[Planner] ${job.base}: bypassed (no-op \u2014 short or silent input).`);

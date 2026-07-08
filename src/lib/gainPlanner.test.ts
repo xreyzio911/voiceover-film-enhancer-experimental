@@ -1157,6 +1157,78 @@ describe("ramp placement", () => {
       `deep silence gain ${deepSilenceGainDb.toFixed(2)} dB should be below -9 dB (full expander)`,
     );
   });
+
+  it("protects soft spoken tails that fall just outside the detected speech run", () => {
+    const frameDb = new Array<number>(260).fill(-78);
+    for (let frame = 50; frame < 170; frame += 1) frameDb[frame] = -30;
+    for (let frame = 170; frame < 205; frame += 1) frameDb[frame] = -57;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 50, endFrame: 170 }],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.2,
+    });
+
+    const bodyGainDb = gainDbAtFrame(plan.gainCurve, 120);
+    const softTailGainDb = gainDbAtFrame(plan.gainCurve, 200);
+    const deepSilenceGainDb = gainDbAtFrame(plan.gainCurve, 235);
+
+    assert.equal(plan.tailRescueRunCount, 1);
+    assert.equal(plan.tailRescueFrameCount, 35);
+    assert.equal(plan.tailRescueMaxMs, 350);
+    assert.ok(
+      bodyGainDb - softTailGainDb < 4,
+      `soft spoken tail should stay near body gain, got body ${bodyGainDb.toFixed(2)} dB vs tail ${softTailGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      deepSilenceGainDb <= -9,
+      `real post-tail silence should still return to expander floor, got ${deepSilenceGainDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("does not let the next run attack ramp overwrite a rescued soft tail", () => {
+    const frameDb = new Array<number>(280).fill(-78);
+    for (let frame = 50; frame < 170; frame += 1) frameDb[frame] = -30;
+    for (let frame = 170; frame < 195; frame += 1) frameDb[frame] = -57;
+    for (let frame = 195; frame < 245; frame += 1) frameDb[frame] = -30;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [
+        { startFrame: 50, endFrame: 170 },
+        { startFrame: 195, endFrame: 245 },
+      ],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.2,
+    });
+
+    const firstBodyGainDb = gainDbAtFrame(plan.gainCurve, 120);
+    const softTailNearNextRunGainDb = gainDbAtFrame(plan.gainCurve, 193);
+    const secondBodyGainDb = gainDbAtFrame(plan.gainCurve, 220);
+
+    assert.equal(plan.tailRescueRunCount, 1);
+    assert.equal(plan.tailRescueFrameCount, 25);
+    assert.equal(plan.tailRescueMaxMs, 250);
+    assert.ok(
+      firstBodyGainDb - softTailNearNextRunGainDb < 4,
+      `next run attack should not repaint rescued tail, got first body ${firstBodyGainDb.toFixed(2)} dB vs near-next tail ${softTailNearNextRunGainDb.toFixed(2)} dB`,
+    );
+    assert.ok(
+      Math.abs(secondBodyGainDb - firstBodyGainDb) < 1,
+      `second speech run should still reach body gain, got first ${firstBodyGainDb.toFixed(2)} dB vs second ${secondBodyGainDb.toFixed(2)} dB`,
+    );
+  });
 });
 
 describe("trimmed-mean target", () => {
