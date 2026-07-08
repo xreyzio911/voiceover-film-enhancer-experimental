@@ -62,6 +62,20 @@ test("buildSpeechMask keeps soft endings active and bridges short gaps", () => {
   assert.equal(mask.slice(0, 50).some(Boolean), false);
 });
 
+test("buildSpeechMask holds quiet trailing speech below close threshold for at least 150 ms", () => {
+  const tailStart = 160;
+  const frameDb = [
+    ...new Array(60).fill(-82),
+    ...new Array(100).fill(-28),
+    ...new Array(20).fill(-65),
+    ...new Array(20).fill(-82),
+  ];
+
+  const mask = buildSpeechMask(frameDb, -82, { frameMs: FRAME_MS });
+
+  assert.equal(mask.slice(tailStart, tailStart + 15).every(Boolean), true);
+});
+
 test("protected steady endings avoid fade and pause-noise flags", () => {
   const protectedTail = analyzeSections([
     { frames: 120, fromDb: -75 },

@@ -6,7 +6,9 @@ import {
   applyGainCurveToSamples,
   emitSendcmdScript,
   planGainCurve,
+  resolvePlannerCalibration,
   speechRunsFromMask,
+  tameRenderedConsonantPeaks,
 } from "./gainPlanner.ts";
 import { computeLogBandSpectrumDb, computeSibilanceScore } from "./spectrum.ts";
 import { decodeWav, encodeWavFloat32 } from "./webAudioRender.ts";
@@ -85,6 +87,23 @@ const makeTone = (frequencyHz: number, gain: number, seconds = 2) => {
 };
 
 describe("gainPlanner", () => {
+  it("caps hot adaptive noise floors against the decoded planner envelope", () => {
+    const frameDb = new Array<number>(1000).fill(-120);
+    for (let frame = 100; frame < 220; frame += 1) frameDb[frame] = -29;
+    for (let frame = 220; frame < 240; frame += 1) frameDb[frame] = -52;
+    for (let frame = 620; frame < 760; frame += 1) frameDb[frame] = -31;
+
+    const calibration = resolvePlannerCalibration(frameDb, -32.9, -26);
+    const hotMaskRuns = speechRunsFromMask(buildSpeechMask(frameDb, -32.9, { frameMs: FRAME_MS }));
+    const plannerMaskRuns = speechRunsFromMask(buildSpeechMask(frameDb, calibration.noiseFloorDb, { frameMs: FRAME_MS }));
+
+    assert.ok(calibration.noiseFloorDb <= -85, `planner floor should be capped low, got ${calibration.noiseFloorDb.toFixed(1)} dB`);
+    assert.equal(calibration.speechThresholdDb, -58);
+    assert.equal(hotMaskRuns.length, 0, "fixture should prove hot profile floor loses the quiet speech");
+    assert.equal(plannerMaskRuns.length, 2);
+    assert.ok(plannerMaskRuns[0].endFrame >= 240, "quiet tail should stay in the first planner run");
+  });
+
   it("uses K-weighted frame energy to align boomy and bright voices with equal perceived loudness", () => {
     const lowUnit = makeTone(100, 1);
     const highUnit = makeTone(3000, 1);
@@ -208,7 +227,7 @@ describe("gainPlanner", () => {
     );
   });
 
-  it("keeps residual loud-run correction in the K-weighted loudness domain", () => {
+  it("uses raw run mean for residual loud-run correction after K-weighted targeting", () => {
     const frameDb = new Array<number>(180).fill(-78);
     const loudnessFrameDb = new Array<number>(180).fill(-78);
     const run = { startFrame: 20, endFrame: 150 };
@@ -233,8 +252,93 @@ describe("gainPlanner", () => {
 
     const bodyGainDb = gainDbAtFrame(plan.gainCurve, 70);
 
-    assert.equal(plan.sustainedLoudClusterCount, 0);
-    assert.ok(Math.abs(bodyGainDb) < 0.35, `K-weighted target is already met; residual pass should not cut ${bodyGainDb.toFixed(2)} dB`);
+    assert.equal(plan.sustainedLoudClusterCount, 1);
+    assert.ok(bodyGainDb < -1, `raw-hot body should receive a residual cut, got ${bodyGainDb.toFixed(2)} dB`);
+  });
+
+  it("adds a bounded floor lift when high-crest body speech is raw-quiet and perceptually under target", () => {
+    const frameDb = new Array<number>(180).fill(-78);
+    const loudnessFrameDb = new Array<number>(180).fill(-78);
+    const samples = new Float32Array(frameDb.length * FRAME_SAMPLES);
+    const run = { startFrame: 20, endFrame: 150 };
+
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+      frameDb[frame] = -27;
+      loudnessFrameDb[frame] = -24;
+      const start = frame * FRAME_SAMPLES;
+      for (let sample = 0; sample < FRAME_SAMPLES; sample += 1) {
+        const sampleIndex = start + sample;
+        samples[sampleIndex] = Math.sin((2 * Math.PI * 240 * sampleIndex) / SAMPLE_RATE) * dbToLin(-27) * Math.SQRT2;
+      }
+      samples[start + 4] = dbToLin(-5);
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      loudnessFrameDb,
+      speechRuns: [run],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      samples,
+      sampleRate: SAMPLE_RATE,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      peakCeilingDb: -3,
+      instabilityHint: 0.7,
+      speechSpikeTaming: 0.85,
+    });
+
+    assert.equal(plan.runs[0].runClass, "body-speech");
+    assert.ok(plan.runs[0].plannedGainDb > 0, `quiet high-crest body should not be left below source level, got ${plan.runs[0].plannedGainDb.toFixed(2)} dB`);
+    assert.ok(
+      plan.runs[0].meanDb + plan.runs[0].plannedGainDb > -27,
+      `raw body should receive a small floor lift, got ${(plan.runs[0].meanDb + plan.runs[0].plannedGainDb).toFixed(2)} dB`,
+    );
+  });
+
+  it("keeps spike taming from crushing an entire body-speech run", () => {
+    const frameDb = new Array<number>(220).fill(-78);
+    const samples = new Float32Array(frameDb.length * FRAME_SAMPLES);
+    const run = { startFrame: 30, endFrame: 190 };
+
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+      frameDb[frame] = -22;
+      const start = frame * FRAME_SAMPLES;
+      for (let sample = 0; sample < FRAME_SAMPLES; sample += 1) {
+        const sampleIndex = start + sample;
+        samples[sampleIndex] = Math.sin((2 * Math.PI * 260 * sampleIndex) / SAMPLE_RATE) * dbToLin(-22) * Math.SQRT2;
+      }
+      if ((frame - run.startFrame) % 3 === 0) {
+        samples[start + 6] = dbToLin(-1);
+      }
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [run],
+      noiseFloorDb: -78,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      samples,
+      sampleRate: SAMPLE_RATE,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      peakCeilingDb: -3,
+      instabilityHint: 1,
+      speechSpikeTaming: 1,
+    });
+    const leveled = applyGainCurveToSamples(samples, plan.gainCurve, SAMPLE_RATE, 1, FRAME_MS);
+    const sourceDb = measureRmsDb(samples, run.startFrame * FRAME_SAMPLES, run.endFrame * FRAME_SAMPLES);
+    const leveledDb = measureRmsDb(leveled, run.startFrame * FRAME_SAMPLES, run.endFrame * FRAME_SAMPLES);
+
+    assert.ok(plan.runs[0].peakReducedDb < 0, "fixture should engage the spike guard");
+    assert.ok(
+      leveledDb >= sourceDb - 10.2,
+      `spike guard should not crush the run body: source ${sourceDb.toFixed(2)} dB, leveled ${leveledDb.toFixed(2)} dB`,
+    );
   });
 
   it("honors the speech-spike floor even when the caller passes zero", () => {
@@ -947,6 +1051,66 @@ describe("body-spike guard (within-sentence syllable peaks)", () => {
   });
 });
 
+describe("full-rate rendered consonant peak tamer", () => {
+  it("tames narrow full-rate consonant peaks without changing the surrounding voice body", () => {
+    const sampleRate = 48000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 220;
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+
+    for (let i = 0; i < samples.length; i += 1) {
+      samples[i] = Math.sin((2 * Math.PI * 260 * i) / sampleRate) * dbToLin(-28) * Math.SQRT2;
+    }
+    const spikeIndex = 110 * samplesPerFrame + 80;
+    samples[spikeIndex] = dbToLin(-3.5);
+
+    const bodyStart = 40 * samplesPerFrame;
+    const bodyEnd = 90 * samplesPerFrame;
+    const bodyBeforeDb = measureRmsDb(samples, bodyStart, bodyEnd);
+    const result = tameRenderedConsonantPeaks(samples, sampleRate, frameMs);
+    const bodyAfterDb = measureRmsDb(result.samples, bodyStart, bodyEnd);
+    let peakBefore = 0;
+    let peakAfter = 0;
+    for (let index = 109 * samplesPerFrame; index < 112 * samplesPerFrame; index += 1) {
+      peakBefore = Math.max(peakBefore, Math.abs(samples[index]));
+      peakAfter = Math.max(peakAfter, Math.abs(result.samples[index]));
+    }
+
+    assert.ok(result.stats.tamedFrameCount >= 1, "full-rate tamer should catch the isolated consonant spike");
+    assert.ok(
+      20 * Math.log10(peakAfter) <= -8,
+      `consonant peak should be pulled below -8 dBFS, got ${(20 * Math.log10(peakAfter)).toFixed(2)} dB`,
+    );
+    assert.ok(
+      20 * Math.log10(peakBefore) - 20 * Math.log10(peakAfter) >= 4,
+      "peak should receive a visible local reduction",
+    );
+    assert.ok(
+      Math.abs(bodyAfterDb - bodyBeforeDb) < 0.05,
+      `surrounding actor body must not move: before ${bodyBeforeDb.toFixed(2)} dB after ${bodyAfterDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("leaves normal loud voice emphasis alone when peak-over-body is natural", () => {
+    const sampleRate = 48000;
+    const frameMs = 10;
+    const samplesPerFrame = (sampleRate * frameMs) / 1000;
+    const totalFrames = 180;
+    const samples = new Float32Array(totalFrames * samplesPerFrame);
+
+    for (let i = 0; i < samples.length; i += 1) {
+      samples[i] = Math.sin((2 * Math.PI * 300 * i) / sampleRate) * dbToLin(-18) * Math.SQRT2;
+    }
+    samples[90 * samplesPerFrame + 40] = dbToLin(-8.5);
+
+    const result = tameRenderedConsonantPeaks(samples, sampleRate, frameMs);
+
+    assert.equal(result.stats.tamedFrameCount, 0);
+    assert.deepEqual(result.samples, samples);
+  });
+});
+
 describe("localized peak guard", () => {
   it("dips only around the plosive frame, not the whole sentence body", () => {
     const sampleRate = 48000;
@@ -1177,7 +1341,7 @@ describe("ramp placement", () => {
 
     const bodyGainDb = gainDbAtFrame(plan.gainCurve, 120);
     const softTailGainDb = gainDbAtFrame(plan.gainCurve, 200);
-    const deepSilenceGainDb = gainDbAtFrame(plan.gainCurve, 235);
+    const deepSilenceGainDb = gainDbAtFrame(plan.gainCurve, 258);
 
     assert.equal(plan.tailRescueRunCount, 1);
     assert.equal(plan.tailRescueFrameCount, 35);
@@ -1186,10 +1350,40 @@ describe("ramp placement", () => {
       bodyGainDb - softTailGainDb < 4,
       `soft spoken tail should stay near body gain, got body ${bodyGainDb.toFixed(2)} dB vs tail ${softTailGainDb.toFixed(2)} dB`,
     );
+    const postTailReleaseGainDb = gainDbAtFrame(plan.gainCurve, 230);
+    assert.ok(
+      postTailReleaseGainDb > -8,
+      `release should continue after rescued tail, got ${postTailReleaseGainDb.toFixed(2)} dB at 250 ms post-tail`,
+    );
     assert.ok(
       deepSilenceGainDb <= -9,
       `real post-tail silence should still return to expander floor, got ${deepSilenceGainDb.toFixed(2)} dB`,
     );
+  });
+
+  it("rescues very quiet real-world tails after a normal dialogue body", () => {
+    const frameDb = new Array<number>(260).fill(-82);
+    for (let frame = 40; frame < 140; frame += 1) frameDb[frame] = -28;
+    for (let frame = 140; frame < 160; frame += 1) frameDb[frame] = -52;
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [{ startFrame: 40, endFrame: 140 }],
+      noiseFloorDb: -82,
+      speechThresholdDb: -55,
+      pauseNoiseRisk: 0.2,
+      frameMs: FRAME_MS,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      instabilityHint: 0.2,
+    });
+
+    const bodyGainDb = gainDbAtFrame(plan.gainCurve, 100);
+    const tailGains = Array.from({ length: 20 }, (_, index) => gainDbAtFrame(plan.gainCurve, 140 + index));
+    const worstTailDipDb = bodyGainDb - Math.min(...tailGains);
+
+    assert.equal(plan.tailRescueRunCount, 1);
+    assert.ok(worstTailDipDb < 1, `quiet tail should hold body gain; worst dip ${worstTailDipDb.toFixed(2)} dB`);
   });
 
   it("does not let the next run attack ramp overwrite a rescued soft tail", () => {
@@ -1227,6 +1421,53 @@ describe("ramp placement", () => {
     assert.ok(
       Math.abs(secondBodyGainDb - firstBodyGainDb) < 1,
       `second speech run should still reach body gain, got first ${firstBodyGainDb.toFixed(2)} dB vs second ${secondBodyGainDb.toFixed(2)} dB`,
+    );
+  });
+
+  it("does not run the body-relative spike guard over the final 150 ms of a speech run", () => {
+    const totalFrames = 180;
+    const run = { startFrame: 20, endFrame: 150 };
+    const tailStart = run.endFrame - 15;
+    const frameDb = new Array<number>(totalFrames).fill(-82);
+    const samples = new Float32Array(totalFrames * FRAME_SAMPLES);
+
+    for (let frame = run.startFrame; frame < run.endFrame; frame += 1) {
+      const rmsDb = frame >= tailStart ? -20 : -24;
+      frameDb[frame] = rmsDb;
+      const amp = dbToLin(rmsDb) * Math.SQRT2;
+      const start = frame * FRAME_SAMPLES;
+      for (let sample = 0; sample < FRAME_SAMPLES; sample += 1) {
+        const sampleIndex = start + sample;
+        samples[sampleIndex] = Math.sin((2 * Math.PI * 320 * sampleIndex) / SAMPLE_RATE) * amp;
+      }
+    }
+
+    const plan = planGainCurve({
+      frameDb,
+      speechRuns: [run],
+      noiseFloorDb: -82,
+      speechThresholdDb: -58,
+      pauseNoiseRisk: 0.05,
+      frameMs: FRAME_MS,
+      samples,
+      sampleRate: SAMPLE_RATE,
+      targetDb: -22,
+      sourceTargetBlend: 0,
+      peakCeilingDb: -3,
+      instabilityHint: 0,
+      speechSpikeTaming: 1,
+    });
+
+    const bodyGainDb = gainDbAtFrame(plan.gainCurve, 80);
+    const edgeGains = Array.from(
+      { length: 15 },
+      (_, index) => gainDbAtFrame(plan.gainCurve, tailStart + index),
+    );
+    const worstTailDipDb = bodyGainDb - Math.min(...edgeGains);
+
+    assert.ok(
+      worstTailDipDb < 1,
+      `run-edge spike guard should stand down at the tail; worst dip ${worstTailDipDb.toFixed(2)} dB`,
     );
   });
 });

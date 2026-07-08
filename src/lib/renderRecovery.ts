@@ -70,6 +70,13 @@ export type QcUnavailableFallbackSelection<TVariant extends string = string> = {
   reason: string;
 };
 
+export type RenderFallbackStrategyLike = {
+  label: string;
+};
+
+export const PLANNER_TAIL_SAFE_STRATEGY_LABEL = "planner-tail-safe single-pass";
+export const AUDIBILITY_SAFE_STRATEGY_LABEL = "audibility-safe single-pass";
+
 type RenderRiskInput = {
   durationSeconds: number;
   longSparseMode: boolean;
@@ -141,6 +148,18 @@ const fallbackRenderPathPriority = (meta: CandidateRenderMeta) => {
   if (meta.renderPath === "speech-pause-segmented" || meta.renderPath === "speech-aligned-segmented") return 1;
   if (meta.renderPath === "single-pass") return 2;
   return 3;
+};
+
+export const resolveNextAudibilityFallbackIndex = (
+  strategies: RenderFallbackStrategyLike[],
+  currentIndex: number,
+) => {
+  if (currentIndex < 0 || currentIndex >= strategies.length - 1) return null;
+  const plannerTailSafeIndex = strategies.findIndex((item) => item.label === PLANNER_TAIL_SAFE_STRATEGY_LABEL);
+  if (plannerTailSafeIndex > currentIndex) return plannerTailSafeIndex;
+  const audibilitySafeIndex = strategies.findIndex((item) => item.label === AUDIBILITY_SAFE_STRATEGY_LABEL);
+  if (audibilitySafeIndex > currentIndex) return audibilitySafeIndex;
+  return currentIndex + 1;
 };
 
 const compareQcUnavailableFallbackCandidates = <TVariant extends string>(

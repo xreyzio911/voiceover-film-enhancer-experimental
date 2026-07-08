@@ -302,6 +302,7 @@ test("scoreCandidateWithLearnedWeights does not hard-gate inherited ending risk"
   const sourceWithWeakEndings = toReviewMetricSnapshot({
     inputTP: -2.4,
     endFadeRiskScore: 0.74,
+    endEdgeDipDb: 68.2,
     overallRisk: 0.24,
     instabilityScore: 0.16,
     sentenceJumpScore: 0.12,
@@ -323,6 +324,7 @@ test("scoreCandidateWithLearnedWeights does not hard-gate inherited ending risk"
     clickScore: 0.06,
     echoScore: 0.08,
     endFadeRiskScore: 0.77,
+    endEdgeDipDb: 66.0,
     sibilanceScore: 0.09,
     pauseNoiseFloorDb: -72,
     noiseContrastDb: 28,
@@ -336,6 +338,7 @@ test("scoreCandidateWithLearnedWeights does not hard-gate inherited ending risk"
   });
 
   assert.ok(!ranking.gateReasons.includes("ending-damage"));
+  assert.ok(!ranking.gateReasons.includes("end-edge-dip"));
 });
 
 test("shouldAttemptCorrectivePassForAssessment uses fail, high-value WARN, multi-WARN, and gate triggers", () => {
@@ -616,6 +619,33 @@ test("autoReviewBundle fails and triggers correction on a severe rendered end-ed
   assert.equal(auto.finalVerdict, "fail");
   assert.ok(auto.issueTags.includes("endings_damaged"));
   assert.equal(shouldAttemptCorrectivePassForAssessment(auto.selectedAssessment), true);
+});
+
+test("autoReviewBundle treats improved inherited end-edge dip as pass", () => {
+  const manifest = buildManifest("bundle-end-edge-inherited");
+  const winner = manifest.candidates.find((candidate) => candidate.role === "winner");
+  assert.ok(winner);
+  if (!winner) throw new Error("Missing winner candidate.");
+
+  manifest.source.qc = toReviewMetricSnapshot({
+    ...manifest.source.qc,
+    endFadeRiskScore: 0.1,
+    endEdgeDipDb: 68.2,
+  });
+  winner.qc = toReviewMetricSnapshot({
+    ...winner.qc,
+    endFadeRiskScore: 0.1,
+    endEdgeDipDb: 66.0,
+    instabilityScore: 0.18,
+    sentenceJumpScore: 0.12,
+  });
+  winner.sourceComparison.qcDelta = buildReviewMetricDelta(manifest.source.qc, winner.qc);
+
+  const auto = autoReviewBundle(manifest);
+  const endEdgeCheck = auto.selectedAssessment.findings.find((finding) => finding.id === "end-edge-dip");
+
+  assert.equal(endEdgeCheck?.status, "pass");
+  assert.ok(!auto.issueTags.includes("endings_damaged"));
 });
 
 test("autoReviewBundle fails when rendered cold-open dip is severe and newly worse", () => {

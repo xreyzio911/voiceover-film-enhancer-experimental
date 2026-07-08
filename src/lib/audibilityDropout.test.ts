@@ -49,6 +49,24 @@ test("does not flag real pauses or normal mastering gain differences", () => {
   assert.equal(report.clusterCount, 0);
 });
 
+test("does not flag a uniform rendered level shift without local collapse", () => {
+  const sourceFrameDb = makeFrames(260, -90);
+  const renderedFrameDb = makeFrames(260, -92);
+  for (let frame = 30; frame < 220; frame += 1) {
+    sourceFrameDb[frame] = -39;
+    renderedFrameDb[frame] = -63;
+  }
+
+  const report = detectAudibilityDropouts({
+    sourceFrameDb,
+    renderedFrameDb,
+    frameMs: 20,
+  });
+
+  assert.equal(report.severe, false);
+  assert.equal(report.clusterCount, 0);
+});
+
 test("does not flag repeated real source pauses rendered as silence", () => {
   const sourceFrameDb = makeFrames(700, -92);
   const renderedFrameDb = makeFrames(700, -120);
@@ -115,6 +133,28 @@ test("aggregates repeated sub-sentence dropouts into a severe render failure", (
   assert.ok(report.badSeconds >= 0.6, `expected repeated dropouts to accumulate, got ${report.badSeconds}s`);
 });
 
+test("keeps a single 200 ms collapsed phrase fragment severe", () => {
+  const sourceFrameDb = makeFrames(7000, -92);
+  const renderedFrameDb = makeFrames(7000, -94);
+  for (let frame = 5600; frame < 6050; frame += 1) {
+    sourceFrameDb[frame] = -31;
+    renderedFrameDb[frame] = -24;
+  }
+  for (let frame = 5957; frame < 5967; frame += 1) {
+    renderedFrameDb[frame] = -68;
+  }
+
+  const report = detectAudibilityDropouts({
+    sourceFrameDb,
+    renderedFrameDb,
+    frameMs: 20,
+  });
+
+  assert.equal(report.severe, true);
+  assert.equal(report.clusterCount, 1);
+  assert.equal(report.badSeconds, 0.2);
+});
+
 test("detects rendered files truncated before active source speech ends", () => {
   const sourceFrameDb = makeFrames(200, -90);
   const renderedFrameDb = makeFrames(188, -84);
@@ -153,6 +193,28 @@ test("detects continuous soft speech that collapses below audibility", () => {
   assert.equal(report.severe, true);
   assert.equal(report.clusterCount, 1);
   assert.ok(report.badSeconds >= 0.8, `expected collapsed soft speech to trip, got ${report.badSeconds}s`);
+});
+
+test("detects end-edge gradual dips that erase the last phoneme", () => {
+  const sourceFrameDb = makeFrames(260, -90);
+  const renderedFrameDb = makeFrames(260, -92);
+  for (let frame = 40; frame < 180; frame += 1) {
+    sourceFrameDb[frame] = -30;
+    renderedFrameDb[frame] = -30;
+  }
+  for (let frame = 150; frame < 180; frame += 1) {
+    const progress = (frame - 150) / 29;
+    renderedFrameDb[frame] = -30 + (-65 + 30) * progress;
+  }
+
+  const report = detectAudibilityDropouts({
+    sourceFrameDb,
+    renderedFrameDb,
+    frameMs: 20,
+  });
+
+  assert.equal(report.severe, true);
+  assert.equal(report.clusterCount, 1);
 });
 
 test("detects all-soft speech when the adaptive threshold would otherwise rise too high", () => {

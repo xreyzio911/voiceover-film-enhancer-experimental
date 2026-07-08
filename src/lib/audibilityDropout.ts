@@ -32,6 +32,7 @@ export type AudibilityDropoutInput = {
 };
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const LOCAL_SPEECH_CONTEXT_MS = 200;
 
 const median = (values: number[]) => {
   const finite = values.filter(Number.isFinite).sort((a, b) => a - b);
@@ -161,6 +162,7 @@ export const detectAudibilityDropouts = (input: AudibilityDropoutInput): Audibil
   }
   const sourceSpeechThresholdDb = estimateSourceSpeechThresholdDb(sourceFrameDb);
   const speechLikeThresholdDb = Math.min(sourceSpeechThresholdDb, -50);
+  const localWindowFrames = Math.max(1, Math.round(LOCAL_SPEECH_CONTEXT_MS / frameMs));
   const clusteredSpeechMask = bridgeMaskGaps(
     sourceFrameDb.map((db) => db >= speechLikeThresholdDb),
     Math.max(0, Math.round(120 / frameMs)),
@@ -175,8 +177,11 @@ export const detectAudibilityDropouts = (input: AudibilityDropoutInput): Audibil
     const dropDb = renderedDb - sourceDb;
     const collapsedToSilence = renderedDb <= -68 && sourceDb >= -50;
     const severeRelativeDrop = dropDb <= -24 && renderedDb <= -58;
+    const localRenderedMedianDb = median(renderedFrameDb.slice(Math.max(0, frame - localWindowFrames), frame + 1));
+    const collapsedVsLocal = renderedDb <= localRenderedMedianDb - 18;
     const strongSpeechMissing = sourceDb >= -38 && renderedDb <= -54;
-    bad[frame] = clusteredSpeechMask[frame] && (collapsedToSilence || severeRelativeDrop || strongSpeechMissing);
+    bad[frame] =
+      clusteredSpeechMask[frame] && (collapsedToSilence || (severeRelativeDrop && collapsedVsLocal) || strongSpeechMissing);
   }
 
   const minClusterFrames = Math.max(1, Math.round((input.minClusterMs ?? 80) / frameMs));

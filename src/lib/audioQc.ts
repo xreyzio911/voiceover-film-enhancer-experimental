@@ -10,6 +10,8 @@ const COLD_OPEN_RISK_FLOOR_DB = 1.0;
 const COLD_OPEN_RISK_SPAN_DB = 4.0;
 const END_EDGE_TAIL_MS = 150;
 const END_EDGE_BODY_MS = 450;
+const SOFT_TAIL_HOLD_MS = 180;
+const SOFT_TAIL_FLOOR_MARGIN_DB = 14;
 
 export type AudioQcMetrics = {
   peakDb: number | null;
@@ -192,6 +194,10 @@ export const buildSpeechMask = (
     1,
     Math.round((options?.minSpeechHoldMs ?? 140) / frameMs)
   );
+  const softTailHoldFrames = Math.max(
+    minSpeechHoldFrames,
+    Math.round(SOFT_TAIL_HOLD_MS / frameMs)
+  );
   const openConfirmFrames = Math.max(
     1,
     Math.round((options?.openConfirmMs ?? 35) / frameMs)
@@ -209,6 +215,7 @@ export const buildSpeechMask = (
   const mask = new Array<boolean>(smoothed.length).fill(false);
   let active = false;
   let holdFrames = 0;
+  let softTailDecayActive = false;
 
   for (let index = 0; index < smoothed.length; index += 1) {
     const db = smoothed[index];
@@ -233,16 +240,30 @@ export const buildSpeechMask = (
 
     if (db >= openThresholdDb) {
       holdFrames = minSpeechHoldFrames;
+      softTailDecayActive = false;
     } else if (db >= closeThresholdDb) {
       holdFrames = Math.max(holdFrames, Math.ceil(minSpeechHoldFrames * 0.45));
+      softTailDecayActive = false;
     } else {
-      const closeGapDb = closeThresholdDb - db;
-      holdFrames -= closeGapDb >= 8 ? 3 : closeGapDb >= 4 ? 2 : 1;
+      const softTailFloorDb = noiseFloorDb + SOFT_TAIL_FLOOR_MARGIN_DB;
+      const rawDb = frameDb[index] ?? db;
+      if (db >= softTailFloorDb && rawDb >= softTailFloorDb) {
+        if (!softTailDecayActive) {
+          holdFrames = Math.max(holdFrames, softTailHoldFrames);
+          softTailDecayActive = true;
+        }
+        holdFrames -= 1;
+      } else {
+        softTailDecayActive = false;
+        const closeGapDb = closeThresholdDb - db;
+        holdFrames -= closeGapDb >= 8 ? 3 : closeGapDb >= 4 ? 2 : 1;
+      }
     }
 
     if (holdFrames < 0) {
       active = false;
       holdFrames = 0;
+      softTailDecayActive = false;
       continue;
     }
 

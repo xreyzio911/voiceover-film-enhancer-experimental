@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  AUDIBILITY_SAFE_STRATEGY_LABEL,
+  PLANNER_TAIL_SAFE_STRATEGY_LABEL,
   buildRenderRiskProfile,
   compareCandidateScores,
+  resolveNextAudibilityFallbackIndex,
   selectQcUnavailableFallbackCandidate,
   shouldPreferCandidate,
   type CandidateRenderMeta,
@@ -71,6 +74,51 @@ test("render risk keeps segment gain matching only for strong sentence jumps", (
   assert.equal(risk.level, "high");
   assert.equal(risk.disableSegmentGainMatch, false);
   assert.equal(risk.shouldUseFixedSegmentation, false);
+});
+
+test("audibility fallback jumps from primary chain to planner-tail-safe recovery", () => {
+  const strategies = [
+    { label: "primary chain" },
+    { label: "room cleanup bypass" },
+    { label: PLANNER_TAIL_SAFE_STRATEGY_LABEL },
+    { label: AUDIBILITY_SAFE_STRATEGY_LABEL },
+    { label: "audibility passthrough" },
+  ];
+
+  assert.equal(resolveNextAudibilityFallbackIndex(strategies, 0), 2);
+});
+
+test("audibility fallback can continue from planner-tail-safe recovery to audibility-safe recovery", () => {
+  const strategies = [
+    { label: "primary chain" },
+    { label: PLANNER_TAIL_SAFE_STRATEGY_LABEL },
+    { label: AUDIBILITY_SAFE_STRATEGY_LABEL },
+    { label: "audibility passthrough" },
+  ];
+
+  assert.equal(resolveNextAudibilityFallbackIndex(strategies, 1), 2);
+});
+
+test("audibility fallback can continue from audibility-safe recovery to passthrough", () => {
+  const strategies = [
+    { label: "primary chain" },
+    { label: PLANNER_TAIL_SAFE_STRATEGY_LABEL },
+    { label: AUDIBILITY_SAFE_STRATEGY_LABEL },
+    { label: "audibility passthrough" },
+  ];
+
+  assert.equal(resolveNextAudibilityFallbackIndex(strategies, 2), 3);
+});
+
+test("audibility fallback stops at the last recovery strategy", () => {
+  const strategies = [
+    { label: "primary chain" },
+    { label: PLANNER_TAIL_SAFE_STRATEGY_LABEL },
+    { label: AUDIBILITY_SAFE_STRATEGY_LABEL },
+    { label: "audibility passthrough" },
+  ];
+
+  assert.equal(resolveNextAudibilityFallbackIndex(strategies, 3), null);
 });
 
 test("healthy segmented candidate can beat degraded recovered candidate when close", () => {

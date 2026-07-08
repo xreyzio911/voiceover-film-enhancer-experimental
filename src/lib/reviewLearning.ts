@@ -583,10 +583,16 @@ export const scoreCandidateWithLearnedWeights = (input: {
   const candidateEndEdgeDipDb = safeNumber(input.candidateQc?.endEdgeDipDb);
   const sourceEndEdgeDipDb = safeNumber(input.sourceQc?.endEdgeDipDb);
   const endEdgeDipDeltaDb = safeNumber(qcDelta?.endEdgeDipDb);
+  const hasSourceEndEdgeDip = hasFiniteNumber(input.sourceQc?.endEdgeDipDb);
+  const hasEndEdgeDipDelta = hasFiniteNumber(qcDelta?.endEdgeDipDb);
+  const endEdgeDipIsNewOrWorse =
+    !hasSourceEndEdgeDip ||
+    sourceEndEdgeDipDb < 3.5 ||
+    (hasEndEdgeDipDelta && endEdgeDipDeltaDb >= 1);
   const createdSevereEndEdgeDip =
-    candidateEndEdgeDipDb >= 6 ||
-    (candidateEndEdgeDipDb >= 4.5 &&
-      (sourceEndEdgeDipDb < 3.5 || endEdgeDipDeltaDb >= 1));
+    endEdgeDipIsNewOrWorse &&
+    (candidateEndEdgeDipDb >= 6 ||
+      (candidateEndEdgeDipDb >= 4.5 && (!hasEndEdgeDipDelta || endEdgeDipDeltaDb >= 1)));
   if (createdSevereEndEdgeDip) {
     hardGatePenalty +=
       Math.max(1, candidateEndEdgeDipDb - 3.5, endEdgeDipDeltaDb) *
@@ -894,15 +900,19 @@ const buildCandidateAssessment = (
 
   const endEdgeDipDb = safeNumber(qc?.endEdgeDipDb);
   const endEdgeDipDeltaDb = safeNumber(delta?.endEdgeDipDb);
+  const hasEndEdgeDipDelta = hasFiniteNumber(delta?.endEdgeDipDb);
+  const endEdgeDipIsNewOrWorse = !hasEndEdgeDipDelta || endEdgeDipDeltaDb >= 1;
   const severeEndEdgeDip =
-    endEdgeDipDb >= 6 ||
-    (endEdgeDipDb >= 4.5 && endEdgeDipDeltaDb >= 1);
+    endEdgeDipIsNewOrWorse &&
+    (endEdgeDipDb >= 6 || (endEdgeDipDb >= 4.5 && (!hasEndEdgeDipDelta || endEdgeDipDeltaDb >= 1)));
   pushAssessmentCheck(findings, issueTags, {
     id: "end-edge-dip",
     label: "End-Edge Level Dip",
     tag: "endings_damaged",
     fail: severeEndEdgeDip,
-    warn: endEdgeDipDb >= 4 || (endEdgeDipDb >= 2.5 && endEdgeDipDeltaDb >= 1),
+    warn:
+      endEdgeDipIsNewOrWorse &&
+      (endEdgeDipDb >= 4 || (endEdgeDipDb >= 2.5 && (!hasEndEdgeDipDelta || endEdgeDipDeltaDb >= 1))),
     failSeverity: "major",
     warnSeverity: "major",
     detail: `End-edge dip ${formatDb(qc?.endEdgeDipDb)} (${formatSignedDb(
