@@ -14,6 +14,7 @@ export type DegradeReason =
   | "qc-unavailable"
   | "planner-required"
   | "planner-apply-failed"
+  | "audibility-dropout-guard"
   | "single-pass-recovery";
 
 export type CandidateScore = {

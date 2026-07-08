@@ -6,6 +6,11 @@ import JSZip from "jszip";
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { analyzeFloatSamples, buildSpeechMask, type AudioQcMetrics } from "../lib/audioQc";
 import {
+  detectAudibilityDropouts,
+  frameDbFromFloatSamples,
+  type AudibilityDropoutReport,
+} from "../lib/audibilityDropout";
+import {
   applyKWeighting,
   applyGainCurveToSamples,
   planGainCurve,
@@ -1176,6 +1181,64 @@ const summarizeFailureReason = (error: unknown) => {
     return new Float32Array(aligned.buffer, aligned.byteOffset, usableLength / 4);
   };
 
+  type AudibilityGuardError = Error & { audibilityGuard: true };
+  const isAudibilityGuardError = (error: unknown): error is AudibilityGuardError =>
+    error instanceof Error && (error as Partial<AudibilityGuardError>).audibilityGuard === true;
+
+  const summarizeAudibilityReport = (report: AudibilityDropoutReport) => {
+    const topClusters = report.clusters
+      .slice()
+      .sort((a, b) => a.minDropDb - b.minDropDb || b.durationSec - a.durationSec)
+      .slice(0, 3)
+      .map(
+        (cluster) =>
+          `${cluster.startSec.toFixed(2)}-${cluster.endSec.toFixed(2)}s/${cluster.minDropDb.toFixed(0)}dB`,
+      )
+      .join(", ");
+    return `${report.badSeconds.toFixed(2)}s collapsed speech, ${report.clusterCount} cluster${
+      report.clusterCount === 1 ? "" : "s"
+    }, worst ${report.worstDropDb.toFixed(0)} dB${topClusters ? ` (${topClusters})` : ""}`;
+  };
+
+  const makeAudibilityGuardError = (context: string, report: AudibilityDropoutReport): AudibilityGuardError => {
+    const error = new Error(`${context}: ${summarizeAudibilityReport(report)}`) as AudibilityGuardError;
+    error.audibilityGuard = true;
+    return error;
+  };
+
+  const renderAudibilityFrameDb = async (ffmpeg: FFmpeg, inputName: string, context: string) => {
+    const rawName = `${sanitizeBase(inputName)}_${sanitizeBase(context)}_audibility.f32`;
+    resetLogBuffer();
+    await execOrThrow(
+      ffmpeg,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-filter_threads",
+        "1",
+        "-y",
+        "-i",
+        inputName,
+        "-ac",
+        "1",
+        "-ar",
+        `${AUDIBILITY_GUARD_SAMPLE_RATE}`,
+        "-f",
+        "f32le",
+        rawName,
+      ],
+      `Audibility guard decode ${context}`,
+    );
+    try {
+      const bytes = await readVirtualFileBytes(ffmpeg, rawName);
+      return frameDbFromFloatSamples(toFloatSamples(bytes), AUDIBILITY_GUARD_SAMPLE_RATE, AUDIBILITY_GUARD_FRAME_MS);
+    } finally {
+      await safeDeleteFile(ffmpeg, rawName);
+    }
+  };
+
   const decodeWavToMono = (bytes: Uint8Array): DecodedMonoAudio => {
     const decoded = decodeWav(bytes);
     const frameCount = Math.floor(decoded.samples.length / Math.max(decoded.channels, 1));
@@ -1714,6 +1777,9 @@ const summarizeFailureReason = (error: unknown) => {
    * mix chain so ffmpeg doesn't have to resample again.
    */
   const PLANNER_APPLY_SAMPLE_RATE = 48000;
+  const AUDIBILITY_GUARD_SAMPLE_RATE = 16000;
+  const AUDIBILITY_GUARD_FRAME_MS = 20;
+  const AUDIBILITY_GUARD_MAX_DURATION_SECONDS = 1800;
 
   /**
    * Decode a time range of `inputName` to mono Float32 at `PLANNER_APPLY_SAMPLE_RATE`,
@@ -4042,6 +4108,7 @@ const summarizeFailureReason = (error: unknown) => {
       base: string;
       detail: string;
       candidateVariant?: CandidateVariant | null;
+      sourceSafeChain?: boolean;
     },
   ) => {
     let activeFfmpeg = ffmpeg;
@@ -4051,10 +4118,8 @@ const summarizeFailureReason = (error: unknown) => {
     const inputByteLength = assertUsableWavBytes(inputBytes, "App output before final app polish");
     const tempBase = targetName.replace(/\.wav$/i, "");
     const appPassName = `${tempBase}_final_polish_tmp.wav`;
-    const candidateVariant =
-      context.candidateVariant && context.candidateVariant !== "source-safe"
-        ? context.candidateVariant
-        : "continuity-safe";
+    const sourceSafePolish = context.sourceSafeChain === true || context.candidateVariant === "source-safe";
+    const candidateVariant = sourceSafePolish ? "source-safe" : (context.candidateVariant ?? "continuity-safe");
 
     try {
       setStatus(`Final app polish: ${context.base}`);
@@ -4069,6 +4134,8 @@ const summarizeFailureReason = (error: unknown) => {
         skipSpeechSegmentation: true,
         disableSegmentGainMatch: true,
         disableAdaptiveNoiseReduction: true,
+        disableRoomCleanup: sourceSafePolish ? true : undefined,
+        sourceSafeChain: sourceSafePolish,
       });
 
       const passBytes = await readVirtualFileBytes(activeFfmpeg, appPassName);
@@ -4655,15 +4722,27 @@ const summarizeFailureReason = (error: unknown) => {
       meta.analysisWindowsDropped > 0 ? ` dropped ${meta.analysisWindowsDropped}` : ""
     }`;
 
+  const isAudibilityProtectedRender = (meta: CandidateRenderMeta | null | undefined) =>
+    Boolean(
+      meta &&
+        (meta.degradeReasons.includes("audibility-dropout-guard") ||
+          meta.strategyLabel === "audibility-safe single-pass"),
+    );
+
   const buildSilenceSegmentFilter = (profile: AdaptiveProfile | null, options?: MixRenderOptions) => {
     const controls = getActiveAudioReviewControls();
     const filters: string[] = [];
     const candidateVariant = options?.candidateVariant ?? "cinematic-stable";
     const pauseSafeMode = candidateVariant === "pause-safe";
+    const minimalStabilityChain = options?.minimalStabilityChain === true;
+    const sourceSafeMode = options?.sourceSafeChain === true || candidateVariant === "source-safe";
     if (controls.eqCleanup) {
       filters.push(`highpass=f=${profile?.highpassHz ?? 80}`);
     }
     if (
+      !minimalStabilityChain &&
+      !sourceSafeMode &&
+      !options?.disableAdaptiveNoiseReduction &&
       controls.noiseGuard &&
       profile &&
       (profile.pauseNoiseRisk >= 0.42 || (pauseSafeMode && profile.noiseRisk !== "low"))
@@ -4680,6 +4759,8 @@ const summarizeFailureReason = (error: unknown) => {
       }
     }
     if (
+      !minimalStabilityChain &&
+      !sourceSafeMode &&
       controls.floorGuard &&
       profile &&
       (profile.noiseRisk === "high" || profile.pauseNoiseRisk >= 0.38 || pauseSafeMode)
@@ -4687,6 +4768,9 @@ const summarizeFailureReason = (error: unknown) => {
       filters.push(profile.floorGuardFilter);
     }
     if (
+      !minimalStabilityChain &&
+      !sourceSafeMode &&
+      !options?.disableRoomCleanup &&
       controls.roomCleanup &&
       profile &&
       profile.roomRisk !== "low" &&
@@ -5902,12 +5986,25 @@ const summarizeFailureReason = (error: unknown) => {
         minimalStabilityChain: true,
       },
     });
+    fallbackStrategies.push({
+      label: "audibility-safe single-pass",
+      options: {
+        candidateVariant: "source-safe",
+        disableRoomCleanup: true,
+        disableAdaptiveNoiseReduction: true,
+        disableSegmentGainMatch: true,
+        skipSpeechSegmentation: true,
+        sourceSafeChain: true,
+      },
+    });
 
     let lastMixError: unknown = null;
     let mixRendered = false;
     let inputDurationSeconds: number | null | undefined = speechRenderPlan?.durationSeconds;
     let speechAlignedSegmentCountUsed: number | null = null;
     let renderMeta: CandidateRenderMeta | null = null;
+    let sourceAudibilityFrameDb: number[] | null = null;
+    let audibilityGuardTripped = false;
 
     const ensureInputDuration = async () => {
       if (inputDurationSeconds !== undefined) return inputDurationSeconds;
@@ -5917,6 +6014,47 @@ const summarizeFailureReason = (error: unknown) => {
         inputDurationSeconds = null;
       }
       return inputDurationSeconds;
+    };
+
+    const noteAudibilityGuardReason = (reasons: DegradeReason[]) => {
+      if (!reasons.includes("audibility-dropout-guard")) {
+        reasons.push("audibility-dropout-guard");
+      }
+    };
+
+    const assertRenderedAudibility = async (strategyLabel: string, renderPath: RenderPath) => {
+      const durationSeconds = await ensureInputDuration();
+      if (
+        durationSeconds === null ||
+        !Number.isFinite(durationSeconds) ||
+        durationSeconds <= 1 ||
+        durationSeconds > AUDIBILITY_GUARD_MAX_DURATION_SECONDS
+      ) {
+        return;
+      }
+
+      try {
+        if (!sourceAudibilityFrameDb) {
+          sourceAudibilityFrameDb = await renderAudibilityFrameDb(ffmpeg, job.inputName, `${job.base}_source`);
+        }
+        const renderedFrameDb = await renderAudibilityFrameDb(ffmpeg, outputName, `${job.base}_${strategyLabel}`);
+        if (sourceAudibilityFrameDb.length === 0 || renderedFrameDb.length === 0) return;
+        const report = detectAudibilityDropouts({
+          sourceFrameDb: sourceAudibilityFrameDb,
+          renderedFrameDb,
+          frameMs: AUDIBILITY_GUARD_FRAME_MS,
+        });
+        if (!report.severe) return;
+
+        audibilityGuardTripped = true;
+        throw makeAudibilityGuardError(
+          `[AudibilityGuard] ${job.base}/${strategyLabel}/${describeRenderPath(renderPath)}`,
+          report,
+        );
+      } catch (error) {
+        if (isAudibilityGuardError(error)) throw error;
+        appendLog(`[AudibilityGuard] ${job.base}/${strategyLabel}: skipped (${describeError(error)}).`);
+      }
     };
 
     // Candidate renders normally receive a file-level planner context so all
@@ -6043,6 +6181,9 @@ const summarizeFailureReason = (error: unknown) => {
       const strategy = fallbackStrategies[strategyIndex];
       const effectiveOptions = { ...options, ...strategy.options };
       const strategyDegradeReasons: DegradeReason[] = [];
+      if (audibilityGuardTripped) {
+        noteAudibilityGuardReason(strategyDegradeReasons);
+      }
       try {
         if (speechRenderPlan && !effectiveOptions.skipSpeechSegmentation) {
           const plannedSegments = buildSpeechAlignedRenderSegments(
@@ -6093,6 +6234,7 @@ const summarizeFailureReason = (error: unknown) => {
               },
               leveled,
             );
+            await assertRenderedAudibility(strategy.label, "fixed-segmented");
             speechAlignedSegmentCountUsed = Math.ceil(speechRenderPlan.durationSeconds / MIX_SEGMENT_SECONDS);
             mixRendered = true;
             renderMeta = buildMeta(strategy.label, "fixed-segmented", strategyDegradeReasons);
@@ -6123,6 +6265,10 @@ const summarizeFailureReason = (error: unknown) => {
               },
               leveled,
             );
+            await assertRenderedAudibility(
+              strategy.label,
+              speechRenderPlan.mode === "speech-pause" ? "speech-pause-segmented" : "speech-aligned-segmented",
+            );
             mixRendered = true;
             renderMeta = buildMeta(
               strategy.label,
@@ -6145,6 +6291,10 @@ const summarizeFailureReason = (error: unknown) => {
               break;
             } catch (fixedError) {
               lastMixError = fixedError;
+              if (isAudibilityGuardError(fixedError)) {
+                noteAudibilityGuardReason(strategyDegradeReasons);
+                throw fixedError;
+              }
               if (shouldResetFfmpegForError(fixedError)) {
                 strategyDegradeReasons.push("segment-render-memory-fault");
                 ffmpeg = await refreshFfmpeg(`fixed-segmented fallback on ${job.base}`);
@@ -6161,6 +6311,10 @@ const summarizeFailureReason = (error: unknown) => {
               break;
             } catch (segError) {
               lastMixError = segError;
+              if (isAudibilityGuardError(segError)) {
+                noteAudibilityGuardReason(strategyDegradeReasons);
+                throw segError;
+              }
               appendLog(
                 `[Segmented] ${job.base}: ${speechRenderPlan.mode} ${strategy.label} failed (${describeError(
                   segError
@@ -6189,6 +6343,10 @@ const summarizeFailureReason = (error: unknown) => {
                   break;
                 } catch (liteError) {
                   lastMixError = liteError;
+                  if (isAudibilityGuardError(liteError)) {
+                    noteAudibilityGuardReason(strategyDegradeReasons);
+                    throw liteError;
+                  }
                   appendLog(
                     `[Segmented] ${job.base}: segmented-lite ${strategy.label} failed (${describeError(
                       liteError
@@ -6209,6 +6367,10 @@ const summarizeFailureReason = (error: unknown) => {
                 break;
               } catch (fixedError) {
                 lastMixError = fixedError;
+                if (isAudibilityGuardError(fixedError)) {
+                  noteAudibilityGuardReason(strategyDegradeReasons);
+                  throw fixedError;
+                }
                 if (shouldResetFfmpegForError(fixedError)) {
                   if (!strategyDegradeReasons.includes("segment-render-memory-fault")) {
                     strategyDegradeReasons.push("segment-render-memory-fault");
@@ -6225,13 +6387,17 @@ const summarizeFailureReason = (error: unknown) => {
         setActiveQueueStage(job.base, stageLabel, `File ${fileIndex + 1} of ${totalFiles}`);
         const leveledForSinglePass = await ensureLeveledInput();
         await runMixReady(ffmpeg, job.inputName, outputName, profile, effectiveOptions, leveledForSinglePass);
+        if (strategyDegradeReasons.includes("segment-render-memory-fault")) {
+          strategyDegradeReasons.push("single-pass-recovery");
+        }
+        await assertRenderedAudibility(
+          strategy.label,
+          strategyDegradeReasons.includes("single-pass-recovery") ? "single-pass-recovered" : "single-pass",
+        );
         appendLog(
           `[SinglePass] ${job.base}: ${strategy.label} (planner=${leveledForSinglePass ? "on" : "off"}).`,
         );
         mixRendered = true;
-        if (strategyDegradeReasons.includes("segment-render-memory-fault")) {
-          strategyDegradeReasons.push("single-pass-recovery");
-        }
         renderMeta = buildMeta(
           strategy.label,
           strategyDegradeReasons.includes("single-pass-recovery") ? "single-pass-recovered" : "single-pass",
@@ -6240,6 +6406,9 @@ const summarizeFailureReason = (error: unknown) => {
         break;
       } catch (error) {
         lastMixError = error;
+        if (isAudibilityGuardError(error)) {
+          noteAudibilityGuardReason(strategyDegradeReasons);
+        }
         const strategyFailureMessage = describeError(error);
         if (shouldResetFfmpegForError(error)) {
           ffmpeg = await refreshFfmpeg(`mix fallback on ${job.base}`);
@@ -6247,7 +6416,10 @@ const summarizeFailureReason = (error: unknown) => {
         }
 
         const durationSeconds = await ensureInputDuration();
-        const canRunSegmented = durationSeconds !== null && durationSeconds >= MIX_SEGMENT_MIN_DURATION_SECONDS;
+        const canRunSegmented =
+          !isAudibilityGuardError(error) &&
+          durationSeconds !== null &&
+          durationSeconds >= MIX_SEGMENT_MIN_DURATION_SECONDS;
 
         if (canRunSegmented && durationSeconds !== null) {
           try {
@@ -6264,6 +6436,7 @@ const summarizeFailureReason = (error: unknown) => {
               effectiveOptions,
               leveledForSeg,
             );
+            await assertRenderedAudibility(strategy.label, "fixed-segmented");
             mixRendered = true;
             renderMeta = buildMeta(strategy.label, "fixed-segmented", strategyDegradeReasons);
             break;
@@ -6279,6 +6452,16 @@ const summarizeFailureReason = (error: unknown) => {
 
         const hasMoreStrategies = strategyIndex < fallbackStrategies.length - 1;
         if (hasMoreStrategies) {
+          if (isAudibilityGuardError(error)) {
+            const audibilitySafeIndex = fallbackStrategies.findIndex((item) => item.label === "audibility-safe single-pass");
+            if (audibilitySafeIndex > strategyIndex) {
+              strategyIndex = audibilitySafeIndex - 1;
+              appendLog(
+                `[MixFallback] ${job.base}: audibility guard tripped on ${strategy.label}; jumping to audibility-safe single-pass.`,
+              );
+              continue;
+            }
+          }
           const finalFailureMessage = describeError(lastMixError);
           appendLog(
             `[MixFallback] ${job.base}: ${strategy.label} failed (${finalFailureMessage}), trying ${
@@ -6937,13 +7120,22 @@ const summarizeFailureReason = (error: unknown) => {
             }.`
           );
           appendLog(`[CandidateSummary] ${job.base}: ${selectedSummary}.`);
-          const polishResult = await runFinalAppPolishPass(ffmpeg, job.mixName, profile, {
-            base: job.base,
-            detail: `File ${i + 1} of ${jobs.length}, final app polish`,
-            candidateVariant: selectedVariant,
-          });
-          ffmpeg = polishResult.ffmpeg;
-          const outputProcessingFlow = polishResult.applied ? "app-final-polish" : "app";
+          const selectedAudibilityProtected = isAudibilityProtectedRender(selectedMeta);
+          let outputProcessingFlow: OutputEntry["processingFlow"] = "app";
+          if (selectedAudibilityProtected) {
+            appendLog(
+              `[FinalPolish] ${job.base}: skipped because audibility guard selected a source-safe recovery render.`,
+            );
+          } else {
+            const polishResult = await runFinalAppPolishPass(ffmpeg, job.mixName, profile, {
+              base: job.base,
+              detail: `File ${i + 1} of ${jobs.length}, final app polish`,
+              candidateVariant: selectedVariant,
+              sourceSafeChain: selectedVariant === "source-safe",
+            });
+            ffmpeg = polishResult.ffmpeg;
+            outputProcessingFlow = polishResult.applied ? "app-final-polish" : "app";
+          }
 
           const buildArtifactForRenderedMix = async (
             renderedName: string,
@@ -7089,7 +7281,11 @@ const summarizeFailureReason = (error: unknown) => {
             ],
           });
 
-          if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant) {
+          if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && selectedAudibilityProtected) {
+            appendLog(`[Corrective] ${job.base}: skipped because audibility guard selected a source-safe recovery render.`);
+          }
+
+          if (MAX_CORRECTIVE_PASSES > 0 && selectedVariant && !selectedAudibilityProtected) {
             const selectedPostPolishBytes = await readVirtualFileBytes(ffmpeg, job.mixName);
             const selectedPostPolishArtifact = await buildArtifactForRenderedMix(
               job.mixName,
@@ -7213,12 +7409,19 @@ const summarizeFailureReason = (error: unknown) => {
                     correctivePlannerContext,
                   );
                   ffmpeg = correctiveResult.ffmpeg;
-                  const correctivePolish = await runFinalAppPolishPass(ffmpeg, correctiveName, correctiveProfile, {
-                    base: job.base,
-                    detail: `File ${i + 1} of ${jobs.length}, corrective final app polish`,
-                    candidateVariant: selectedVariant,
-                  });
-                  ffmpeg = correctivePolish.ffmpeg;
+                  if (isAudibilityProtectedRender(correctiveResult.meta)) {
+                    appendLog(
+                      `[FinalPolish] ${job.base}: skipped corrective final app polish because audibility guard selected a source-safe recovery render.`,
+                    );
+                  } else {
+                    const correctivePolish = await runFinalAppPolishPass(ffmpeg, correctiveName, correctiveProfile, {
+                      base: job.base,
+                      detail: `File ${i + 1} of ${jobs.length}, corrective final app polish`,
+                      candidateVariant: selectedVariant,
+                      sourceSafeChain: selectedVariant === "source-safe",
+                    });
+                    ffmpeg = correctivePolish.ffmpeg;
+                  }
                   const correctiveBytes = await readVirtualFileBytes(ffmpeg, correctiveName);
                   const correctiveArtifact = await buildArtifactForRenderedMix(
                     correctiveName,

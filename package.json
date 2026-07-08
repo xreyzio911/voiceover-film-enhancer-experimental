@@ -7,7 +7,7 @@
     "build": "node node_modules/next/dist/bin/next build",
     "start": "node node_modules/next/dist/bin/next start",
     "lint": "eslint",
-    "test:audio-qc": "node --test --experimental-strip-types src/lib/audioQc.test.ts src/lib/gainPlanner.test.ts src/lib/renderRecovery.test.ts src/lib/reviewLearning.test.ts src/lib/audioSplitterService.test.ts src/lib/downloadPolicy.test.ts src/lib/longFormExportPolicy.test.ts src/lib/neuralRepairPolicy.test.ts src/lib/neuralRepairRuntime.test.ts src/lib/neuralRepairClient.test.ts src/lib/neuralRepairChunkPolicy.test.ts src/lib/aiAudioReview.test.ts src/lib/roomCleanupPolicy.test.ts src/lib/echoResidualSuppression.test.ts src/lib/batchLoudnessAlign.test.ts src/lib/spectrum.test.ts",
+    "test:audio-qc": "node --test --experimental-strip-types src/lib/audioQc.test.ts src/lib/gainPlanner.test.ts src/lib/renderRecovery.test.ts src/lib/reviewLearning.test.ts src/lib/audioSplitterService.test.ts src/lib/downloadPolicy.test.ts src/lib/longFormExportPolicy.test.ts src/lib/neuralRepairPolicy.test.ts src/lib/neuralRepairRuntime.test.ts src/lib/neuralRepairClient.test.ts src/lib/neuralRepairChunkPolicy.test.ts src/lib/aiAudioReview.test.ts src/lib/roomCleanupPolicy.test.ts src/lib/echoResidualSuppression.test.ts src/lib/batchLoudnessAlign.test.ts src/lib/spectrum.test.ts src/lib/audibilityDropout.test.ts",
     "train:review-model": "node --experimental-strip-types scripts/trainReviewModel.ts",
     "promote:review-model": "node --experimental-strip-types scripts/promoteReviewModel.ts",
     "postinstall": "node scripts/copy-ffmpeg-core.mjs"
